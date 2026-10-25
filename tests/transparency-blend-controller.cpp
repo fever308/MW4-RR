@@ -1256,6 +1256,7 @@ struct ControllerCpuTest {
         auto &g = s.gpu.coverage;
         rrblend::Tuning tuning;
         tuning.diffuse = 0.25f;
+        tuning.pattern = true; // opt-in; the cases below need it
         c.SetTransparencyBlendTuning(tuning);
 
         // The target holds this frame's coverage only once a capture cleared it.

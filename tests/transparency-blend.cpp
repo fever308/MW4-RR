@@ -657,7 +657,7 @@ static void TestControl() {
 
     const auto c = Make(Tuning{}, 1920, 1088);
     assert(c.admitted == 0 && c.width == 1920 && c.height == 1088);
-    assert(c.flags == (SkyFlag | FilterFlag | PatternFlag));
+    assert(c.flags == (SkyFlag | FilterFlag)); // the pattern is opt-in
     assert(c.diffuse[0] == 0.5f && c.diffuse[1] == 0.5f && c.diffuse[2] == 0.5f);
     assert(c.diffuse[3] == 0.f);
     assert(c.params[0] == 0.f && c.params[1] == 0.f && c.params[2] == 1.f);
@@ -993,7 +993,8 @@ static void FillColor(Color &c, float value) {
 static void TestPattern() {
     Tuning plain;
     plain.filter = false;
-    assert(plain.pattern);
+    assert(!plain.pattern); // opt-in
+    plain.pattern = true;
     float t[3][3][3];
     Fill(t, 0.f); // fully covered: c = 1, so the diffuse guide becomes the target
     Color color;

@@ -1379,7 +1379,9 @@ static void TestCapture() {
 static void TestControl() {
     Slot s;
     auto &memory = s.Get("control").memory;
-    auto c = Make(Tuning{}, 1919, 1081);
+    Tuning pattern;
+    pattern.pattern = true; // opt-in
+    auto c = Make(pattern, 1919, 1081);
     c.admitted = 7;
     c.reserved[2] = 9;
     assert(c.flags & PatternFlag);
