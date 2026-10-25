@@ -33,7 +33,7 @@ Transparency albedo blend (on by default, with a checkbox in the panel and no ho
 - `TransparencyBlendFilter` (1): 1 smooths the blend mask over neighboring pixels; 0 uses it unfiltered.
 - `TransparencyBlendDebug` (0): 1 shows the blend mask in the albedo guide for inspection.
 
-The indented "Frosted glass pattern" checkbox under the blend (on by default, saved as the `TransparencyBlendPattern` key) gives covered pixels a diffuse albedo that follows the visible glass pattern, the `TransparencyBlendDiffuse` value scaled by the pixel's color over its local average brightness, so RR keeps the pattern instead of smoothing it as noise.
+The indented "Frosted glass pattern" checkbox under the blend (off by default, saved as the `TransparencyBlendPattern` key) gives covered pixels a diffuse albedo that follows the visible glass pattern, the `TransparencyBlendDiffuse` value scaled by the pixel's color over its local average brightness, so RR keeps the pattern instead of smoothing it as noise.
 
 ## Architecture
 

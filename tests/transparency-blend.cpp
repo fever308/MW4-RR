@@ -691,7 +691,7 @@ static void TestClamp() {
     const Tuning defaults;
     assert(defaults.diffuse == 0.5f && defaults.specular == 0.f && defaults.roughness == -1.f);
     assert(defaults.strength == 1.f && defaults.sky && defaults.filter && !defaults.debug);
-    assert(defaults.pattern && Clamp(defaults).pattern);
+    assert(!defaults.pattern && !Clamp(defaults).pattern);
     const auto same = Clamp(defaults);
     assert(same.diffuse == 0.5f && same.specular == 0.f && same.roughness == -1.f);
     assert(same.strength == 1.f && same.sky && same.filter && !same.debug);

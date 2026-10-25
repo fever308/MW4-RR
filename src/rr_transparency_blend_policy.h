@@ -40,7 +40,7 @@ struct Tuning {
     bool debug = false;
     // Covered pixels take a detail albedo from RR's input colour (PatternFlag)
     // instead of the constant diffuse target.
-    bool pattern = true;
+    bool pattern = false;
 };
 inline float ClampUnit(float value, float fallback) {
     return std::isnan(value) ? fallback : std::clamp(value, 0.f, 1.f);
