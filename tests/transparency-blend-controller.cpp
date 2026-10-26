@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "../src/rr_live.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
@@ -901,7 +902,7 @@ static D3D12_RESOURCE_DESC Texture(UINT64 w, UINT h, DXGI_FORMAT format, UINT sa
 static D3D12_RESOURCE_DESC Scene(UINT64 w = 960, UINT h = 540) {
     return Texture(w, h, DXGI_FORMAT_R11G11B10_FLOAT, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
 }
-static bool OwnsLock(std::recursive_mutex &m) {
+template <class M> static bool OwnsLock(M &m) {
     bool locked = false;
     std::thread([&] {
         locked = m.try_lock();
@@ -1492,7 +1493,76 @@ struct ControllerCpuTest {
         assert(c.blend_counters.last == rrblend::Reason::None);
     }
 
+    // RR's NGX call with its lock held twice (TryReplaceSR, then AfterSR). DLSS5 NR, beneath
+    // RR, waits there for Frame Generation's NGX call to leave, and that call records a
+    // barrier RR observes under its lock. The barrier must get through, and be tracked.
+    static void ForeignCall() {
+        Rig r;
+        auto &c = r.c;
+        auto &s = r.S();
+        s.sr = &r.sr;
+        s.sr_live = s.pending_sr = true;
+        s.gpu.sr[0] = &r.scene;
+        auto *handle = reinterpret_cast<NVSDK_NGX_Handle *>(&r.output);
+        c.feature = handle;
+        c.layout_pending = true; // a reconfiguration waits for the call
+        {
+            std::lock_guard replace(c.mutex), after(c.mutex);
+            const bool finished = c.Foreign([&] {
+                assert(c.foreign_call && !OwnsLock(c.mutex));
+                assert(!c.Reconfigure() && c.feature == handle);
+                std::atomic<bool> fg_done{false};
+                std::thread fg([&] {
+                    D3D12_RESOURCE_BARRIER b{};
+                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b.Transition.pResource = &r.scene;
+                    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    c.Barriers(&r.sr, 1, &b);
+                    fg_done = true;
+                });
+                const auto start = GetTickCount64();
+                while (!fg_done && GetTickCount64() - start < 5000)
+                    Sleep(1);
+                const bool done = fg_done;
+                if (done)
+                    fg.join();
+                else
+                    fg.detach(); // deadlocked: the assert below reports it
+                return done;
+            });
+            assert(finished);
+            assert(!c.foreign_call && OwnsLock(c.mutex));
+            assert(s.states[0].known && s.states[0].complete &&
+                   s.states[0].state == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            // A throwing call gives the holds back as well.
+            bool thrown = false;
+            try {
+                c.Foreign([]() -> int { throw std::runtime_error("ngx"); });
+            } catch (const std::runtime_error &) {
+                thrown = true;
+            }
+            assert(thrown && !c.foreign_call && OwnsLock(c.mutex));
+            c.mutex.unlock(); // still held once, by replace
+            assert(OwnsLock(c.mutex));
+            c.mutex.lock();
+        }
+        assert(!OwnsLock(c.mutex));
+        // Shutdown waits for the call too.
+        c.runtime = reinterpret_cast<HMODULE>(1);
+        c.foreign_call = true;
+        assert(!c.BeforeShutdown(reinterpret_cast<HMODULE>(1), nullptr));
+        assert(Logged("RR shutdown deferred: an RR evaluation is in NGX"));
+        c.foreign_call = false;
+        c.feature = nullptr;
+        c.layout_pending = false;
+        s.gpu.sr[0].Reset();
+        s.sr.Reset();
+        s.sr_live = s.pending_sr = false;
+    }
+
     static void Run() {
+        ForeignCall();
         PoolExtra();
         State();
         Capture();

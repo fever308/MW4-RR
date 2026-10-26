@@ -11,6 +11,7 @@
 #include "rr_sss_mask.h"
 #include "rr_inputs.h"
 #include "rr_internal.h"
+#include "rr_lock.h"
 #include "rr_ngx_api.h"
 #include "rr_ngx_log.h"
 #include "rr_trace.h"
@@ -57,7 +58,9 @@ class Controller {
         std::vector<bool> touched;
     };
     static inline thread_local std::vector<Call> submissions;
-    std::recursive_mutex mutex;
+    rrlock::Recursive mutex;
+    // An NGX call into the add-ons beneath RR is running with the lock released (Foreign).
+    bool foreign_call{};
     std::deque<Slot> slots{6};
     Pipelines pipelines;
     Budget budget;
@@ -180,6 +183,20 @@ class Controller {
     NVSDK_NGX_Handle *feature{};
     rreval::Options key;
     rreval::Api (*resolve)(HMODULE) = &rreval::Api::Load;
+    // A call into NGX, where an add-on beneath RR (DLSS5 NR) may wait for another thread's NGX
+    // call, Frame Generation's, which records barriers RR observes under this lock. The call runs
+    // with every hold released. The slot being recorded stays live (sr_live), so no
+    // reconfiguration, shutdown or slot reuse retires what the call uses, and foreign_call
+    // refuses another SR call meanwhile.
+    template <class F> auto Foreign(F &&f) -> decltype(f()) {
+        struct Flag {
+            bool &v;
+            ~Flag() {
+                v = false;
+            }
+        } flag{foreign_call = true};
+        return rrlock::Released(mutex, f);
+    }
     void Log(const char *s) {
         if (logger)
             logger(s);
@@ -447,6 +464,8 @@ class Controller {
     bool Reconfigure() {
         if (!NeedsReconfigure())
             return true;
+        if (foreign_call)
+            return false;
         for (const auto &s : slots)
             if (!rrpreset::CanRetire(
                     s.poisoned, s.pre_live, s.sr_live, s.sss.live,
@@ -1311,6 +1330,8 @@ class Controller {
         };
         if (!replace_sr || replace_paused)
             return skip(rrsr::Off);
+        if (foreign_call)
+            return skip(rrsr::Scope);
         if (!enabled)
             return skip(rrsr::Disabled);
         if (failed || retired)
@@ -1430,6 +1451,8 @@ class Controller {
                  bool safe, bool replacement = false) {
 
         std::lock_guard lock(mutex);
+        if (foreign_call)
+            return false;
         Slot *s{};
         for (auto &v : slots)
             if (v.pending_sr && v.frame == scope.frame && v.viewport == scope.viewport) {
@@ -1625,8 +1648,12 @@ class Controller {
                 rreval::CreateParameters(*parameters, o, preset.desired);
                 Require(rrpreset::Requested(*parameters, preset.desired),
                         "live RR preset parameter readback failed");
-                auto created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
-                                          parameters, &feature);
+                NVSDK_NGX_Handle *created_feature{};
+                auto created = Foreign([&] {
+                    return api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction, parameters,
+                                      &created_feature);
+                });
+                feature = created_feature;
                 char line[200];
                 rrngxlog::CapabilityLine(api, line, sizeof(line));
                 Log(line);
@@ -1738,10 +1765,13 @@ class Controller {
                     const auto viewport = rrslroute::Viewport(scope.viewport);
                     sl_used_view = viewport;
                     // The list the game handed Streamline, which Streamline expects back.
-                    const auto r = rrtrace::Probe::SlEvaluateRR(
-                        *scope.token, viewport, constants, sl_options, tags.tags.data(), tags.count,
-                        scope.command ? scope.command
-                                      : reinterpret_cast<sl::CommandBuffer *>(public_cl));
+                    const auto r = Foreign([&] {
+                        return rrtrace::Probe::SlEvaluateRR(
+                            *scope.token, viewport, constants, sl_options, tags.tags.data(),
+                            tags.count,
+                            scope.command ? scope.command
+                                          : reinterpret_cast<sl::CommandBuffer *>(public_cl));
+                    });
                     // A refused Streamline call falls back to the direct call for this frame, so
                     // it never retires RR.
                     // Out of VRAM is a warning Streamline returns after recording the evaluate.
@@ -1774,7 +1804,8 @@ class Controller {
                 if (!routed) {
                     if (sl_last_routed || sl_history_lost)
                         parameters->Set(NVSDK_NGX_Parameter_Reset, 1);
-                    evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
+                    evaluated_result = Foreign(
+                        [&] { return api.evaluate(public_cl, feature, parameters, nullptr); });
                 }
                 sl_last_routed = routed;
                 sl_history_lost = false;
@@ -2000,6 +2031,10 @@ class Controller {
         if (runtime != mod || (d && !fg::SameNativeObject(public_device.Get(), d)))
             return true;
         enabled = false;
+        if (foreign_call) {
+            Log("RR shutdown deferred: an RR evaluation is in NGX");
+            return false;
+        }
         for (const auto &s : slots)
             if (s.poisoned || s.pre_live || s.sr_live || s.sss.live || s.transparency.Live() ||
                 s.coverage.Live() || s.pending_sr) {

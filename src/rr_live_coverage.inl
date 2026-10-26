@@ -264,7 +264,7 @@ void CoverageReport() {
 // the caller records: BeginCapture(cl, first) on *gpu, the variant PSO and the
 // owned RTV (rtv), the replay, the native state restore, EndCapture(cl).
 struct CoverageToken {
-    std::unique_lock<std::recursive_mutex> lock;
+    std::unique_lock<rrlock::Recursive> lock;
     Slot *slot{};
     ID3D12GraphicsCommandList *cl{};
     rrblend::Gpu *gpu{};
