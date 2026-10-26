@@ -32,10 +32,14 @@ struct Selection {
         has_effective = false;
         draining = true;
     }
-    constexpr void Created() {
-        effective = desired;
+    // value: the preset the new RR was created with, which a request may since have changed.
+    constexpr void Created(unsigned value) {
+        effective = value;
         has_effective = true;
         draining = false;
+    }
+    constexpr void Created() {
+        Created(desired);
     }
 };
 // Never release a replayable recording, an unsealed evaluation, or GPU work.

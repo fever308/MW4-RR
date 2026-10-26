@@ -20,6 +20,8 @@
 #include <atomic>
 #include <mutex>
 #include <deque>
+#include <initializer_list>
+#include <vector>
 namespace rrlive {
 // Private resources remain retained until native recordings retire and every
 // submitted producer and consumer completes on the tracked fence.
@@ -61,6 +63,8 @@ class Controller {
     rrlock::Recursive mutex;
     // An NGX call into the add-ons beneath RR is running with the lock released (Foreign).
     bool foreign_call{};
+    // Objects a timed-out initialization left to the GPU: kept for the process.
+    std::vector<ComPtr<IUnknown>> stranded;
     std::deque<Slot> slots{6};
     Pipelines pipelines;
     Budget budget;
@@ -420,7 +424,15 @@ class Controller {
             setup_queue->ExecuteCommandLists(1, &setup);
         }
         Check(setup_queue->Signal(setup_fence.Get(), 1), "live init signal failed");
-        Require(rrprivate::FencePoint{setup_fence, 1}.Wait(5000), "live init unfinished");
+        if (!rrprivate::FencePoint{setup_fence, 1}.Wait(5000)) {
+            // The GPU may still run the clear: what it uses is never released, and RR stays off.
+            for (IUnknown *object : std::initializer_list<IUnknown *>{
+                     history.Get(), zero.Get(), init_list.Get(), init_allocator.Get(),
+                     setup_queue.Get(), setup_fence.Get()})
+                stranded.emplace_back(object);
+            failed = true;
+            throw std::runtime_error("live init unfinished; RR off");
+        }
         initialized = true;
     }
     bool NeedsReconfigure() const {
@@ -1645,8 +1657,11 @@ class Controller {
                 rrngxlog::Require(NVSDK_NGX_SUCCEED(allocated) && parameters,
                                   "live NGX parameter allocation failed",
                                   rrngxlog::Returned(allocated, parameters));
-                rreval::CreateParameters(*parameters, o, preset.desired);
-                Require(rrpreset::Requested(*parameters, preset.desired),
+                // The preset RR is created with: a request during the creation call below waits
+                // for the next RR.
+                const auto created_preset = preset.desired;
+                rreval::CreateParameters(*parameters, o, created_preset);
+                Require(rrpreset::Requested(*parameters, created_preset),
                         "live RR preset parameter readback failed");
                 NVSDK_NGX_Handle *created_feature{};
                 auto created = Foreign([&] {
@@ -1660,9 +1675,9 @@ class Controller {
                 rrngxlog::Require(NVSDK_NGX_SUCCEED(created) && feature,
                                   "live RR feature creation failed",
                                   rrngxlog::Returned(created, feature));
-                preset.Created();
+                preset.Created(created_preset);
                 weapon_linear = weapon_on;
-                rrngxlog::DescribeCreation(o, preset.desired, line, sizeof(line));
+                rrngxlog::DescribeCreation(o, created_preset, line, sizeof(line));
                 Log(line);
                 if (weapon_on)
                     Log("Weapon depth: on (RR reads the weapon-remapped depth copy)");

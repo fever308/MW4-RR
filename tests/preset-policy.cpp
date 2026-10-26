@@ -21,6 +21,16 @@ constexpr bool lifecycle() {
     p.Created();
     return p.effective == 0 && !p.Pending();
 }
+// A request that lands while RR is being created waits for the next RR.
+constexpr bool request_during_creation() {
+    rrpreset::Selection p;
+    p.Request(4);
+    const unsigned created = p.desired;
+    p.Request(5); // during the creation call
+    p.Created(created);
+    return p.effective == 4 && p.desired == 5 && p.Pending();
+}
+static_assert(request_during_creation());
 static_assert(lifecycle());
 static_assert(!rrpreset::CanRetire(true, false, false, false, false, false, false, false, true));
 static_assert(!rrpreset::CanRetire(false, true, false, false, false, false, false, false, true));
