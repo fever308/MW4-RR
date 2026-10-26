@@ -652,11 +652,11 @@ static void TestControl() {
     static_assert(offsetof(Control, params) == 32);
     static_assert(offsetof(Control, reserved) == 48);
     static_assert(offsetof(Control, zero) == 64);
-    static_assert(SkyFlag == 1 && RoughnessFlag == 2 && FilterFlag == 4);
+    static_assert(SkyFlag == 1 && RoughnessFlag == 2 && FilterFlag == 4 && SssFlag == 8);
 
     const auto c = Make(Tuning{}, 1920, 1088);
     assert(c.admitted == 0 && c.width == 1920 && c.height == 1088);
-    assert(c.flags == (SkyFlag | FilterFlag));
+    assert(c.flags == (SkyFlag | FilterFlag | SssFlag));
     assert(c.diffuse[0] == 0.5f && c.diffuse[1] == 0.5f && c.diffuse[2] == 0.5f);
     assert(c.diffuse[3] == 0.f);
     assert(c.params[0] == 0.f && c.params[1] == 0.f && c.params[2] == 1.f);
@@ -673,6 +673,7 @@ static void TestControl() {
     t.strength = 0.5f;
     t.sky = false;
     t.filter = false;
+    t.sss = false;
     const auto e = Make(t, 640, 368);
     assert(e.flags == RoughnessFlag);
     assert(e.diffuse[0] == 1.f && e.diffuse[1] == 1.f && e.diffuse[2] == 1.f);
@@ -687,7 +688,7 @@ static void TestControl() {
 static void TestClamp() {
     const Tuning defaults;
     assert(defaults.diffuse == 0.5f && defaults.specular == 0.f && defaults.roughness == -1.f);
-    assert(defaults.strength == 1.f && defaults.sky && defaults.filter);
+    assert(defaults.strength == 1.f && defaults.sky && defaults.filter && defaults.sss);
     const auto same = Clamp(defaults);
     assert(same.diffuse == 0.5f && same.specular == 0.f && same.roughness == -1.f);
     assert(same.strength == 1.f && same.sky && same.filter);
@@ -952,6 +953,84 @@ static void TestReference() {
     }
 }
 
+// The SSS guide fades with the same coverage weight c as the albedo guides,
+// luminance-weighted as NVIDIA's guide is ((r + 2g + b) / 4), and never reaches
+// exactly 0 on an SSS pixel: the next frame's SSS-masked lighting tells SSS
+// pixels by a nonzero guide.
+static void TestSssFade() {
+    Tuning plain;
+    plain.filter = false;
+    float t[3][3][3];
+    auto with = [](float sss) {
+        auto g = Sample();
+        g.sss = sss;
+        return g;
+    };
+    // Full coverage: the guide drops to the floor, keeping its sign.
+    Fill(t, 0.f);
+    for (float sss : {0.25f, -0.25f}) {
+        auto g = with(sss);
+        Reference(Admitted(plain), 3, 3, 1, t, g);
+        assert(g.sss == (sss > 0 ? SssFloor : -SssFloor));
+    }
+    // A guide already below the floor is kept, not raised.
+    {
+        auto g = with(-1e-6f);
+        Reference(Admitted(plain), 3, 3, 1, t, g);
+        assert(g.sss == -1e-6f);
+    }
+    // Non-SSS pixels stay exactly 0.
+    {
+        auto g = with(0.f);
+        Reference(Admitted(plain), 3, 3, 1, t, g);
+        assert(g.sss == 0.f && !std::signbit(g.sss));
+    }
+    // Partial, tinted coverage: guide * (1 - (c.r + 2 c.g + c.b) / 4).
+    {
+        float tinted[3][3][3];
+        for (auto &row : tinted)
+            for (auto &px : row) {
+                px[0] = 0.5f;  // o = 0.5
+                px[1] = 0.75f; // o = 0.25
+                px[2] = 1.f;   // o = 0
+            }
+        auto g = with(0.5f);
+        Reference(Admitted(plain), 3, 3, 1, tinted, g);
+        float c[3];
+        for (int ch = 0; ch < 3; ++ch)
+            c[ch] =
+                Saturate(Saturate((1.f - tinted[1][1][ch] - OpacityFloor) / (1.f - OpacityFloor)));
+        const float w = 0.25f * c[0] + 0.5f * c[1] + 0.25f * c[2];
+        assert(std::fabs(g.sss - 0.5f * (1.f - w)) < 1e-6f);
+        assert(g.sss > 0.37f && g.sss < 0.38f);
+    }
+    // Clear coverage, ineligible status, unadmitted or switched off: unchanged.
+    {
+        Fill(t, 1.f);
+        auto g = with(0.25f);
+        Reference(Admitted(plain), 3, 3, 1, t, g);
+        assert(g.sss == 0.25f);
+        Fill(t, 0.f);
+        for (uint32_t status : {0u, 4u}) {
+            g = with(0.25f);
+            Reference(Admitted(plain), 3, 3, status, t, g);
+            assert(g.sss == 0.25f);
+        }
+        g = with(0.25f);
+        Reference(Make(plain, 8, 8), 3, 3, 1, t, g);
+        assert(g.sss == 0.25f);
+        Tuning off = plain;
+        off.sss = false;
+        g = with(0.25f);
+        Reference(Admitted(off), 3, 3, 1, t, g);
+        assert(g.sss == 0.25f);
+        // The albedo blend itself still runs.
+        assert(g.diffuse[0] == 0.5f);
+    }
+    // The floor is the smallest normal half float.
+    static_assert(SssFloor == 6.103515625e-05f);
+}
+
 static void TestReport() {
     Counters k{};
     k.frames = 600;
@@ -1021,8 +1100,10 @@ int main() {
     TestControl();
     TestClamp();
     TestReference();
+    TestSssFade();
     TestReport();
     TestStatus();
     puts("PASS: transparency blend admission, targets, blend/depth/signature classification, "
-         "coverage extent, control layout, tuning, reference math, report and status");
+         "coverage extent, control layout, tuning, reference math, SSS guide fade, report and "
+         "status");
 }

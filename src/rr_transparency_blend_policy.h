@@ -37,6 +37,7 @@ struct Tuning {
     float strength = 1.f;
     bool sky = true;
     bool filter = true;
+    bool sss = true; // fade the SSS guide with the same coverage
 };
 inline float ClampUnit(float value, float fallback) {
     return std::isnan(value) ? fallback : std::clamp(value, 0.f, 1.f);
@@ -50,7 +51,10 @@ inline Tuning Clamp(Tuning t) {
     return t;
 }
 
-inline constexpr uint32_t SkyFlag = 1u, RoughnessFlag = 2u, FilterFlag = 4u;
+inline constexpr uint32_t SkyFlag = 1u, RoughnessFlag = 2u, FilterFlag = 4u, SssFlag = 8u;
+// The least magnitude a faded SSS guide keeps: the smallest normal half float.
+// The next frame's SSS-masked lighting reads a nonzero guide as an SSS pixel.
+inline constexpr float SssFloor = 6.103515625e-05f;
 // Opacity at or below two 10-bit steps is quantization noise of the coverage target.
 inline constexpr float OpacityFloor = 2.f / 1023.f;
 // Mirrors the blend shader's cbuffer. Word 0 is written at submission time.
@@ -73,7 +77,7 @@ inline Control Make(const Tuning &tuning, uint32_t width, uint32_t height) {
     c.width = width;
     c.height = height;
     c.flags = (t.sky ? SkyFlag : 0u) | (t.roughness >= 0.f ? RoughnessFlag : 0u) |
-              (t.filter ? FilterFlag : 0u);
+              (t.filter ? FilterFlag : 0u) | (t.sss ? SssFlag : 0u);
     c.diffuse[0] = c.diffuse[1] = c.diffuse[2] = t.diffuse;
     c.params[0] = t.specular;
     c.params[1] = t.roughness >= 0.f ? t.roughness : 0.f;
@@ -336,6 +340,7 @@ struct Guides {
     float diffuse[3];
     float specular[3];
     float roughness;
+    float sss = 0.f; // the SSS guide, 0 off SSS pixels
 };
 inline float Saturate(float v) {
     return v > 0.f ? (v < 1.f ? v : 1.f) : 0.f; // NaN -> 0, as HLSL saturate
@@ -387,6 +392,15 @@ inline void Reference(const Control &control, uint32_t x, uint32_t y, uint32_t s
         }
         if (control.flags & RoughnessFlag)
             inout.roughness = Lerp(inout.roughness, control.params[1], Luma(c));
+        // The colour shows the background's SSS only through the layer's
+        // transmittance, about 1 - c: fade the guide by c, weighted as NVIDIA's
+        // SSS guide luminance (r + 2g + b) / 4.
+        if ((control.flags & SssFlag) && inout.sss != 0.f) {
+            const float w = 0.25f * c[0] + 0.5f * c[1] + 0.25f * c[2];
+            const float g = std::fabs(inout.sss);
+            const float faded = (std::max)(g * (1.f - w), (std::min)(g, SssFloor));
+            inout.sss = inout.sss < 0.f ? -faded : faded;
+        }
     }
 }
 

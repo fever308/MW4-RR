@@ -290,8 +290,15 @@ static void CoverageDraw(reshade::api::command_list *list,
         CoverageLog(path, CoverageNote::Exception, "draw exception");
     }
 }
-// Hidden tuning keys, read once with the other settings and never written.
-// Missing or unparsable keys keep their defaults; values are clamped.
+// The tuning last given to the controller; the panel's SSS checkbox edits it
+// under settings_mutex, as LoadBlendTuning does.
+static rrblend::Tuning &BlendTuning() noexcept {
+    static rrblend::Tuning tuning;
+    return tuning;
+}
+// Hidden tuning keys, read once with the other settings and never written,
+// except TransparencyBlendSss, which the panel saves. Missing or unparsable
+// keys keep their defaults; values are clamped.
 static void LoadBlendTuning(const char *section) noexcept {
     try {
         rrblend::Tuning t;
@@ -301,16 +308,19 @@ static void LoadBlendTuning(const char *section) noexcept {
         reshade::get_config_value(nullptr, section, "TransparencyBlendStrength", t.strength);
         reshade::get_config_value(nullptr, section, "TransparencyBlendSky", t.sky);
         reshade::get_config_value(nullptr, section, "TransparencyBlendFilter", t.filter);
+        reshade::get_config_value(nullptr, section, "TransparencyBlendSss", t.sss);
         t = rrblend::Clamp(t);
         LiveRR().SetTransparencyBlendTuning(t);
+        BlendTuning() = t;
         const rrblend::Tuning d;
         if (t.diffuse != d.diffuse || t.specular != d.specular || t.roughness != d.roughness ||
-            t.strength != d.strength || t.sky != d.sky || t.filter != d.filter) {
+            t.strength != d.strength || t.sky != d.sky || t.filter != d.filter || t.sss != d.sss) {
             char line[256];
             snprintf(line, sizeof(line),
                      "Transparency albedo blend tuning: diffuse=%.3f specular=%.3f roughness=%.3f "
-                     "strength=%.3f sky=%d filter=%d",
-                     t.diffuse, t.specular, t.roughness, t.strength, int(t.sky), int(t.filter));
+                     "strength=%.3f sky=%d filter=%d sss=%d",
+                     t.diffuse, t.specular, t.roughness, t.strength, int(t.sky), int(t.filter),
+                     int(t.sss));
             WriteLog(line);
         }
     } catch (...) {

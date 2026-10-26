@@ -789,6 +789,11 @@ struct GuideSet {
             resources[i] = &r;
         }
     }
+    // An SSS guide as rrsss::Gpu::GuideDesc makes it: R16_FLOAT, render size, UAV.
+    FakeResource &Sss(DXGI_FORMAT format = DXGI_FORMAT_R16_FLOAT) {
+        const auto d = resources[0]->GetDesc();
+        return fakes.emplace_back("sss", rrlive::TextureDesc(UINT(d.Width), d.Height, format));
+    }
 };
 
 // A prepared slot: device, pipeline helpers, owner and Gpu.
@@ -878,14 +883,15 @@ static void TestPipelineBuild() {
         "check-options", Format("check-format %u", DXGI_FORMAT_R16G16B16A16_FLOAT),
         "root-signature", "compute-pipeline"};
     assert(events == order);
-    // [0] root CBV b0 (control), [1] table t0-t1 then u0-u2, [2] root UAV u3 (stats).
+    // [0] root CBV b0 (control), [1] table t0-t1, u0-u2, then u4 (SSS guide), [2] root UAV u3
+    // (stats).
     assert(p.parameters.size() == 3 && p.flags == D3D12_ROOT_SIGNATURE_FLAG_NONE && !p.samplers);
     for (const auto &q : p.parameters)
         assert(q.visibility == D3D12_SHADER_VISIBILITY_ALL);
     assert(p.parameters[0].type == D3D12_ROOT_PARAMETER_TYPE_CBV && p.parameters[0].reg == 0 &&
            p.parameters[0].space == 0);
     const auto &table = p.parameters[1];
-    assert(table.type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && table.ranges.size() == 2);
+    assert(table.type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && table.ranges.size() == 3);
     assert(table.ranges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
            table.ranges[0].NumDescriptors == 2 && table.ranges[0].BaseShaderRegister == 0 &&
            table.ranges[0].RegisterSpace == 0 &&
@@ -894,6 +900,10 @@ static void TestPipelineBuild() {
            table.ranges[1].NumDescriptors == 3 && table.ranges[1].BaseShaderRegister == 0 &&
            table.ranges[1].RegisterSpace == 0 &&
            table.ranges[1].OffsetInDescriptorsFromTableStart == 2);
+    assert(table.ranges[2].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV &&
+           table.ranges[2].NumDescriptors == 1 && table.ranges[2].BaseShaderRegister == 4 &&
+           table.ranges[2].RegisterSpace == 0 &&
+           table.ranges[2].OffsetInDescriptorsFromTableStart == 5);
     assert(p.parameters[2].type == D3D12_ROOT_PARAMETER_TYPE_UAV && p.parameters[2].reg == 3 &&
            p.parameters[2].space == 0);
     assert(p.code == RRTransparencyBlend && p.code_size == sizeof(RRTransparencyBlend));
@@ -944,7 +954,7 @@ static void TestPipelineLive() {
            d->pParameters[0].Descriptor.ShaderRegister == 0);
     const auto &t = d->pParameters[1].DescriptorTable;
     assert(d->pParameters[1].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
-           t.NumDescriptorRanges == 2);
+           t.NumDescriptorRanges == 3);
     assert(t.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
            t.pDescriptorRanges[0].NumDescriptors == 2 &&
            t.pDescriptorRanges[0].OffsetInDescriptorsFromTableStart == 0);
@@ -952,6 +962,10 @@ static void TestPipelineLive() {
            t.pDescriptorRanges[1].NumDescriptors == 3 &&
            t.pDescriptorRanges[1].BaseShaderRegister == 0 &&
            t.pDescriptorRanges[1].OffsetInDescriptorsFromTableStart == 2);
+    assert(t.pDescriptorRanges[2].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV &&
+           t.pDescriptorRanges[2].NumDescriptors == 1 &&
+           t.pDescriptorRanges[2].BaseShaderRegister == 4 &&
+           t.pDescriptorRanges[2].OffsetInDescriptorsFromTableStart == 5);
     assert(d->pParameters[2].ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV &&
            d->pParameters[2].Descriptor.ShaderRegister == 3);
     pipeline = {};
@@ -1070,7 +1084,7 @@ static void TestPrepare() {
     const std::vector<std::string> order = Join(
         SizeQueries(),
         {Format("create-heap type=%u n=1 flags=0 mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
-         Format("create-heap type=%u n=5 flags=%u mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+         Format("create-heap type=%u n=6 flags=%u mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE),
          "map control sub=0 read=0-0", "map readback sub=0 read=all",
          Format("rtv coverage fmt=%u dim=%u at=0x10000", DXGI_FORMAT_R10G10B10A2_UNORM,
@@ -1145,7 +1159,7 @@ static void TestPrepareResumes() {
         events.clear();
         assert(gpu.Prepare(owner, p, budget, Scene()) && gpu.Ready());
         assert(owner.calls.size() == 4 && device.heaps.size() == 2);
-        assert(events[0] == (at ? Format("create-heap type=%u n=5 flags=%u mask=0",
+        assert(events[0] == (at ? Format("create-heap type=%u n=6 flags=%u mask=0",
                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
                                 : Format("create-heap type=%u n=1 flags=0 mask=0",
@@ -1381,6 +1395,9 @@ static void TestControl() {
     c.reserved[2] = 9;
     events.clear();
     s.gpu.WriteControl(c);
+    // No SSS guide was described, so its flag is cleared; the rest is the caller's.
+    assert(c.flags & SssFlag);
+    c.flags &= ~SssFlag;
     assert(!memcmp(memory, &c, sizeof(c)));
     // Seal writes word 0 only.
     s.gpu.Seal(true);
@@ -1418,7 +1435,14 @@ static void TestControlZero() {
     // Every other word is the caller's.
     auto expected = c;
     memset(expected.zero, 0, sizeof(expected.zero));
+    expected.flags &= ~SssFlag;
     assert(!memcmp(&mapped, &expected, sizeof(mapped)));
+}
+
+// Heap [5]: the u4 view of the SSS guide, or a null view of the same shape.
+static std::string SssView(const char *name, SIZE_T heap) {
+    return Format("uav %s counter=null fmt=%u dim=%u mip=0 plane=0 at=%#zx", name,
+                  DXGI_FORMAT_R16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 160);
 }
 
 static void TestDescriptors() {
@@ -1438,16 +1462,57 @@ static void TestDescriptors() {
         Format("uav diffuse counter=null fmt=%u dim=%u mip=0 plane=0 at=%#zx",
                DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 96),
         Format("uav specular counter=null fmt=%u dim=%u mip=0 plane=0 at=%#zx",
-               DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 128)};
-    assert(events == expected);
-    // Immutable until the slot retires: the same guides write nothing again,
-    // other guides are refused.
+               DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 128),
+        SssView("null", heap)};
+    assert(events == expected && !s.gpu.faded);
+    // Immutable until the slot retires: the same guides write only the SSS
+    // view again, other guides are refused.
     events.clear();
     s.gpu.WriteDescriptors(s.pipelines, g.resources);
-    assert(events.empty());
+    assert(events == std::vector<std::string>{SssView("null", heap)});
     GuideSet other;
+    events.clear();
     assert(Throws([&] { s.gpu.WriteDescriptors(s.pipelines, other.resources); }));
     assert(events.empty() && s.gpu.Described());
+
+    // The SSS guide's view is rewritten on every call; WriteControl keeps
+    // SssFlag only while it is a real view.
+    auto &memory = s.Get("control").memory;
+    auto flags = [&] {
+        Control mapped;
+        memcpy(&mapped, memory, sizeof(mapped));
+        return mapped.flags;
+    };
+    auto &sss = g.Sss();
+    events.clear();
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, &sss);
+    assert(events == std::vector<std::string>{SssView("sss", heap)} && s.gpu.faded == &sss);
+    s.gpu.WriteControl(Make(Tuning{}, 1920, 1080));
+    assert(flags() & SssFlag);
+    s.gpu.WriteDescriptors(s.pipelines, g.resources);
+    s.gpu.WriteControl(Make(Tuning{}, 1920, 1080));
+    assert(!(flags() & SssFlag) && !s.gpu.faded);
+    // A guide of another format or size, or without UAV access, is not used.
+    auto unusable = [&](FakeResource &bad) {
+        events.clear();
+        s.gpu.WriteDescriptors(s.pipelines, g.resources, &bad);
+        s.gpu.WriteControl(Make(Tuning{}, 1920, 1080));
+        return events == std::vector<std::string>{SssView("null", heap)} && !s.gpu.faded &&
+               !(flags() & SssFlag);
+    };
+    assert(unusable(g.Sss(DXGI_FORMAT_R32_FLOAT)));
+    auto &wide = g.Sss();
+    wide.desc.Width = 1921;
+    assert(unusable(wide));
+    auto &tall = g.Sss();
+    tall.desc.Height = 1081;
+    assert(unusable(tall));
+    auto &fixed = g.Sss();
+    fixed.desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    assert(unusable(fixed));
+    auto &sampled = g.Sss();
+    sampled.desc.SampleDesc.Count = 4;
+    assert(unusable(sampled));
 
     // Every guide is checked before any view is written.
     auto refused = [](auto change) {
@@ -1510,6 +1575,17 @@ static void TestRecord() {
         Transition("stats", source, common)};
     assert(events == expected);
     static_assert(noexcept(s.gpu.Record(&list, pipeline, g.resources, 1, 1)));
+
+    // With an SSS guide it goes to UAV beside the albedo guides and back.
+    auto &sss = g.Sss();
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, &sss);
+    events.clear();
+    s.gpu.Record(&list, pipeline, g.resources, 1919, 1081);
+    auto with = expected;
+    with.insert(with.begin() + 4, Transition("sss", read, uav));
+    with.insert(with.begin() + 19, Transition("sss", uav, read));
+    assert(with[18] == Transition("specular", uav, read));
+    assert(events == with);
 }
 
 static void TestHarvest() {

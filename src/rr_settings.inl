@@ -159,6 +159,17 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     if (requested_sss && LiveRR().Running())
         ImGui::Text("SSS lighting: %s", rrsssmask::Label(SssMaskState()));
     changed |= ImGui::Checkbox("Transparency albedo blend", &requested_blend);
+    if (requested_blend) {
+        // No hotkey; applied live through the blend tuning and saved on change.
+        ImGui::Indent();
+        auto &tuning = BlendTuning();
+        if (ImGui::Checkbox("Fade SSS guide under glass", &tuning.sss)) {
+            LiveRR().SetTransparencyBlendTuning(tuning);
+            reshade::set_config_value(nullptr, SettingsSection, "TransparencyBlendSss",
+                                      tuning.sss);
+        }
+        ImGui::Unindent();
+    }
     changed |= ImGui::Checkbox("Specular hit distance", &requested_hit);
     changed |= ImGui::Checkbox("Weapon depth", &requested_weapon_depth);
     {

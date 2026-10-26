@@ -4,7 +4,7 @@
 // The CPU mirror is rrblend::Reference in src/rr_transparency_blend_policy.h.
 cbuffer Control : register(b0) {
     uint Admitted, Width, Height, Flags; // Flags bit0 blend sky (status 2), bit1 blend roughness,
-                                         // bit2 3x3 tent filter
+                                         // bit2 3x3 tent filter, bit3 fade the SSS guide
     float4 Diffuse;                      // rgb = diffuse target
     float4 Params;                       // x specular target, y roughness target, z strength, w floor
     uint4 Reserved;                      // unused
@@ -16,6 +16,10 @@ RWTexture2D<float4> NormalRoughness : register(u0);
 RWTexture2D<float4> DiffuseAlbedo : register(u1);
 RWTexture2D<float4> SpecularAlbedo : register(u2);
 RWByteAddressBuffer Stats : register(u3); // [0] ran [4] eligible [8] covered [12] opacity*64
+RWTexture2D<float> SssGuide : register(u4); // a null view unless Flags bit3
+// The least magnitude a faded SSS guide keeps (rrblend::SssFloor): the next frame's
+// SSS-masked lighting reads a nonzero guide as an SSS pixel.
+static const float kSssFloor = 6.103515625e-05;
 groupshared uint g_eligible, g_covered, g_opacity;
 static const float3 kLuma = float3(0.299, 0.587, 0.114);
 // Opacity of render pixel q. Saturated per tap: NaN reads as clear, and a value
@@ -75,6 +79,16 @@ float3 Opacity(int2 q) {
         }
         DiffuseAlbedo[id.xy] = d;
         SpecularAlbedo[id.xy] = s;
+        // The colour shows the background's SSS only through the layer's transmittance,
+        // about 1 - c: fade the guide by c, weighted as NVIDIA's SSS guide luminance.
+        if (Flags & 8u) {
+            const float g = SssGuide[id.xy];
+            if (g != 0.0) {
+                const float w = dot(c, float3(0.25, 0.5, 0.25));
+                const float faded = max(abs(g) * (1.0 - w), min(abs(g), kSssFloor));
+                SssGuide[id.xy] = g < 0.0 ? -faded : faded;
+            }
+        }
     }
     if (eligible)
         InterlockedAdd(g_eligible, 1u);

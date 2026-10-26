@@ -181,7 +181,9 @@ void CoverageHarvest(Slot &s, ULONGLONG now) {
 // AfterSR, on the SR list after GateBegin (guides in NON_PIXEL_SHADER_RESOURCE)
 // and before evaluate. w x h is the render size, which BeforeSR proved equals
 // the slot's guides. Records the blend only when this frame's captures are
-// complete; nothing here may reach AfterSR's catch.
+// complete; nothing here may reach AfterSR's catch. When this frame's SSS guide
+// was resolved (sss_used, rrsss::Gpu::Resolve just before), the blend fades it
+// under the same coverage.
 void CoverageBlend(Slot &s, ID3D12GraphicsCommandList *cl, UINT w, UINT h) noexcept {
     try {
         const auto now = GetTickCount64();
@@ -197,7 +199,7 @@ void CoverageBlend(Slot &s, ID3D12GraphicsCommandList *cl, UINT w, UINT h) noexc
             CoverageRefused(rrblend::Reason::Extent);
             return;
         }
-        g.WriteDescriptors(pipelines, s.gpu.guides);
+        g.WriteDescriptors(pipelines, s.gpu.guides, s.sss_used ? s.gpu.sss.guide.Get() : nullptr);
         g.WriteControl(rrblend::Make(blend_tuning, w, h)); // Admitted 0 until Seal
         rrinternal::Scope copies;
         rrcompute::Tracker::Internal state;

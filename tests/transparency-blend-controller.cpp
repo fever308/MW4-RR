@@ -1275,6 +1275,22 @@ struct ControllerCpuTest {
         assert(Recorded("dispatch 240 135 1") && g.Described());
         const auto *k = reinterpret_cast<const rrblend::Control *>(g.control_map);
         assert(k->admitted == 0 && k->width == 1920 && k->height == 1080 && k->diffuse[0] == 0.25f);
+        // No SSS guide resolved this frame: a null view, SssFlag cleared.
+        assert(!g.faded && !(k->flags & rrblend::SssFlag));
+        // A resolved SSS guide is faded under the same coverage, on that frame only.
+        FakeResource sss("sss", Texture(1920, 1080, DXGI_FORMAT_R16_FLOAT, 1,
+                                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+        s.gpu.sss.guide = &sss;
+        s.sss_used = true;
+        events.clear();
+        c.CoverageBlend(s, &r.sr, 1920, 1080);
+        assert(g.faded == &sss && (k->flags & rrblend::SssFlag));
+        assert(Recorded("transition sss 0x40->0x8 sub=0xffffffff flags=0") &&
+               Recorded("transition sss 0x8->0x40 sub=0xffffffff flags=0"));
+        s.sss_used = false;
+        c.CoverageBlend(s, &r.sr, 1920, 1080);
+        assert(!g.faded && !(k->flags & rrblend::SssFlag));
+        s.gpu.sss.guide.Reset();
 
         // The submission-time seal: word 0 only, frame acceptance untouched.
         c.SealCoverage(s, 0, 1, 2, true);

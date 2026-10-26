@@ -43,6 +43,7 @@ Transparency albedo blend (on by default, with a checkbox in the panel and no ho
 - `TransparencyBlendStrength` (1): overall blend amount, from 0 (no change) to 1.
 - `TransparencyBlendSky` (1): 1 also blends where transparency layers cover the sky; 0 leaves sky pixels alone.
 - `TransparencyBlendFilter` (1): 1 smooths the blend mask over neighboring pixels; 0 uses it unfiltered.
+- `TransparencyBlendSss` (1): 1 also fades the Subsurface Scattering guide by the same coverage, so skin seen through glass is not described as skin to RR while its colour and albedo describe the glass; 0 leaves the guide unchanged. Also shown in the panel as "Fade SSS guide under glass" under the blend checkbox.
 
 The panel also has these checkboxes, all on by default and saved in `ReShade.ini`:
 

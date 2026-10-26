@@ -38,7 +38,8 @@ struct Pipeline {
     bool Ready() const {
         return bool(state);
     }
-    // Typed UAV load and store of the guide format (R16G16B16A16_FLOAT).
+    // Typed UAV load and store of the guide format (R16G16B16A16_FLOAT). The SSS
+    // guide's R16_FLOAT is in the set TypedUAVLoadAdditionalFormats guarantees.
     static bool TypedLoadSupported(ID3D12Device *d) noexcept {
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
         if (!d ||
@@ -71,13 +72,15 @@ struct Pipeline {
                 unavailable = Reason::Typed;
                 return false;
             }
-            // [0] b0 control, [1] t0 coverage, t1 status, u0-u2 guides, [2] u3 stats.
+            // [0] b0 control, [1] t0 coverage, t1 status, u0-u2 guides, u4 SSS guide,
+            // [2] u3 stats.
             D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
-                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 2}};
+                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 2},
+                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 4, 0, 5}};
             D3D12_ROOT_PARAMETER args[3]{};
             args[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             args[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            args[1].DescriptorTable = {2, ranges};
+            args[1].DescriptorTable = {3, ranges};
             args[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
             args[2].Descriptor.ShaderRegister = 3;
             D3D12_ROOT_SIGNATURE_DESC desc{3, args};
@@ -101,8 +104,9 @@ static_assert(sizeof(PassStats) == 16);
 // of this slot may still be in flight; the slot's fence (it is reused only
 // after it retired and completed, as for rrtrans::Gpu) guarantees that.
 struct Gpu {
-    static constexpr UINT HeapSize = 5; // [0] t0 coverage, [1] t1 status, [2..4] u0-u2 guides
-    ComPtr<ID3D12Resource> target;      // R10G10B10A2_UNORM 2DMS transmittance, COMMON at rest
+    // [0] t0 coverage, [1] t1 status, [2..4] u0-u2 guides, [5] u4 SSS guide
+    static constexpr UINT HeapSize = 6;
+    ComPtr<ID3D12Resource> target; // R10G10B10A2_UNORM 2DMS transmittance, COMMON at rest
     ComPtr<ID3D12Resource> control, stats, readback;
     ComPtr<ID3D12DescriptorHeap> rtv, heap;
     D3D12_RESOURCE_DESC desc{}; // the target's description, set with target
@@ -111,6 +115,9 @@ struct Gpu {
     UINT *control_map{};
     UINT *readback_map{}; // the GPU copies PassStats here; Record clears those words
     std::array<ID3D12Resource *, 4> described{}; // guides behind heap [1..4] (identity only)
+    // The SSS guide behind heap [5] for this frame, or null (a null view;
+    // WriteControl then clears SssFlag). Identity only.
+    ID3D12Resource *faded{};
     bool ready{}, recorded{};
 
     // A scene target the coverage target can mirror: 2D with 4 samples in the
@@ -271,21 +278,46 @@ struct Gpu {
         ready = true;
         return true;
     }
+    // An SSS guide the blend can fade in place: rrsss::Gpu::GuideDesc, the
+    // render size of the albedo guides.
+    static bool SssUsable(const D3D12_RESOURCE_DESC &d, const D3D12_RESOURCE_DESC &guide) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.DepthOrArraySize == 1 &&
+               d.SampleDesc.Count == 1 && d.Format == DXGI_FORMAT_R16_FLOAT &&
+               (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && d.Width == guide.Width &&
+               d.Height == guide.Height;
+    }
     // Heap [1] Status SRV and [2..4] guide UAVs, written once per slot after
     // the guides exist (GpuFrame::guides: normal/roughness, diffuse, specular,
     // status). They stay unchanged until the slot is released, so a later call
     // only checks that it names the same guides.
+    // Heap [5] is the SSS guide's UAV (u4), rewritten on every call: the guide
+    // is used only on frames whose SSS draw was resolved. Safe for the same
+    // reason as WriteControl: this slot's previous dispatch has completed. sss
+    // is null on other frames; then, or when it is not SssUsable, [5] is a
+    // null view and faded is null, so WriteControl clears SssFlag.
     template <class Pipelines>
-    void WriteDescriptors(Pipelines &p, const std::array<ComPtr<ID3D12Resource>, 4> &guides) {
+    void WriteDescriptors(Pipelines &p, const std::array<ComPtr<ID3D12Resource>, 4> &guides,
+                          ID3D12Resource *sss = nullptr) {
         using rrprivate::Require;
         Require(ready, "coverage blend resources not prepared");
         std::array<ID3D12Resource *, 4> resources{};
         for (unsigned i = 0; i < 4; ++i)
             resources[i] = guides[i].Get();
-        if (Described()) {
+        if (Described())
             Require(resources == described, "coverage blend guides changed before retirement");
-            return;
-        }
+        else
+            DescribeGuides(p, resources);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = DXGI_FORMAT_R16_FLOAT;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        faded = sss && SssUsable(sss->GetDesc(), resources[0]->GetDesc()) ? sss : nullptr;
+        p.device->CreateUnorderedAccessView(
+            faded, nullptr, &uav,
+            {heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(5) * stride});
+    }
+    template <class Pipelines>
+    void DescribeGuides(Pipelines &p, const std::array<ID3D12Resource *, 4> &resources) {
+        using rrprivate::Require;
         for (unsigned i = 0; i < 4; ++i) {
             Require(resources[i], "coverage blend guide missing");
             const auto d = resources[i]->GetDesc();
@@ -330,13 +362,16 @@ struct Gpu {
                           D3D12_RESOURCE_STATE_COMMON);
     }
     // The whole control buffer, except that Control::zero, the source Record
-    // clears the stats from, stays zero whatever c holds.
+    // clears the stats from, stays zero whatever c holds, and SssFlag is
+    // cleared unless the last WriteDescriptors wrote a real SSS guide view.
     void WriteControl(const Control &c) noexcept {
         if (!control_map)
             return;
-        memcpy(control_map, &c, sizeof(c));
-        memset(reinterpret_cast<unsigned char *>(control_map) + offsetof(Control, zero), 0,
-               sizeof(Control::zero));
+        auto k = c;
+        if (!faded)
+            k.flags &= ~SssFlag;
+        memset(k.zero, 0, sizeof(k.zero));
+        memcpy(control_map, &k, sizeof(k));
     }
     // Submission-time gate: word 0 only.
     void Seal(bool admitted) noexcept {
@@ -361,7 +396,9 @@ struct Gpu {
     }
     // On the SR list, after GateBegin (guides in NON_PIXEL_SHADER_RESOURCE),
     // before NGX evaluate. guides as in WriteDescriptors; guides[3] (status)
-    // keeps its state. The caller has prepared everything: this records only.
+    // keeps its state. The SSS guide WriteDescriptors last named, if any, is
+    // in NON_PIXEL_SHADER_RESOURCE too (after rrsss::Gpu::Resolve). The caller has prepared
+    // everything: this records only.
     void Record(ID3D12GraphicsCommandList *cl, const Pipeline &pipeline,
                 const std::array<ComPtr<ID3D12Resource>, 4> &guides, UINT w, UINT h) noexcept {
         using rrsss::Transition;
@@ -371,6 +408,8 @@ struct Gpu {
         Transition(cl, target.Get(), common, read);
         for (unsigned i = 0; i < 3; ++i)
             Transition(cl, guides[i].Get(), read, uav);
+        if (faded)
+            Transition(cl, faded, read, uav);
         Transition(cl, stats.Get(), common, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(stats.Get(), 0, control.Get(), offsetof(Control, zero),
                              sizeof(Control::zero));
@@ -388,6 +427,8 @@ struct Gpu {
         cl->ResourceBarrier(1, &order);
         for (unsigned i = 0; i < 3; ++i)
             Transition(cl, guides[i].Get(), uav, read);
+        if (faded)
+            Transition(cl, faded, uav, read);
         Transition(cl, target.Get(), read, common);
         Transition(cl, stats.Get(), uav, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, sizeof(PassStats));
