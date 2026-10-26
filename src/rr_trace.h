@@ -228,6 +228,9 @@ struct SlCall {
     bool valid{};
     unsigned feature{}, frame{UINT_MAX}, viewport{UINT_MAX};
     sl::CommandBuffer *command{};
+    // The game's own token, valid only during its evaluate call: RR's Streamline evaluate reuses
+    // it rather than taking a slot of Streamline's small token ring.
+    const sl::FrameToken *token{};
 };
 struct LastError {
     DWORD value = GetLastError();
@@ -370,28 +373,25 @@ class Probe {
     // Streamline entry points, so RR's own observers do not see it as the game's.
     static bool SlRRReady() {
         auto *self = active;
-        return self && self->sl_eval && self->sl_tags && self->constants && self->rr_options &&
-               self->frame_token;
+        return self && self->sl_eval && self->sl_tags && self->constants && self->rr_options;
     }
-    static sl::Result SlEvaluateRR(uint32_t frame, uint32_t viewport, const sl::Constants &c,
-                                   const sl::DLSSDOptions &options, const sl::ResourceTag *tags,
-                                   uint32_t count, sl::CommandBuffer *cl) {
+    static sl::Result SlEvaluateRR(const sl::FrameToken &token, uint32_t viewport,
+                                   const sl::Constants &c, const sl::DLSSDOptions &options,
+                                   const sl::ResourceTag *tags, uint32_t count,
+                                   sl::CommandBuffer *cl) {
         auto *self = active;
         if (!SlRRReady())
             return sl::Result::eErrorFeatureMissing;
-        sl::FrameToken *token{};
-        auto r = self->frame_token(token, &frame);
-        if (r != sl::Result::eOk || !token)
-            return r == sl::Result::eOk ? sl::Result::eErrorInvalidParameter : r;
         const sl::ViewportHandle handle(viewport);
-        if ((r = self->constants(c, *token, handle)) != sl::Result::eOk)
+        sl::Result r;
+        if ((r = self->constants(c, token, handle)) != sl::Result::eOk)
             return r;
         if ((r = self->rr_options(handle, options)) != sl::Result::eOk)
             return r;
-        if ((r = self->sl_tags(*token, handle, tags, count, cl)) != sl::Result::eOk)
+        if ((r = self->sl_tags(token, handle, tags, count, cl)) != sl::Result::eOk)
             return r;
         const sl::BaseStructure *inputs[] = {&handle};
-        return self->sl_eval(sl::kFeatureDLSS_RR, *token, inputs, 1, cl);
+        return self->sl_eval(sl::kFeatureDLSS_RR, token, inputs, 1, cl);
     }
     static CreationInfo CurrentCreation() {
         return current_creation;
@@ -564,7 +564,6 @@ class Probe {
     std::set<HMODULE> seen;
     std::set<void *> targets;
     PFun_slEvaluateFeature *sl_eval{};
-    PFun_slGetNewFrameToken *frame_token{};
     PFun_slSetTagForFrame *sl_tags{};
     using LegacyTag = sl::Result(const sl::ViewportHandle &, const sl::ResourceTag *, uint32_t,
                                  sl::CommandBuffer *);
@@ -875,8 +874,12 @@ class Probe {
             if (duplicate)
                 viewport = UINT_MAX;
             auto index = FrameIndex(frame);
-            current_call = {index != UINT_MAX && viewport != UINT_MAX && cl != nullptr, f, index,
-                            viewport, cl};
+            current_call = {index != UINT_MAX && viewport != UINT_MAX && cl != nullptr,
+                            f,
+                            index,
+                            viewport,
+                            cl,
+                            &frame};
         }
         return active->sl_eval(f, frame, inputs, count, cl);
     }
@@ -943,7 +946,6 @@ class Probe {
                 reinterpret_cast<void **>(&allocate));
         get_function =
             reinterpret_cast<PFun_slGetFeatureFunction *>(Address(m, "slGetFeatureFunction"));
-        frame_token = reinterpret_cast<PFun_slGetNewFrameToken *>(Address(m, "slGetNewFrameToken"));
     }
     void ResolveOptions() {
         if (!rr_options) {

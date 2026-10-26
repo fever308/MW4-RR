@@ -117,6 +117,7 @@ class Controller {
     UINT sl_constants_frame = UINT_MAX, sl_constants_view = UINT_MAX;
     unsigned sl_route_failures{}; // in a row; 3 send replacement back to RR's direct call
     bool sl_route_logged{};
+    bool sl_last_routed{}; // the latest RR evaluate went through Streamline
     UINT64 camera_time{};
     rrstatus::Telemetry status;
     rrpreset::Selection preset;
@@ -896,7 +897,7 @@ class Controller {
     // Changing the setting also clears a pause after refused replacement frames.
     // Whether RR's replacement evaluate can go through the game's Streamline for this SR call.
     bool SlRoutable(const rrtrace::SlCall &scope) const {
-        return sl_route_failures < 3 && rrtrace::Probe::SlRRReady() &&
+        return sl_route_failures < 3 && scope.token && rrtrace::Probe::SlRRReady() &&
                sl_constants_frame == scope.frame && sl_constants_view == scope.viewport;
     }
     void SetReplaceSR(bool value) {
@@ -1668,16 +1669,19 @@ class Controller {
                 // built-in RR, so add-ons beneath RR that need the game's DLSS call still see one.
                 bool routed = false;
                 sl::DLSSDOptions sl_options;
-                if (replacement && SlRoutable(scope) &&
+                // Only with an add-on hooked beneath RR: otherwise the direct call serves.
+                if (replacement && rrtrace::Probe::ForeignBeneath() && SlRoutable(scope) &&
                     rrslroute::Options(evaluated, preset.desired, s->view.data(), sl_options)) {
                     rrslroute::Tags tags;
                     rrslroute::Build(evaluated, resources, tags);
                     auto constants = sl_constants;
-                    constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+                    // RR's two features keep separate histories: switching between them resets.
+                    constants.reset =
+                        reset || !sl_last_routed ? sl::Boolean::eTrue : sl::Boolean::eFalse;
                     routed = true;
                     const auto viewport = rrslroute::Viewport(scope.viewport);
                     const auto r = rrtrace::Probe::SlEvaluateRR(
-                        scope.frame, viewport, constants, sl_options, tags.tags.data(), tags.count,
+                        *scope.token, viewport, constants, sl_options, tags.tags.data(), tags.count,
                         reinterpret_cast<sl::CommandBuffer *>(public_cl));
                     // A refused Streamline call falls back to the direct call for this frame, so
                     // it never retires RR.
@@ -1703,8 +1707,12 @@ class Controller {
                         }
                     }
                 }
-                if (!routed)
+                if (!routed) {
+                    if (sl_last_routed)
+                        parameters->Set(NVSDK_NGX_Parameter_Reset, 1);
                     evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
+                }
+                sl_last_routed = routed;
             } catch (...) {
                 threw = true;
                 Log("RR evaluation threw; restoring resources for native SR");
