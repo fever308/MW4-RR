@@ -366,6 +366,33 @@ class Probe {
     static const char *ForeignOwner() {
         return ForeignBeneath() ? foreign_owner : "";
     }
+    // RR's evaluation through the game's Streamline DLSS-D (rr_sl_route.h). Calls the original
+    // Streamline entry points, so RR's own observers do not see it as the game's.
+    static bool SlRRReady() {
+        auto *self = active;
+        return self && self->sl_eval && self->sl_tags && self->constants && self->rr_options &&
+               self->frame_token;
+    }
+    static sl::Result SlEvaluateRR(uint32_t frame, uint32_t viewport, const sl::Constants &c,
+                                   const sl::DLSSDOptions &options, const sl::ResourceTag *tags,
+                                   uint32_t count, sl::CommandBuffer *cl) {
+        auto *self = active;
+        if (!SlRRReady())
+            return sl::Result::eErrorFeatureMissing;
+        sl::FrameToken *token{};
+        auto r = self->frame_token(token, &frame);
+        if (r != sl::Result::eOk || !token)
+            return r == sl::Result::eOk ? sl::Result::eErrorInvalidParameter : r;
+        const sl::ViewportHandle handle(viewport);
+        if ((r = self->constants(c, *token, handle)) != sl::Result::eOk)
+            return r;
+        if ((r = self->rr_options(handle, options)) != sl::Result::eOk)
+            return r;
+        if ((r = self->sl_tags(*token, handle, tags, count, cl)) != sl::Result::eOk)
+            return r;
+        const sl::BaseStructure *inputs[] = {&handle};
+        return self->sl_eval(sl::kFeatureDLSS_RR, *token, inputs, 1, cl);
+    }
     static CreationInfo CurrentCreation() {
         return current_creation;
     }
@@ -408,8 +435,9 @@ class Probe {
             if (rrforeign::Beneath(eval, module, owner, sizeof(owner)) &&
                 !foreign_beneath.exchange(true)) {
                 strncpy_s(foreign_owner, owner[0] ? owner : "unknown code", _TRUNCATE);
-                Log("DLSS evaluation was hooked before RR by %s; the game's SR pass keeps "
-                    "running so that add-on still sees it",
+                Log("DLSS evaluation was hooked before RR by %s; RR replaces the game's "
+                    "SR pass only through the game's Streamline, so that add-on still sees a DLSS "
+                    "call",
                     foreign_owner);
             }
         }
@@ -536,6 +564,7 @@ class Probe {
     std::set<HMODULE> seen;
     std::set<void *> targets;
     PFun_slEvaluateFeature *sl_eval{};
+    PFun_slGetNewFrameToken *frame_token{};
     PFun_slSetTagForFrame *sl_tags{};
     using LegacyTag = sl::Result(const sl::ViewportHandle &, const sl::ResourceTag *, uint32_t,
                                  sl::CommandBuffer *);
@@ -914,6 +943,7 @@ class Probe {
                 reinterpret_cast<void **>(&allocate));
         get_function =
             reinterpret_cast<PFun_slGetFeatureFunction *>(Address(m, "slGetFeatureFunction"));
+        frame_token = reinterpret_cast<PFun_slGetNewFrameToken *>(Address(m, "slGetNewFrameToken"));
     }
     void ResolveOptions() {
         if (!rr_options) {

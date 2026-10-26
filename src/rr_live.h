@@ -15,6 +15,7 @@
 #include "rr_ngx_log.h"
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
+#include "rr_sl_route.h"
 #include <atomic>
 #include <mutex>
 #include <deque>
@@ -111,6 +112,11 @@ class Controller {
     UINT generation{}, camera_frame = UINT_MAX, camera_view = UINT_MAX, selected_view = UINT_MAX,
                        next_serial{};
     rrtrace::CameraInfo latest;
+    // The game's Streamline constants for the latest frame, for RR's own DLSS-D viewport.
+    sl::Constants sl_constants{};
+    UINT sl_constants_frame = UINT_MAX, sl_constants_view = UINT_MAX;
+    unsigned sl_route_failures{}; // in a row; 3 send replacement back to RR's direct call
+    bool sl_route_logged{};
     UINT64 camera_time{};
     rrstatus::Telemetry status;
     rrpreset::Selection preset;
@@ -888,6 +894,11 @@ class Controller {
     }
     // Native SR history is reset when its evaluations resume (rrtrace::Probe).
     // Changing the setting also clears a pause after refused replacement frames.
+    // Whether RR's replacement evaluate can go through the game's Streamline for this SR call.
+    bool SlRoutable(const rrtrace::SlCall &scope) const {
+        return sl_route_failures < 3 && rrtrace::Probe::SlRRReady() &&
+               sl_constants_frame == scope.frame && sl_constants_view == scope.viewport;
+    }
     void SetReplaceSR(bool value) {
         std::lock_guard lock(mutex);
         if (replace_sr == value)
@@ -932,6 +943,15 @@ class Controller {
     void Camera(UINT frame, UINT viewport, const sl::Constants &c) {
         std::lock_guard lock(mutex);
         latest = rrtrace::ReadCamera(c);
+        // At least the version RR was built with, so the copy reads only the game's own fields;
+        // the copy then says that version, so Streamline reads no further either.
+        if (c.structType == sl::Constants::s_structType && c.structVersion >= sl::kStructVersion2) {
+            sl_constants = c;
+            sl_constants.next = nullptr;
+            sl_constants.structVersion = sl::kStructVersion2;
+            sl_constants_frame = frame;
+            sl_constants_view = viewport;
+        }
         camera_frame = frame;
         camera_view = viewport;
         camera_time = GetTickCount64();
@@ -1269,6 +1289,10 @@ class Controller {
             return skip(rrsr::Scope);
         if (!native || s->sr.Get() != native.Get())
             return skip(rrsr::List);
+        // An add-on hooked beneath RR (DLSS5 NR) needs the game's DLSS call: replace SR only
+        // when RR can make that call through the game's Streamline.
+        if (rrtrace::Probe::ForeignBeneath() && !SlRoutable(scope))
+            return skip(rrsr::Foreign);
         rrsr::StateProof proof;
         bool untracked = false;
         for (unsigned i = 0; i < 4; ++i) {
@@ -1640,7 +1664,47 @@ class Controller {
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             bool threw = false; // then evaluated_result is the sentinel above, not NGX's
             try {
-                evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
+                // Replacing SR, RR goes through the game's Streamline DLSS-D like a game with
+                // built-in RR, so add-ons beneath RR that need the game's DLSS call still see one.
+                bool routed = false;
+                sl::DLSSDOptions sl_options;
+                if (replacement && SlRoutable(scope) &&
+                    rrslroute::Options(evaluated, preset.desired, s->view.data(), sl_options)) {
+                    rrslroute::Tags tags;
+                    rrslroute::Build(evaluated, resources, tags);
+                    auto constants = sl_constants;
+                    constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+                    routed = true;
+                    const auto viewport = rrslroute::Viewport(scope.viewport);
+                    const auto r = rrtrace::Probe::SlEvaluateRR(
+                        scope.frame, viewport, constants, sl_options, tags.tags.data(), tags.count,
+                        reinterpret_cast<sl::CommandBuffer *>(public_cl));
+                    // A refused Streamline call falls back to the direct call for this frame, so
+                    // it never retires RR.
+                    if (r != sl::Result::eOk) {
+                        routed = false;
+                        char line[160];
+                        snprintf(line, sizeof(line),
+                                 "RR through Streamline DLSS-D failed (result %d)%s", int(r),
+                                 ++sl_route_failures == 3 ? "; RR evaluates directly from now on"
+                                                          : "");
+                        Log(line);
+                    } else {
+                        evaluated_result = NVSDK_NGX_Result_Success;
+                        sl_route_failures = 0;
+                        if (!sl_route_logged) {
+                            sl_route_logged = true;
+                            char line[160];
+                            snprintf(line, sizeof(line),
+                                     "RR evaluates through Streamline DLSS-D on viewport 0x%x "
+                                     "(%u tags)",
+                                     viewport, tags.count);
+                            Log(line);
+                        }
+                    }
+                }
+                if (!routed)
+                    evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
             } catch (...) {
                 threw = true;
                 Log("RR evaluation threw; restoring resources for native SR");

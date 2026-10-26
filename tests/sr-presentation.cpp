@@ -1,5 +1,6 @@
 #include "../src/rr_sr_eligibility.h"
 #include "../src/rr_foreign_hook.h"
+#include "../src/rr_sl_route.h"
 #include "../src/rr_spatial_fallback.h"
 #include "../src/rr_status.h"
 #include <cassert>
@@ -112,4 +113,64 @@ int main() {
     assert(rrspatial::UseFallback(true, false, true));
     assert(!rrspatial::UseFallback(false, true, true));
     assert(!rrspatial::UseFallback(true, false, false));
+    // RR's Streamline route: its own viewport, the game's quality mode, and its tags.
+    static_assert(rrslroute::Viewport(0) == 0x52520000u);
+    static_assert(rrslroute::Viewport(0x12345) == 0x52522345u);
+    assert(rrslroute::Mode(0) == sl::DLSSMode::eMaxPerformance);
+    assert(rrslroute::Mode(2) == sl::DLSSMode::eMaxQuality);
+    assert(rrslroute::Mode(5) == sl::DLSSMode::eDLAA);
+    assert(rrslroute::Mode(9) == sl::DLSSMode::eOff);
+    {
+        const float m[16] = {1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 4, 0, 3, 5, 7, 1};
+        float inv[16];
+        assert(rrslroute::Invert(m, inv));
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) {
+                float v = 0;
+                for (int k = 0; k < 4; ++k)
+                    v += m[r * 4 + k] * inv[k * 4 + c];
+                assert(std::fabs(v - (r == c ? 1.f : 0.f)) < 1e-5f);
+            }
+        const float singular[16] = {};
+        assert(!rrslroute::Invert(singular, inv));
+        rreval::Options o;
+        o.quality = 1;
+        o.out_width = 3840;
+        o.out_height = 2160;
+        o.width = 1920;
+        o.height = 1080;
+        o.color_x = 8;
+        o.color_y = 4;
+        o.depth_x = o.depth_y = o.motion_x = o.motion_y = 0;
+        o.flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+        sl::DLSSDOptions options;
+        assert(rrslroute::Options(o, 4, m, options));
+        assert(options.mode == sl::DLSSMode::eBalanced && options.outputWidth == 3840);
+        assert(options.colorBuffersHDR == sl::Boolean::eTrue);
+        assert(options.balancedPreset == sl::DLSSDPreset(4));
+        assert(!rrslroute::Options(o, 4, singular, options));
+        o.quality = 7;
+        assert(!rrslroute::Options(o, 4, m, options));
+        o.quality = 1;
+        auto fake = [](uintptr_t v) { return reinterpret_cast<ID3D12Resource *>(v); };
+        rreval::Resources r{};
+        r.color = fake(0x10);
+        r.depth = fake(0x20);
+        r.motion = fake(0x30);
+        r.output = fake(0x40);
+        r.normal = fake(0x50);
+        rrslroute::Tags tags;
+        rrslroute::Build(o, r, tags);
+        assert(tags.count == 5);
+        assert(tags.tags[0].type == sl::kBufferTypeScalingInputColor);
+        assert(tags.tags[0].extent.left == 8 && tags.tags[0].extent.top == 4);
+        assert(tags.tags[0].extent.width == 1920 && tags.tags[0].resource == &tags.resources[0]);
+        assert(tags.tags[1].type == sl::kBufferTypeScalingOutputColor);
+        assert(tags.resources[1].state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        assert(tags.tags[1].extent.width == 3840);
+        assert(tags.resources[2].state == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        assert(tags.tags[4].type == sl::kBufferTypeNormalRoughness);
+        for (unsigned i = 0; i < tags.count; ++i)
+            assert(tags.tags[i].lifecycle == sl::eValidUntilEvaluate);
+    }
 }

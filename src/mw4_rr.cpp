@@ -195,10 +195,6 @@ static void SrBoundary(ID3D12GraphicsCommandList *cl, rrtrace::Kind kind,
 }
 static bool SrReplacement(ID3D12GraphicsCommandList *cl, const NVSDK_NGX_Parameter *p,
                           NVSDK_NGX_Result &result) {
-    if (rrtrace::Probe::ForeignBeneath()) {
-        rrsr::Note(rrsr::Foreign);
-        return false;
-    }
     auto n = fg::NativeObject<ID3D12GraphicsCommandList>(cl);
     const bool replaced = LiveRR().TryReplaceSR(
         cl, p, rrtrace::Probe::CurrentCall(), rrtrace::Probe::CurrentRuntime(),
