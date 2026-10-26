@@ -1307,6 +1307,8 @@ class Controller {
             return skip(rrsr::Scope);
         if (!native || s->sr.Get() != native.Get())
             return skip(rrsr::List);
+        if (!rrsr::ReplaceUnderForeignHook && rrtrace::Probe::ForeignBeneath())
+            return skip(rrsr::Foreign);
         rrsr::StateProof proof;
         bool untracked = false;
         for (unsigned i = 0; i < 4; ++i) {
@@ -1430,7 +1432,8 @@ class Controller {
                     "live original SR failed or scope changed");
             ComPtr<ID3D12Device> pub;
             Check(public_cl->GetDevice(IID_PPV_ARGS(&pub)), "live public device missing");
-            if (!pipelines.announced && fg::SameNativeObject(pub.Get(), pipelines.device.Get())) {
+            if (rrsr::ReplaceUnderForeignHook && !pipelines.announced &&
+                fg::SameNativeObject(pub.Get(), pipelines.device.Get())) {
                 pipelines.announced = pub;
                 Log(pub.Get() != fg::NativeObject<ID3D12Device>(pub.Get()).Get()
                         ? "RR's output and depth are created through ReShade's device, announced "

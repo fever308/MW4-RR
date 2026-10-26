@@ -4,6 +4,9 @@
 #include <atomic>
 #include <cstdint>
 namespace rrsr {
+// With an add-on hooked beneath RR (DLSS5 NR), replace SR and announce RR's output and depth to
+// other add-ons. Off: with NR running jobs on RR's frames the GPU hung (cross-queue wait).
+inline constexpr bool ReplaceUnderForeignHook = false;
 struct StateProof {
     std::array<bool, 4> known{};
     std::array<D3D12_RESOURCE_STATES, 4> states{};
