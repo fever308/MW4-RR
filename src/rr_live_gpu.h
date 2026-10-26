@@ -107,7 +107,8 @@ struct Pipelines {
     rrsss::ResolvePipeline sss;
     ComPtr<ID3D12Device> device;
     // The game's device as ReShade wraps it: a resource created through it is announced to other
-    // add-ons (init_resource), which DLSS5 NR needs for the output RR hands DLSS.
+    // add-ons (init_resource). DLSS5 NR admits a DLSS call only when its output, depth and motion
+    // are all in the registry it fills from those events, so RR's output and depth go through it.
     ComPtr<ID3D12Device> announced;
     ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, weapon_root,
         water_root;
@@ -658,7 +659,7 @@ struct GpuFrame {
             depth_buffer = Allocate(p, b, rrprivate::Buffer(size));
             auto d = TextureDesc(UINT(native.Width), native.Height, DXGI_FORMAT_R32_FLOAT);
             d.Flags = D3D12_RESOURCE_FLAG_NONE;
-            depth = Allocate(p, b, d);
+            depth = Allocate(p, b, d, D3D12_HEAP_TYPE_DEFAULT, nullptr, true);
         }
     }
     void Depth(ID3D12GraphicsCommandList *cl, D3D12_RESOURCE_STATES source_state) {

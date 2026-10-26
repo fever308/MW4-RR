@@ -205,7 +205,9 @@ class Controller {
                       budget.Reserve(pipelines.device.Get(), old + n);
             if (ok) {
                 try {
-                    t.texture = persistent.Allocate(pipelines, budget, d);
+                    // Weapon depth is the depth RR hands DLSS: announced like RR's own depth.
+                    t.texture = persistent.Allocate(pipelines, budget, d, D3D12_HEAP_TYPE_DEFAULT,
+                                                    nullptr, true);
                     test_reserve += budget.limit - old;
                 } catch (const std::exception &) {
                     budget.limit = old;
@@ -1431,10 +1433,10 @@ class Controller {
             if (!pipelines.announced && fg::SameNativeObject(pub.Get(), pipelines.device.Get())) {
                 pipelines.announced = pub;
                 Log(pub.Get() != fg::NativeObject<ID3D12Device>(pub.Get()).Get()
-                        ? "RR's output is created through ReShade's device, announced to other "
-                          "add-ons"
-                        : "RR's output is created on the native device: other add-ons are not "
-                          "told of it");
+                        ? "RR's output and depth are created through ReShade's device, announced "
+                          "to other add-ons"
+                        : "RR's output and depth are created on the native device: other add-ons "
+                          "are not told of them");
             }
             if (!Key(s->options, mod, epoch, pub.Get(), scope.viewport)) {
                 QueueReconfigure();
