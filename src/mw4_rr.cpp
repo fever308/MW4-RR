@@ -47,8 +47,8 @@ static rrcompute::Tracker &ComputeState() {
     static auto *p = []() {
         auto *v = new rrcompute::Tracker;
         v->UseSharedOutputContext(&SharedOutputCoverage);
-        if (!v->SetAfterIndirect(&CoverageAfterIndirect, &WriteLog))
-            WriteLog("Transparency albedo blend unavailable: indirect draw observer not installed");
+        // NR bisect A: the blend's ExecuteIndirect observer is not installed.
+        WriteLog("NR bisect A: blend indirect observer and signature hook not installed");
         return v;
     }();
     return *p;
@@ -258,8 +258,7 @@ static void OnDevice(reshade::api::device *d) {
                 WriteLog("RR optional native SSS PSO proof hooks unavailable; unproven SSS "
                          "pipelines stay off");
             // Before the game creates its command signatures: earlier ones read as Unknown.
-            const bool signatures = rrsig::Attach(reinterpret_cast<ID3D12Device *>(d->get_native()),
-                                                  ComputeState(), &WriteLog);
+            const bool signatures = false; // NR bisect A: no command signature hook
             CoveragePipelines().SignatureHook(d, signatures);
             if (!signatures)
                 WriteLog("Transparency albedo blend unavailable: command signature hook not "
