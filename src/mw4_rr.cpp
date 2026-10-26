@@ -205,8 +205,32 @@ static bool SrReplacement(ID3D12GraphicsCommandList *cl, const NVSDK_NGX_Paramet
         rrsr::counters.replaced.fetch_add(1, std::memory_order_relaxed);
         ComputeState().Invalidate(n.Get());
         result = NVSDK_NGX_Result_Success;
+        return true;
     }
-    return replaced;
+    // Test build: with an add-on hooked beneath RR (DLSS5 NR), the game's SR never runs while
+    // replacement is on, so that add-on never sees an SR stream and can only adopt RR's. The
+    // frame then continues as after a native SR call (RR draws over the output when it can),
+    // and a frame RR cannot draw keeps the previous output.
+    if (rrtrace::Probe::ForeignBeneath() && LiveRR().ReplaceSRWanted()) {
+        LiveRR().AfterSR(cl, p, rrtrace::Probe::CurrentCall(), NVSDK_NGX_Result_Success,
+                         rrtrace::Probe::CurrentRuntime(), rrtrace::Probe::RuntimeEpoch(),
+                         n && AlbedoInspector().SafeCopies(n.Get()) &&
+                             AlbedoInspector().StateCoverage(n.Get()),
+                         false);
+        ComputeState().Invalidate(n.Get());
+        static std::atomic<unsigned> held{};
+        const unsigned count = held.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 3 || count % 600 == 0) {
+            char line[160];
+            snprintf(line, sizeof(line),
+                     "Test: the game's SR skipped without RR (%u so far, last reason %s)", count,
+                     rrsr::SkipText(rrsr::counters.last.load(std::memory_order_relaxed)));
+            WriteLog(line);
+        }
+        result = NVSDK_NGX_Result_Success;
+        return true;
+    }
+    return false;
 }
 static bool BeforeNgxShutdown(HMODULE m, ID3D12Device *d) {
     return LiveRR().BeforeShutdown(m, d);

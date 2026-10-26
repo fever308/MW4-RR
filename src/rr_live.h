@@ -923,6 +923,10 @@ class Controller {
         replace_refusals = 0;
         sl_route_failures = 0;
     }
+    bool ReplaceSRWanted() {
+        std::lock_guard lock(mutex);
+        return replace_sr;
+    }
     bool ReplaceSRPaused() {
         std::lock_guard lock(mutex);
         return replace_sr && replace_paused;
@@ -1305,10 +1309,6 @@ class Controller {
             return skip(rrsr::Scope);
         if (!native || s->sr.Get() != native.Get())
             return skip(rrsr::List);
-        // An add-on hooked beneath RR (DLSS5 NR) needs the game's DLSS call: replace SR only
-        // when RR can make that call through the game's Streamline.
-        if (rrtrace::Probe::ForeignBeneath() && !SlRoutable(scope))
-            return skip(rrsr::Foreign);
         rrsr::StateProof proof;
         bool untracked = false;
         for (unsigned i = 0; i < 4; ++i) {
