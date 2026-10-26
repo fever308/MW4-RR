@@ -125,6 +125,18 @@ struct Tags {
         tags[count] = sl::ResourceTag(&resources[count], type, sl::eValidUntilEvaluate, &e);
         ++count;
     }
+    // Points the tag of this type at another resource; false when no such tag.
+    bool Replace(ID3D12Resource *r, sl::BufferType type, D3D12_RESOURCE_STATES state, uint32_t left,
+                 uint32_t top, uint32_t width, uint32_t height) {
+        for (uint32_t i = 0; i < count; ++i)
+            if (tags[i].type == type && r) {
+                resources[i] = sl::Resource(sl::ResourceType::eTex2d, r, uint32_t(state));
+                sl::Extent e{top, left, width, height};
+                tags[i] = sl::ResourceTag(&resources[i], type, sl::eValidUntilEvaluate, &e);
+                return true;
+            }
+        return false;
+    }
 };
 inline void Build(const rreval::Options &o, const rreval::Resources &r, Tags &t) {
     constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

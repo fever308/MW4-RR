@@ -172,5 +172,13 @@ int main() {
         assert(tags.tags[4].type == sl::kBufferTypeNormalRoughness);
         for (unsigned i = 0; i < tags.count; ++i)
             assert(tags.tags[i].lifecycle == sl::eValidUntilEvaluate);
+        assert(tags.Replace(fake(0x60), sl::kBufferTypeDepth, D3D12_RESOURCE_STATE_DEPTH_READ, 2, 3,
+                            1920, 1080));
+        assert(tags.tags[2].resource == &tags.resources[2] &&
+               tags.resources[2].native == fake(0x60));
+        assert(tags.resources[2].state == D3D12_RESOURCE_STATE_DEPTH_READ);
+        assert(tags.tags[2].extent.left == 2 && tags.tags[2].extent.top == 3 && tags.count == 5);
+        assert(!tags.Replace(fake(0x60), sl::kBufferTypeAlbedo, D3D12_RESOURCE_STATE_COMMON, 0, 0,
+                             1, 1));
     }
 }

@@ -1689,6 +1689,14 @@ class Controller {
                     rrslroute::Options(evaluated, preset.desired, s->view.data(), sl_options)) {
                     rrslroute::Tags tags;
                     rrslroute::Build(evaluated, resources, tags);
+                    // Test build: DLSS5 NR associates its guides with the game's own depth, so
+                    // RR's Streamline call is given that depth rather than RR's copy of it.
+                    if (s->gpu.use_depth || weapon_on) {
+                        tags.Replace(s->gpu.sr[1].Get(), sl::kBufferTypeDepth, states[1], o.depth_x,
+                                     o.depth_y, o.width, o.height);
+                        if (!sl_route_logged)
+                            Log("Test: RR's Streamline call is tagged with the game's own depth");
+                    }
                     auto constants = sl_constants;
                     // RR's two features keep separate histories: switching between them resets.
                     constants.reset = reset || !sl_last_routed || sl_history_lost
