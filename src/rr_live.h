@@ -1350,7 +1350,7 @@ class Controller {
                 rrngxlog::Require(NVSDK_NGX_SUCCEED(allocated) && parameters,
                                   "live NGX parameter allocation failed",
                                   rrngxlog::Returned(allocated, parameters));
-                rreval::CreateParameters(*parameters, o, preset.desired, weapon_on);
+                rreval::CreateParameters(*parameters, o, preset.desired); // NR test: hardware depth
                 Require(rrpreset::Requested(*parameters, preset.desired),
                         "live RR preset parameter readback failed");
                 auto created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
@@ -1415,6 +1415,11 @@ class Controller {
             auto evaluated = o;
             if (weapon_on)
                 evaluated.depth_x = evaluated.depth_y = 0;
+            static bool weapon_hw_logged;
+            if (weapon_on && !weapon_hw_logged) {
+                weapon_hw_logged = true;
+                Log("NR test: weapon depth sent as hardware reverse-Z depth");
+            }
             if (weapon_on && (weapon_map.scale != weapon_logged.scale ||
                               weapon_map.offset != weapon_logged.offset ||
                               weapon_map.sky != weapon_logged.sky)) {
