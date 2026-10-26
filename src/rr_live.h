@@ -1907,9 +1907,12 @@ class Controller {
                          : rrtrans::Admit(a, glass_pre[k], glass_anchor[k], b,
                                           s.transparency.prep_submitted,
                                           s.transparency.anchor_submitted, baseline));
-                if (s.transparency_used && s.transparency.producer_copy &&
-                    !s.transparency_accepted && !transparency_producer_suspended)
-                    SuspendTransparencyProducer(nullptr);
+                if (s.transparency_used && s.transparency.producer_copy) {
+                    if (s.transparency_accepted)
+                        transparency_backoff = 0;
+                    else if (!transparency_producer_suspended)
+                        SuspendTransparencyProducer(nullptr);
+                }
                 // Never part of acceptance: an unadmitted blend only reads no coverage.
                 SealCoverage(s, a, cover[k], b, baseline);
                 const bool accepted = baseline && (!s.sss_used || sss_accept) &&

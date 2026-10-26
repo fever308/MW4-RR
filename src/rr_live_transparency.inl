@@ -5,11 +5,16 @@ private:
 rrtrans::CompositionLatch transparency_composition;
 bool transparency_producer_suspended{};
 // A suspension ends after a pause instead of lasting until the guide is toggled: one frame that
-// was not admitted (or found no GPU memory) no longer drops the guide for the session.
+// was not admitted (or found no GPU memory) no longer drops the guide for the session. Repeated
+// non-admission backs off (5, 10, 20, 40, 60 s) until a producer frame is admitted again.
 ULONGLONG transparency_resume_at{};
-unsigned transparency_suspensions{};
+unsigned transparency_suspensions{}, transparency_backoff{};
 void SuspendTransparencyProducer(const char *why) {
-    const ULONGLONG pause = why ? 1000 : 5000;
+    ULONGLONG pause = 1000;
+    if (!why) {
+        pause = (std::min)(5000ull << (std::min)(transparency_backoff, 4u), 60000ull);
+        ++transparency_backoff;
+    }
     transparency_producer_suspended = true;
     transparency_resume_at = GetTickCount64() + pause;
     if (++transparency_suspensions > 3)
