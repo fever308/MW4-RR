@@ -118,6 +118,8 @@ class Controller {
     unsigned sl_route_failures{}; // in a row; 3 send replacement back to RR's direct call
     bool sl_route_logged{};
     bool sl_last_routed{}; // the latest RR evaluate went through Streamline
+    bool sl_history_lost{};       // an evaluate threw: the next one resets whichever route it takes
+    UINT sl_used_view = UINT_MAX; // RR's Streamline viewport, until RR retires
     UINT64 camera_time{};
     rrstatus::Telemetry status;
     rrpreset::Selection preset;
@@ -448,6 +450,18 @@ class Controller {
                 return RetirementFailed("RR feature retirement failed", exported, r);
             feature = nullptr;
             preset.Retired();
+        }
+        // RR's Streamline DLSS-D feature goes with RR's own, once the GPU is done with both.
+        if (sl_used_view != UINT_MAX) {
+            const auto r = rrtrace::Probe::SlFreeRR(sl_used_view);
+            if (r != sl::Result::eOk) {
+                char line[96];
+                snprintf(line, sizeof(line), "RR's Streamline DLSS-D release failed (result %d)",
+                         int(r));
+                Log(line);
+            }
+            sl_used_view = UINT_MAX;
+            sl_last_routed = false;
         }
         if (parameters) {
             const bool exported = api.destroy != nullptr;
@@ -907,6 +921,7 @@ class Controller {
         replace_sr = value;
         replace_paused = false;
         replace_refusals = 0;
+        sl_route_failures = 0;
     }
     bool ReplaceSRPaused() {
         std::lock_guard lock(mutex);
@@ -1676,13 +1691,17 @@ class Controller {
                     rrslroute::Build(evaluated, resources, tags);
                     auto constants = sl_constants;
                     // RR's two features keep separate histories: switching between them resets.
-                    constants.reset =
-                        reset || !sl_last_routed ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+                    constants.reset = reset || !sl_last_routed || sl_history_lost
+                                          ? sl::Boolean::eTrue
+                                          : sl::Boolean::eFalse;
                     routed = true;
                     const auto viewport = rrslroute::Viewport(scope.viewport);
+                    sl_used_view = viewport;
+                    // The list the game handed Streamline, which Streamline expects back.
                     const auto r = rrtrace::Probe::SlEvaluateRR(
                         *scope.token, viewport, constants, sl_options, tags.tags.data(), tags.count,
-                        reinterpret_cast<sl::CommandBuffer *>(public_cl));
+                        scope.command ? scope.command
+                                      : reinterpret_cast<sl::CommandBuffer *>(public_cl));
                     // A refused Streamline call falls back to the direct call for this frame, so
                     // it never retires RR.
                     if (r != sl::Result::eOk) {
@@ -1708,12 +1727,14 @@ class Controller {
                     }
                 }
                 if (!routed) {
-                    if (sl_last_routed)
+                    if (sl_last_routed || sl_history_lost)
                         parameters->Set(NVSDK_NGX_Parameter_Reset, 1);
                     evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
                 }
                 sl_last_routed = routed;
+                sl_history_lost = false;
             } catch (...) {
+                sl_history_lost = true;
                 threw = true;
                 Log("RR evaluation threw; restoring resources for native SR");
             }

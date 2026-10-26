@@ -393,6 +393,12 @@ class Probe {
         const sl::BaseStructure *inputs[] = {&handle};
         return self->sl_eval(sl::kFeatureDLSS_RR, token, inputs, 1, cl);
     }
+    static sl::Result SlFreeRR(uint32_t viewport) {
+        auto *self = active;
+        if (!self || !self->free_resources)
+            return sl::Result::eErrorFeatureMissing;
+        return self->free_resources(sl::kFeatureDLSS_RR, sl::ViewportHandle(viewport));
+    }
     static CreationInfo CurrentCreation() {
         return current_creation;
     }
@@ -574,6 +580,7 @@ class Probe {
     PFun_slAllocateResources *allocate{};
     PFun_slGetFeatureFunction *get_function{};
     PFun_slDLSSDSetOptions *rr_options{};
+    PFun_slFreeResources *free_resources{};
     PFun_slDLSSSetOptions *sr_options{};
     HMODULE sl_module{};
     int rr_resolve = -999, sr_resolve = -999;
@@ -946,6 +953,7 @@ class Probe {
                 reinterpret_cast<void **>(&allocate));
         get_function =
             reinterpret_cast<PFun_slGetFeatureFunction *>(Address(m, "slGetFeatureFunction"));
+        free_resources = reinterpret_cast<PFun_slFreeResources *>(Address(m, "slFreeResources"));
     }
     void ResolveOptions() {
         if (!rr_options) {
