@@ -106,6 +106,9 @@ struct Budget {
 struct Pipelines {
     rrsss::ResolvePipeline sss;
     ComPtr<ID3D12Device> device;
+    // The game's device as ReShade wraps it: a resource created through it is announced to other
+    // add-ons (init_resource), which DLSS5 NR needs for the output RR hands DLSS.
+    ComPtr<ID3D12Device> announced;
     ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, weapon_root,
         water_root;
     ComPtr<ID3D12PipelineState> converter, probability, water, weapon_depth;
@@ -297,7 +300,9 @@ struct GpuFrame {
     bool use_depth{}, hit_ready{}, water_written{};
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT,
-                                    const D3D12_CLEAR_VALUE *clear = nullptr) {
+                                    const D3D12_CLEAR_VALUE *clear = nullptr,
+                                    bool announce = false) {
+        ID3D12Device *device = announce && p.announced ? p.announced.Get() : p.device.Get();
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);
         Require(info.SizeInBytes && info.SizeInBytes <= b.limit &&
                     b.bytes <= b.limit - info.SizeInBytes,
@@ -307,13 +312,14 @@ struct GpuFrame {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = type;
         ComPtr<ID3D12Resource> r;
-        rrprivate::CheckAllocation(p.device->CreateCommittedResource(
-                  &hp, D3D12_HEAP_FLAG_NONE, &d,
-                  type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
-                  : type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
-                                                     : D3D12_RESOURCE_STATE_COMMON,
-                  clear, IID_PPV_ARGS(&r)),
-              "live resource allocation failed");
+        rrprivate::CheckAllocation(
+            device->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &d,
+                type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
+                : type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                   : D3D12_RESOURCE_STATE_COMMON,
+                clear, IID_PPV_ARGS(&r)),
+            "live resource allocation failed");
         b.bytes += info.SizeInBytes;
         bytes += info.SizeInBytes;
         return r;
@@ -630,7 +636,8 @@ struct GpuFrame {
         else {
             ow = o.out_width;
             oh = o.out_height;
-            rr_output = Allocate(p, b, TextureDesc(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT));
+            rr_output = Allocate(p, b, TextureDesc(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                 D3D12_HEAP_TYPE_DEFAULT, nullptr, true);
             SRV(p, rr_output.Get(), 9);
         }
         SRV(p, sr[0].Get(), 10);

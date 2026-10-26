@@ -116,7 +116,7 @@ class Controller {
     sl::Constants sl_constants{};
     UINT sl_constants_frame = UINT_MAX, sl_constants_view = UINT_MAX;
     unsigned sl_route_failures{}; // in a row; 3 send replacement back to RR's direct call
-    bool sl_route_logged{};
+    bool sl_route_logged{}, sl_vram_logged{};
     bool sl_last_routed{}; // the latest RR evaluate went through Streamline
     bool sl_history_lost{};       // an evaluate threw: the next one resets whichever route it takes
     UINT sl_used_view = UINT_MAX; // RR's Streamline viewport, until RR retires
@@ -923,10 +923,6 @@ class Controller {
         replace_refusals = 0;
         sl_route_failures = 0;
     }
-    bool ReplaceSRWanted() {
-        std::lock_guard lock(mutex);
-        return replace_sr;
-    }
     bool ReplaceSRPaused() {
         std::lock_guard lock(mutex);
         return replace_sr && replace_paused;
@@ -1432,6 +1428,14 @@ class Controller {
                     "live original SR failed or scope changed");
             ComPtr<ID3D12Device> pub;
             Check(public_cl->GetDevice(IID_PPV_ARGS(&pub)), "live public device missing");
+            if (!pipelines.announced && fg::SameNativeObject(pub.Get(), pipelines.device.Get())) {
+                pipelines.announced = pub;
+                Log(pub.Get() != fg::NativeObject<ID3D12Device>(pub.Get()).Get()
+                        ? "RR's output is created through ReShade's device, announced to other "
+                          "add-ons"
+                        : "RR's output is created on the native device: other add-ons are not "
+                          "told of it");
+            }
             if (!Key(s->options, mod, epoch, pub.Get(), scope.viewport)) {
                 QueueReconfigure();
                 return false;
@@ -1685,7 +1689,10 @@ class Controller {
                 bool routed = false;
                 sl::DLSSDOptions sl_options;
                 // Only with an add-on hooked beneath RR: otherwise the direct call serves.
-                if (replacement && rrtrace::Probe::ForeignBeneath() && SlRoutable(scope) &&
+                // Off in this test: with its output announced, RR's direct call should serve.
+                constexpr bool through_streamline = false;
+                if (through_streamline && replacement && rrtrace::Probe::ForeignBeneath() &&
+                    SlRoutable(scope) &&
                     rrslroute::Options(evaluated, preset.desired, s->view.data(), sl_options)) {
                     rrslroute::Tags tags;
                     rrslroute::Build(evaluated, resources, tags);
@@ -1712,7 +1719,12 @@ class Controller {
                                       : reinterpret_cast<sl::CommandBuffer *>(public_cl));
                     // A refused Streamline call falls back to the direct call for this frame, so
                     // it never retires RR.
-                    if (r != sl::Result::eOk) {
+                    // Out of VRAM is a warning Streamline returns after recording the evaluate.
+                    if (r == sl::Result::eWarnOutOfVRAM && !sl_vram_logged) {
+                        sl_vram_logged = true;
+                        Log("RR through Streamline DLSS-D: recorded with an out-of-VRAM warning");
+                    }
+                    if (r != sl::Result::eOk && r != sl::Result::eWarnOutOfVRAM) {
                         routed = false;
                         char line[160];
                         snprintf(line, sizeof(line),
