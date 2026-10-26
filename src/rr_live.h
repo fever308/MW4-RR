@@ -68,7 +68,9 @@ class Controller {
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12CommandQueue> last_queue;
     UINT64 signaled{};
-    bool enabled{}, failed{}, initialized{}, history_queued{}, retired{};
+    bool enabled{}, failed{}, initialized{}, retired{};
+    // Cross-queue waits RR inserted, logged up to a cap for the hang trace.
+    unsigned queue_waits_logged{};
     // A new RR allocation found no GPU memory: native frames until memory_retry_after (ms), and
     // one log line per wait.
     ULONGLONG memory_retry_after{};
@@ -385,6 +387,23 @@ class Controller {
         Check(init_list->Close(), "live init close failed");
         Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)),
               "live timeline fence failed");
+        // Clear the history on a private queue and wait for it here, not from inside the
+        // game's ExecuteCommandLists: a nested submission there can reach a compute queue, and
+        // another add-on's submit hook (DLSS5 NR's) loses track of the outer submission.
+        ComPtr<ID3D12CommandQueue> setup_queue;
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        Check(d->CreateCommandQueue(&qd, IID_PPV_ARGS(&setup_queue)), "live init queue failed");
+        ComPtr<ID3D12Fence> setup_fence;
+        Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&setup_fence)),
+              "live init fence failed");
+        {
+            rrinternal::Scope guard;
+            ID3D12CommandList *setup = init_list.Get();
+            setup_queue->ExecuteCommandLists(1, &setup);
+        }
+        Check(setup_queue->Signal(setup_fence.Get(), 1), "live init signal failed");
+        Require(rrprivate::FencePoint{setup_fence, 1}.Wait(5000), "live init unfinished");
         initialized = true;
     }
     bool NeedsReconfigure() const {
@@ -499,7 +518,8 @@ class Controller {
         transparency_source.Reset();
         transparency_composition = {};
         CoverageReconfigured();
-        initialized = history_queued = false;
+        initialized = false;
+        queue_waits_logged = 0;
         signaled = 0;
         runtime = nullptr;
         runtime_epoch = 0;
@@ -1862,15 +1882,19 @@ class Controller {
                     "live queue identity mismatch");
             if (last_queue && last_queue.Get() != q && signaled) {
                 const auto wait_result = q->Wait(fence.Get(), signaled);
-                Check(wait_result, "live cross-queue GPU wait failed");
-            }
-            if (!history_queued) {
-                rrinternal::Scope guard;
-                ID3D12CommandList *setup = init_list.Get();
-                {
-                    q->ExecuteCommandLists(1, &setup);
+                if (queue_waits_logged < 32) {
+                    ++queue_waits_logged;
+                    char line[200];
+                    snprintf(line, sizeof(line),
+                             "RR queue trace: wait %llu (completed %llu) on queue %p type %d, "
+                             "previous queue %p, hr 0x%08lX",
+                             (unsigned long long)signaled,
+                             (unsigned long long)fence->GetCompletedValue(), (void *)q,
+                             int(q->GetDesc().Type), (void *)last_queue.Get(),
+                             (unsigned long)wait_result);
+                    Log(line);
                 }
-                history_queued = true;
+                Check(wait_result, "live cross-queue GPU wait failed");
             }
             last_queue = q;
             queue_ready = q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;

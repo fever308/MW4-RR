@@ -937,7 +937,6 @@ struct ControllerCpuTest {
             c.lighting_valid = [](UINT64, UINT64) { return true; };
             c.SetEnabled(true);
             c.initialized = true;
-            c.history_queued = true;
             c.pipelines.device = &device;
             c.pipelines.stride = 32;
             c.fence = &fence;
