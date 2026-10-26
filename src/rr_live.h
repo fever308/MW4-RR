@@ -1908,9 +1908,8 @@ class Controller {
                                           s.transparency.prep_submitted,
                                           s.transparency.anchor_submitted, baseline));
                 if (s.transparency_used && s.transparency.producer_copy &&
-                    !s.transparency_accepted) {
-                    transparency_producer_suspended = true;
-                }
+                    !s.transparency_accepted && !transparency_producer_suspended)
+                    SuspendTransparencyProducer(nullptr);
                 // Never part of acceptance: an unadmitted blend only reads no coverage.
                 SealCoverage(s, a, cover[k], b, baseline);
                 const bool accepted = baseline && (!s.sss_used || sss_accept) &&

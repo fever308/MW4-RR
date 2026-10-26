@@ -4,6 +4,26 @@
 private:
 rrtrans::CompositionLatch transparency_composition;
 bool transparency_producer_suspended{};
+// A suspension ends after a pause instead of lasting until the guide is toggled: one frame that
+// was not admitted (or found no GPU memory) no longer drops the guide for the session.
+ULONGLONG transparency_resume_at{};
+unsigned transparency_suspensions{};
+void SuspendTransparencyProducer(const char *why) {
+    const ULONGLONG pause = why ? 1000 : 5000;
+    transparency_producer_suspended = true;
+    transparency_resume_at = GetTickCount64() + pause;
+    if (++transparency_suspensions > 3)
+        return;
+    char line[192];
+    snprintf(line, sizeof(line), "Transparency guide paused (%s); retrying in %llus%s",
+             why ? why : "frame not admitted", pause / 1000,
+             transparency_suspensions == 3 ? " (further pauses not logged)" : "");
+    Log(line);
+}
+void ResumeTransparencyProducer() {
+    if (transparency_producer_suspended && GetTickCount64() >= transparency_resume_at)
+        transparency_producer_suspended = false;
+}
 
 Slot *TransparencySlot(ID3D12Resource *source, bool allow_late_anchor = false) {
     if (!source || !initialized || camera_frame == UINT_MAX || camera_view == UINT_MAX ||
@@ -103,6 +123,7 @@ public:
 bool TransparencyProducerMark(ID3D12GraphicsCommandList *cl, ID3D12Resource *source,
                               UINT64 recording) {
     std::lock_guard lock(mutex);
+    ResumeTransparencyProducer();
     if (!enabled || !transparency_enabled || transparency_failed ||
         transparency_producer_suspended || failed || retired || NeedsReconfigure() || !cl ||
         !source || !recording || cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
@@ -216,9 +237,14 @@ bool TransparencyProducerTransition(ID3D12GraphicsCommandList *cl, const D3D12_R
             s.gpu.transparency.Copy(cl, t.source.Get(), t.producer_state);
             t.written = true;
             return true;
+        } catch (const rrprivate::AllocationDeferred &) {
+            t.written = false;
+            SuspendTransparencyProducer("waiting for GPU memory");
+            return false;
         } catch (const std::exception &e) {
             t.written = false;
             transparency_producer_suspended = true;
+            transparency_resume_at = ~0ull; // A real failure stays until the guide toggles.
             Log(e.what());
             return false;
         }
