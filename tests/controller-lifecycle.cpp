@@ -113,8 +113,11 @@ struct CpuResource final : ID3D12Resource {
     }
 };
 static unsigned releases{}, destroys{};
+static void (*on_release)(){}; // runs inside the fake ReleaseFeature
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
+    if (on_release)
+        on_release();
     return NVSDK_NGX_Result_Success;
 }
 static NVSDK_NGX_Result NVSDK_CONV DestroyParameters(NVSDK_NGX_Parameter *) {
@@ -332,6 +335,8 @@ struct ControllerCpuTest {
             c.SetEnabled(true);
         };
         releases = destroys = 0;
+        static Controller *probe;
+        static bool unlocked;
         Controller c;
         rig(c);
         c.ReleaseWhileOff(c.off_since + Controller::ReleaseDelay * 10);
@@ -341,7 +346,29 @@ struct ControllerCpuTest {
         assert(off);
         c.ReleaseWhileOff(off + Controller::ReleaseDelay - 1);
         assert(c.feature && c.initialized && !releases); // a quick toggle keeps RR
+        // A slot still in flight: Reconfigure refuses and nothing else changes.
+        c.slots[0].pre_live = true;
         c.ReleaseWhileOff(off + Controller::ReleaseDelay);
+        assert(c.feature && !releases && !c.layout_pending && !c.NeedsReconfigure());
+        c.slots[0].pre_live = false;
+        // Poll holds RR's lock; ReleaseFeature runs with it released.
+        probe = &c;
+        unlocked = false;
+        on_release = [] {
+            std::thread([] {
+                if (probe->mutex.try_lock()) {
+                    unlocked = true;
+                    probe->mutex.unlock();
+                }
+            }).join();
+        };
+        {
+            std::lock_guard lock(c.mutex);
+            c.ReleaseWhileOff(off + Controller::ReleaseDelay);
+            assert(!c.foreign_call);
+        }
+        on_release = nullptr;
+        assert(unlocked);
         assert(!c.feature && !c.parameters && !c.initialized && releases == 1 && destroys == 1);
         assert(logged == "RR off: its GPU memory was released; turning it on creates RR again\n");
         logged.clear();

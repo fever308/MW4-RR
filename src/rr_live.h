@@ -100,17 +100,29 @@ class Controller {
     // back the feature and every slot (ReleaseWhileOff), so a player who turns RR off gets its
     // VRAM back; a quick A/B toggle keeps it and resumes without re-creating RR.
     UINT64 off_since{};
-    bool off_released{};
+    bool off_released{}, ngx_unlocked{};
+    template <class F> NVSDK_NGX_Result Retire(F &&f) {
+        return ngx_unlocked ? Foreign(f) : f();
+    }
     static constexpr UINT64 ReleaseDelay = 10000;
     void ReleaseWhileOff(UINT64 now) {
         if (enabled || !off_since || now - off_since < ReleaseDelay || off_released || fatal ||
             retired || foreign_call || !(initialized || feature || parameters))
             return;
         // Reconfigure waits for outstanding GPU work: it refuses until every slot can retire,
-        // and a later Poll tries again.
+        // and a later Poll tries again with nothing else changed. Its NGX calls run with RR's
+        // lock released (Foreign), as at evaluation: at present time another add-on's NGX call
+        // (Frame Generation's) may be recording barriers RR observes under that lock.
+        const bool pending = layout_pending;
         layout_pending = true;
-        if (!Reconfigure())
+        ngx_unlocked = true;
+        const bool released = Reconfigure();
+        ngx_unlocked = false;
+        if (!released) {
+            if (!failed)
+                layout_pending = pending;
             return;
+        }
         off_released = true;
         Log("RR off: its GPU memory was released; turning it on creates RR again");
     }
@@ -564,7 +576,8 @@ class Controller {
         rrcompute::Tracker::Internal state;
         if (feature) {
             const bool exported = api.release != nullptr;
-            const auto r = exported ? api.release(feature) : NVSDK_NGX_Result_Fail;
+            const auto r =
+                exported ? Retire([&, h = feature] { return api.release(h); }) : NVSDK_NGX_Result_Fail;
             if (!exported || NVSDK_NGX_FAILED(r))
                 return RetirementFailed("RR feature retirement failed", exported, r);
             feature = nullptr;
@@ -572,7 +585,8 @@ class Controller {
         }
         if (parameters) {
             const bool exported = api.destroy != nullptr;
-            const auto r = exported ? api.destroy(parameters) : NVSDK_NGX_Result_Fail;
+            const auto r = exported ? Retire([&, m = parameters] { return api.destroy(m); })
+                                    : NVSDK_NGX_Result_Fail;
             if (!exported || NVSDK_NGX_FAILED(r))
                 return RetirementFailed("RR parameter retirement failed", exported, r);
             parameters = nullptr;
