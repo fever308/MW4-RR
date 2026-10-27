@@ -99,6 +99,24 @@ struct Ticket {
         return n;
     }
 };
+// A frame generation evaluate: GPU work the game records after it in its list, and where that
+// list is submitted relative to Present. Work after it in the same list means FG's inputs are
+// consumed mid-list: a pass placed at Present runs too late for frame generation.
+struct FgTicket {
+    uint32_t id{};
+    uint64_t list{};
+    uint32_t mark{};
+    std::array<uint32_t, size_t(Op::Count)> ops_at_mark{}, ops_after{};
+    uint64_t presents_at_eval{};
+    Submission submit; // presents = Presents between the evaluate and its submission
+    bool abandoned{};
+    uint32_t Commands() const {
+        uint32_t n = 0;
+        for (auto v : ops_after)
+            n += v;
+        return n;
+    }
+};
 inline Verdict Judge(const Ticket &t) {
     if (!t.submit.seen)
         return t.verdict == Verdict::Abandoned ? Verdict::Abandoned : Verdict::Unsubmitted;
@@ -206,6 +224,17 @@ class Probe {
         std::lock_guard lock(mutex);
         auto &rec = Record(list);
         rec.fg_event = ++rec.events;
+        FgTicket f;
+        f.id = ++next_fg;
+        f.list = list;
+        f.mark = rec.fg_event;
+        f.ops_at_mark = rec.ops;
+        f.presents_at_eval = presents;
+        if (fg_tickets.size() >= MaxTickets) {
+            CloseFg(fg_tickets.front());
+            fg_tickets.erase(fg_tickets.begin());
+        }
+        fg_tickets.push_back(f);
     }
     void Reset(uint64_t list) {
         if (!armed)
@@ -214,6 +243,13 @@ class Probe {
         for (auto &t : tickets)
             if (t.list == list && !t.submit.seen && t.verdict == Verdict::Pending)
                 t.verdict = Verdict::Abandoned;
+        for (size_t i = 0; i < fg_tickets.size();)
+            if (fg_tickets[i].list == list) {
+                fg_tickets[i].abandoned = true;
+                CloseFg(fg_tickets[i]);
+                fg_tickets.erase(fg_tickets.begin() + i);
+            } else
+                ++i;
         lists.erase(list);
         Sweep();
     }
@@ -226,6 +262,19 @@ class Probe {
             auto at = lists.find(ids[i]);
             const ListRecord *rec = at == lists.end() ? nullptr : &at->second;
             Submission here{true, ids[i], queue, queue_type, batch, i, n};
+            if (rec) {
+                for (size_t f = 0; f < fg_tickets.size();)
+                    if (fg_tickets[f].list == ids[i]) {
+                        auto &g = fg_tickets[f];
+                        g.submit = here;
+                        g.submit.presents = uint32_t(presents - g.presents_at_eval);
+                        for (size_t k = 0; k < g.ops_after.size(); ++k)
+                            g.ops_after[k] = rec->ops[k] - g.ops_at_mark[k];
+                        CloseFg(g);
+                        fg_tickets.erase(fg_tickets.begin() + f);
+                    } else
+                        ++f;
+            }
             for (auto &t : tickets) {
                 if (t.verdict != Verdict::Pending)
                     continue;
@@ -255,6 +304,12 @@ class Probe {
             return;
         std::lock_guard lock(mutex);
         ++presents;
+        for (size_t i = 0; i < fg_tickets.size();)
+            if (presents - fg_tickets[i].presents_at_eval > Window + 2) {
+                CloseFg(fg_tickets[i]);
+                fg_tickets.erase(fg_tickets.begin() + i);
+            } else
+                ++i;
         for (auto &t : tickets)
             if (t.verdict == Verdict::Pending) {
                 ++t.presents;
@@ -273,6 +328,10 @@ class Probe {
         std::lock_guard lock(mutex);
         return closed;
     }
+    std::vector<FgTicket> ClosedFg() const {
+        std::lock_guard lock(mutex);
+        return closed_fg;
+    }
     bool keep_closed = false; // tests keep closed tickets
 
   private:
@@ -287,6 +346,9 @@ class Probe {
     bool armed{};
     std::unordered_map<uint64_t, ListRecord> lists;
     std::vector<Ticket> tickets, closed;
+    std::vector<FgTicket> fg_tickets, closed_fg;
+    uint32_t next_fg{};
+    uint64_t fg_logged{};
     std::array<uint64_t, 4> watched{};
     unsigned watch_next{};
     uint32_t next_id{};
@@ -344,6 +406,29 @@ class Probe {
             LogTicket(t);
         if (summary && logged % summary == 0)
             LogSummary();
+    }
+    void CloseFg(const FgTicket &f) {
+        if (keep_closed)
+            closed_fg.push_back(f);
+        if (!logger || ++fg_logged > detailed)
+            return;
+        char line[400];
+        if (!f.submit.seen)
+            snprintf(line, sizeof(line), "NR order FG #%u list=%llx %s", f.id,
+                     (unsigned long long)f.list,
+                     f.abandoned ? "abandoned (list reset before submission)"
+                                 : "never submitted in the window");
+        else
+            snprintf(line, sizeof(line),
+                     "NR order FG #%u list=%llx after fg in list: draw=%u dispatch=%u indirect=%u "
+                     "copy=%u clear=%u resolve=%u | submit: q=%llx(%s) batch=%llu idx=%u/%u "
+                     "presents-between=%u",
+                     f.id, (unsigned long long)f.list, f.ops_after[0], f.ops_after[1],
+                     f.ops_after[2], f.ops_after[3], f.ops_after[4], f.ops_after[5],
+                     (unsigned long long)f.submit.queue, QueueName(f.submit.queue_type),
+                     (unsigned long long)f.submit.batch, f.submit.index, f.submit.count,
+                     f.submit.presents);
+        logger(line);
     }
     static const char *QueueName(uint8_t type) {
         return type == 0 ? "direct" : type == 2 ? "compute" : type == 3 ? "copy" : "other";

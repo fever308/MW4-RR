@@ -224,6 +224,28 @@ static void Ranges() {
     CHECK(RangeUse({{1, 500, 1}}, two).resource == O);
 }
 
+static void FgTickets() {
+    Armed p;
+    p.Command(F, Op::Draw);
+    p.FrameGen(F);
+    p.Command(F, Op::Draw);
+    p.Command(F, Op::Copy);
+    p.Present();
+    Submit(p, Q, {L, F});
+    auto fg = p.ClosedFg();
+    CHECK(fg.size() == 1 && fg[0].submit.seen && fg[0].submit.index == 1);
+    CHECK(fg[0].Commands() == 2 && fg[0].ops_after[size_t(Op::Copy)] == 1);
+    CHECK(fg[0].submit.presents == 1);
+    CHECK(lines.back().find("NR order FG #1") != std::string::npos);
+    p.FrameGen(C);
+    p.Reset(C);
+    CHECK(p.ClosedFg().size() == 2 && p.ClosedFg()[1].abandoned);
+    p.FrameGen(L);
+    for (int i = 0; i < 5; ++i)
+        p.Present();
+    CHECK(p.ClosedFg().size() == 3 && !p.ClosedFg()[2].submit.seen);
+}
+
 int main() {
     Disarmed();
     WorkAfterProducer();
@@ -239,5 +261,6 @@ int main() {
     TicketLimit();
     Summary();
     Ranges();
+    FgTickets();
     std::puts("NR ordering probe tests passed");
 }
