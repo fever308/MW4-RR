@@ -305,6 +305,48 @@ class Tracker {
     Location Find(uint64_t list, Register reg) const {
         return FindImpl(list, reg, false);
     }
+    // NR ordering probe (diagnostic): the SRV/UAV ranges of the list's current layout that
+    // have a table bound, and the heap slots holding a view of either resource.
+    struct BoundRange {
+        uint64_t table{};
+        uint32_t binding{}, count{};
+    };
+    std::vector<BoundRange> BoundViews(uint64_t list) const {
+        std::vector<BoundRange> result;
+        std::lock_guard lock(mutex);
+        if (!healthy)
+            return result;
+        auto s = lists.find(list);
+        if (s == lists.end())
+            return result;
+        auto layout = layouts.find(s->second.layout);
+        if (layout == layouts.end())
+            return result;
+        for (uint32_t param = 0; param < layout->second.size(); ++param) {
+            if (layout->second[param].root || !s->second.tables[param])
+                continue;
+            for (const auto &r : layout->second[param].ranges)
+                if ((r.type == descriptor_type::shader_resource_view ||
+                     r.type == descriptor_type::texture_shader_resource_view ||
+                     r.type == descriptor_type::unordered_access_view ||
+                     r.type == descriptor_type::texture_unordered_access_view) &&
+                    uint32_t(r.visibility & visibility) != 0 && r.count)
+                    result.push_back({s->second.tables[param], r.binding, r.count});
+        }
+        return result;
+    }
+    std::vector<Slot> SlotsOf(uint64_t a, uint64_t b, size_t limit) const {
+        std::vector<Slot> result;
+        std::lock_guard lock(mutex);
+        for (const auto &[slot, value] : descriptors)
+            if (value.known && !value.buffer && value.resource &&
+                (value.resource == a || value.resource == b)) {
+                if (result.size() >= limit)
+                    break;
+                result.push_back(slot);
+            }
+        return result;
+    }
 
   private:
     Location FindImpl(uint64_t list, Register reg, bool constant, bool root_only = false) const {

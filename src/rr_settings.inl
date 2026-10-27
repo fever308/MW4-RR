@@ -68,6 +68,12 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
     reshade::get_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
+    // NR offload Gate 1 diagnostic: logs GPU ordering around the SR/RR output. Off by default.
+    bool nr_order = false;
+    reshade::get_config_value(nullptr, SettingsSection, "NrOrderProbe", nr_order);
+    NrOrder().Arm(nr_order);
+    if (nr_order)
+        WriteLog("NR order probe on (NrOrderProbe=1): diagnostic logging of GPU ordering");
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
     // One read for the RR gate and the config report, so the report names the gate's answer.
@@ -144,6 +150,7 @@ static void OnPresent(reshade::api::effect_runtime *runtime) {
     if (!focused)
         shown.unfocused_presents.fetch_add(1, std::memory_order_relaxed);
     shown.focused.store(focused, std::memory_order_relaxed);
+    NrOrder().Present();
     OnRuntime(runtime);
 }
 static void StatusRow(const char *name, rrstatus::State value) {

@@ -44,8 +44,10 @@ static void AuditRenderTargets(reshade::api::command_list *list, uint32_t count,
         if (count > 8 || (count && !views)) {
             return;
         }
-        for (unsigned i = 0; i < count; ++i)
+        for (unsigned i = 0; i < count; ++i) {
             target.targets[i] = rrbindings::Describe(list->get_device(), views[i]);
+            NrResource(list, {target.targets[i].resource}, rrnrorder::Use::RenderTarget);
+        }
         target.count = count;
         target.targets_known = true;
         target.target_handle = count == 1 ? views[0].handle : 0;

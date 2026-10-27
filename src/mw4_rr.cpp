@@ -28,6 +28,7 @@ static void WriteLog(const char *text) {
     rrtrace::LastError preserve;
     reshade::log::message(reshade::log::level::warning, text);
 }
+#include "rr_nr_order_hooks.inl"
 static rrlive::Controller &LiveRR() {
     static auto *p = []() {
         auto *v = new rrlive::Controller;
@@ -97,6 +98,7 @@ template <class F> static void GlassOnly(F &&f) noexcept {
     }
 }
 static void FrameReset(ID3D12GraphicsCommandList *cl) {
+    NrReset(cl);
     try {
         LiveRR().Reset(cl);
         SparseLayouts().Reset(cl);
@@ -108,6 +110,7 @@ static void FrameReset(ID3D12GraphicsCommandList *cl) {
 static uint64_t FrameSubmit(ID3D12CommandQueue *q, UINT n, ID3D12CommandList *const *l) {
     if (rrinternal::active)
         return 0;
+    NrSubmit(q, n, l);
     try {
         LiveRR().Before(q, n, l);
         return SparsePool().Before(q, n, l);
@@ -129,6 +132,7 @@ static void FrameSubmitEnd(ID3D12CommandQueue *q, uint64_t token) {
 static void FrameBarriers(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RESOURCE_BARRIER *b) {
     if (rrinternal::active)
         return;
+    NrBarriers(cl, n, b);
     LiveRR().Barriers(cl, n, b);
     try {
         SparseLayouts().Observe(cl, n, b);
@@ -205,6 +209,7 @@ static bool SrReplacement(ID3D12GraphicsCommandList *cl, const NVSDK_NGX_Paramet
     if (replaced) {
         ComputeState().Invalidate(n.Get());
         result = NVSDK_NGX_Result_Success;
+        NrProduce(cl, p, true);
     }
     return replaced;
 }
@@ -219,6 +224,7 @@ static void SrCompleted(ID3D12GraphicsCommandList *cl, rrtrace::Kind k,
     // Frame generation is counted for the health line only, lock-free: never the controller.
     if (k == rrtrace::Kind::FG) {
         rrhealth::presentation.fg_evaluations.fetch_add(1, std::memory_order_relaxed);
+        NrFrameGen(cl);
         return;
     }
     if (k != rrtrace::Kind::SR)
@@ -230,6 +236,7 @@ static void SrCompleted(ID3D12GraphicsCommandList *cl, rrtrace::Kind k,
                          AlbedoInspector().StateCoverage(n.Get()),
                      false);
     ComputeState().Invalidate(n.Get());
+    NrProduce(cl, p, false);
 }
 static rrtrace::Probe &Observer() {
     static auto *p = []() {
@@ -343,6 +350,7 @@ static void OnResetList(reshade::api::command_list *list) {
 }
 static void OnDestroyList(reshade::api::command_list *list) {
     OnResetList(list);
+    NrForgetList(reinterpret_cast<void *>(list->get_native()));
     if (list->get_device()->get_api() == reshade::api::device_api::d3d12) {
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
             reinterpret_cast<ID3D12GraphicsCommandList *>(list->get_native()));
@@ -504,6 +512,7 @@ static bool OnUpdates(reshade::api::device *d, uint32_t count,
                     value.byte_size = b.size;
                 }
                 t.Put({slot.heap, slot.offset + i}, value);
+                NrDescriptor({slot.heap, slot.offset + i}, value);
             }
         }
     });
@@ -518,9 +527,13 @@ static bool OnCopies(reshade::api::device *d, uint32_t count,
         }
         for (uint32_t i = 0; i < count && t.Healthy(); ++i) {
             auto &c = copies[i];
+            const auto dest =
+                rrbindings::Resolve(d, c.dest_table, c.dest_binding, c.dest_array_offset);
             t.Copy(rrbindings::Resolve(d, c.source_table, c.source_binding, c.source_array_offset),
-                   rrbindings::Resolve(d, c.dest_table, c.dest_binding, c.dest_array_offset),
-                   c.count);
+                   dest, c.count);
+            if (NrOrder().Armed() && dest.heap)
+                for (uint32_t k = 0; k < c.count && k < 4096; ++k)
+                    NrDescriptor({dest.heap, dest.offset + k}, t.Get({dest.heap, dest.offset + k}));
         }
     });
     return false;
@@ -638,12 +651,14 @@ static bool SssOwnedDraw(reshade::api::command_list *list,
 #include "rr_blend_render.inl"
 static bool AuditDraw(reshade::api::command_list *l, uint32_t c, uint32_t i, uint32_t f,
                       uint32_t fi) {
+    NrCommand(l, rrnrorder::Op::Draw, true, true);
     GlassDraw(l, false, c, i);
     CoverageDraw(l, {false, c, i, f, 0, fi});
     return SssOwnedDraw(l, {false, c, i, f, 0, fi});
 }
 static bool AuditDrawIndexed(reshade::api::command_list *l, uint32_t c, uint32_t i, uint32_t f,
                              int32_t b, uint32_t fi) {
+    NrCommand(l, rrnrorder::Op::Draw, true, true);
     GlassDraw(l, true, c, i);
     CoverageDraw(l, {true, c, i, f, b, fi});
     return SssOwnedDraw(l, {true, c, i, f, b, fi});
@@ -851,6 +866,7 @@ static void RestoreLightingPipeline(reshade::api::command_list *list) {
         native->SetPipelineState((ID3D12PipelineState *)b.pipeline);
 }
 static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
+    NrCommand(list, rrnrorder::Op::Dispatch, false, true);
     if (rrinternal::active)
         return false;
     try {
@@ -901,6 +917,7 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
 }
 static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_command t,
                        reshade::api::resource, uint64_t, uint32_t, uint32_t) {
+    NrCommand(l, rrnrorder::Op::Indirect, t != reshade::api::indirect_command::dispatch, true);
     RestoreLightingPipeline(l);
     if (t == reshade::api::indirect_command::unknown || t == reshade::api::indirect_command::draw ||
         t == reshade::api::indirect_command::draw_indexed)
@@ -984,6 +1001,7 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
     reshade::register_event<reshade::addon_event::draw_indexed>(&AuditDrawIndexed);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnRuntime);
     reshade::register_event<reshade::addon_event::reshade_present>(&OnPresent);
+    RegisterNrOrderEvents();
     return true;
 }
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
