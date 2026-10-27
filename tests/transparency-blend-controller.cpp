@@ -1564,8 +1564,9 @@ struct ControllerCpuTest {
         s.sr_live = s.pending_sr = false;
     }
 
-    // The first slot RR prepares also prepares the pool's idle ones while memory allows, so a
-    // deeper frame queue does not wait for memory another add-on took. A shortage stops quietly.
+    // The first slot RR prepares also prepares idle ones, up to ReserveAhead in all, while memory
+    // allows, so the usual frame queue does not wait for memory another add-on took. The rest of
+    // the pool prepares on first use. A shortage stops quietly.
     static void ReserveSlots() {
         for (const bool room : {true, false}) {
             Rig r;
@@ -1580,7 +1581,8 @@ struct ControllerCpuTest {
             c.ReserveSlots(r.S(), textures, {}, {});
             for (size_t i = 1; i < c.slots.size(); ++i) {
                 const auto &f = c.slots[i].gpu;
-                assert(bool(f.heap) == (room && i != 3));
+                // Slot 0 (the caller's) is unprepared here, so 1, 2 and 4 make ReserveAhead.
+                assert(bool(f.heap) == (room && (i == 1 || i == 2 || i == 4)));
                 assert(!f.sources[3]); // no game resource kept
             }
             assert(!r.S().gpu.heap); // the caller's slot is its own

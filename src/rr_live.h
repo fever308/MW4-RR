@@ -96,6 +96,11 @@ class Controller {
                                                      "until it fits, retried every second";
         Log(line.c_str());
     }
+    // BeforeSR's latest refusal and how often it repeated in a row, for its rate-limited log.
+    struct Refusal {
+        std::string what;
+        unsigned long long count{};
+    } sr_refused;
     bool replace_sr = true;      // skip the game's SR when RR can take its place (ReplaceNativeSR)
     unsigned replace_refusals{}; // replacement frames RR refused in a row
     bool replace_paused{};       // after 3 refusals, until the setting changes
@@ -438,11 +443,16 @@ class Controller {
         Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, init_allocator.Get(), nullptr,
                                    IID_PPV_ARGS(&init_list)),
               "live init list failed");
-        Change(init_list.Get(), history.Get(), D3D12_RESOURCE_STATE_COMMON,
-               D3D12_RESOURCE_STATE_COPY_DEST);
-        init_list->CopyBufferRegion(history.Get(), 0, zero.Get(), 0, 256);
-        Change(init_list.Get(), history.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-               D3D12_RESOURCE_STATE_COMMON);
+        {
+            // RR's own list, never reset or destroyed through ReShade: its barriers stay out of
+            // the hooks' per-list state, which would keep an entry for it after every restart.
+            rrinternal::Scope recording;
+            Change(init_list.Get(), history.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+            init_list->CopyBufferRegion(history.Get(), 0, zero.Get(), 0, 256);
+            Change(init_list.Get(), history.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COMMON);
+        }
         Check(init_list->Close(), "live init close failed");
         Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)),
               "live timeline fence failed");
@@ -1319,9 +1329,21 @@ class Controller {
             s->sr_live = true;
             s->pending_sr = true;
             s->states = {};
+            sr_refused.count = 0;
         } catch (const std::exception &e) {
             policy.Reject();
-            Log(e.what());
+            // Every frame while the cause lasts (a bypass pause, for one): a new reason logs at
+            // once, a repeat at occurrences 1-3 and powers of two.
+            if (sr_refused.what != e.what())
+                sr_refused = {e.what(), 0};
+            const auto n = ++sr_refused.count;
+            if (n == 1)
+                Log(e.what());
+            else if (n <= 3 || !(n & (n - 1))) {
+                char line[300];
+                snprintf(line, sizeof(line), "%s (%llu in a row)", e.what(), n);
+                Log(line);
+            }
         }
     }
     void Barriers(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RESOURCE_BARRIER *b) {

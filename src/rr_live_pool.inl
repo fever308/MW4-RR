@@ -66,14 +66,27 @@ bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
         return false;
     return budget.Reserve(pipelines.device.Get(), required);
 }
-// The pool's other slots, prepared while GPU memory allows (after `self` first prepares), so a
-// deeper frame queue later finds them ready rather than competing with other add-ons' memory
-// (DLSS5 NR's, for one), which would send those frames back to native SR. A shortage or a
-// failure stops it quietly: the rest prepare when first used.
+// Slots prepared ahead of use: the frames a normal queue keeps in flight. Each slot is a set
+// of guide, output and depth textures (about 200 MB at 4K Quality, 400 MB at 4K DLAA), so
+// preparing the whole pool up front cost players gigabytes RR never used. Slots past this
+// prepare when a deeper queue first needs them.
+static constexpr size_t ReserveAhead = 3;
+size_t Prepared(bool output) const {
+    size_t n{};
+    for (const auto &v : slots)
+        n += output ? v.gpu.rr_output != nullptr : v.gpu.heap != nullptr;
+    return n;
+}
+// The pool's other slots up to ReserveAhead, prepared while GPU memory allows (after `self`
+// first prepares), so the usual frame queue later finds them ready rather than competing with
+// other add-ons' memory (DLSS5 NR's, for one), which would send those frames back to native
+// SR. A shortage or a failure stops it quietly: the rest prepare when first used.
 void ReserveSlots(const Slot &self, const std::array<ComPtr<ID3D12Resource>, 4> &textures,
                   const std::array<ComPtr<ID3D12Resource>, 2> &cb,
                   const std::array<UINT64, 2> &offsets) {
     for (auto &v : slots) {
+        if (Prepared(false) >= ReserveAhead)
+            return;
         if (&v == &self || v.busy || v.gpu.heap)
             continue;
         try {
@@ -88,6 +101,8 @@ void ReserveSlots(const Slot &self, const std::array<ComPtr<ID3D12Resource>, 4> 
 void ReserveOutputs(const Slot &self, const rreval::Options &o,
                     const std::array<ComPtr<ID3D12Resource>, 4> &sr_inputs) {
     for (auto &v : slots) {
+        if (Prepared(true) >= ReserveAhead)
+            return;
         if (&v == &self || v.busy || !v.gpu.heap || v.gpu.rr_output)
             continue;
         try {
