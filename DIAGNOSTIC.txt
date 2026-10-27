@@ -1,0 +1,67 @@
+MW4 RAY RECONSTRUCTION - BETA 2
+SUBSURFACE SCATTERING RECOGNITION DIAGNOSTIC 1
+
+This temporary build investigates why the Subsurface Scattering Guide stays
+unavailable on some PCs. It adds automatic diagnostic logging to Beta 2.
+It is not a noise fix or a public release update.
+
+CAMPAIGN ONLY
+Install only beside sp26-cod.exe. Do not use in Multiplayer, DMZ, or COD HQ.
+Those modes have anti-cheat and are not supported or tested. Campaign use is
+not a guarantee against anti-cheat action. Use at your own risk.
+
+INSTALL
+1. Fully close the game and COD HQ.
+2. Back up your existing mw4-rr.addon64 and mw4-rr-dxcompiler.dll to a folder
+   outside the game's sp26 folder so you can restore them afterward.
+3. Copy the two files with those names from this ZIP into sp26, beside
+   sp26-cod.exe. Replace the existing copies. Keep your current ReShade
+   installation, ReShade.ini, and game settings.
+
+RUN ONE TEST
+1. Launch the campaign and load the same scene where you saw the noise.
+   Keep the same graphics settings, including VRS and ray tracing quality,
+   for this first run. There is no need to delete caches or reinstall drivers.
+2. In ReShade, open MW4 Ray Reconstruction. Confirm Ray Reconstruction and
+   the Subsurface Scattering Guide are enabled. If enabled but Waiting,
+   leave them enabled: that is exactly what this test is investigating.
+3. Look at the affected object for about 60 seconds: stay still, move the
+   camera slowly, then stop again. No capture hotkey is needed.
+4. Take a screenshot of the addon panel in the affected scene. Note the
+   mission and the object that is noisy, plus whether the guide says Active
+   or Waiting. If possible, include a screenshot showing the noise too.
+5. Exit the game. BEFORE launching it again, copy ReShade.log from sp26
+   to a separate folder. Send that log and the screenshots/scene notes.
+   ReShade may replace its log on the next launch.
+
+Please use a fresh launch and reach the affected scene within ten minutes.
+Diagnostic recording stops automatically ten minutes after the ReShade
+runtime starts. Normal addon rendering continues after recording stops.
+
+The log must contain "SSS-DIAG build=beta2-recognition-1" near startup.
+If it does not, this diagnostic addon was not loaded. Send the log anyway.
+A capture-limit message is useful evidence; please include the complete log.
+
+AFTER THE TEST
+Close the game and COD HQ, then restore the two files you backed up. Do not
+leave this diagnostic installed for performance comparisons: logging and
+CPU shader reflection can add overhead during collection.
+
+WHAT IS COLLECTED
+ReShade.log includes the addon's normal game/configuration/driver information,
+shader fingerprints and sizes, pipeline formats, shader resource/signature
+metadata, first observed draw callbacks, and bounded summary counters.
+It does not save shader bytecode, shader disassembly, game assets, or screenshots.
+Nothing is automatically uploaded. ReShade's normal log can contain local
+filesystem paths; review those before sharing if you wish.
+
+The diagnostic preserves Beta 2's shader recognition and rendering decisions.
+Unknown shaders are logged, not patched or accepted. Draw observations report
+CPU command recording, not proof of completed GPU execution. Unknown indirect
+commands are explicitly labeled and are not claimed to be executed draws.
+
+Validation: compiled and CPU-tested, including reflection of an existing
+known shader fixture. This diagnostic has not been tested in the recipient's
+game; gameplay will establish what their shader path actually supplies.
+
+Source and license: see SOURCE.txt, LICENSE, and THIRD_PARTY.md.

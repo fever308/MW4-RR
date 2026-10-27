@@ -11,6 +11,7 @@
 #include "rr_sss_stencil_shader.h"
 #include "rr_sss_vertex_proof.h"
 #include "rr_sss_runtime_shader.h"
+#include "rr_sss_diagnostic.h"
 namespace rrsss {
 // Borrowed nonchanged subobject payloads are valid only during init_pipeline.
 // Create the alternate synchronously; never save this patch for a later draw.
@@ -307,6 +308,7 @@ class PipelineRegistry {
     std::atomic<unsigned> reports{};
     static inline thread_local bool creating{};
     void Report(const char *text) noexcept {
+        rrsssdiag::Session().Outcome(text);
         if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
             try {
                 if (logger)
@@ -323,6 +325,8 @@ class PipelineRegistry {
         if (creating || !device || device->get_api() != reshade::api::device_api::d3d12)
             return;
         try {
+            rrsssdiag::Session().Observe(device->get_native(), layout.handle, n, objects,
+                                        original.handle, ReplayCompiler());
             if (!PipelinePatch::IsTarget(n, objects))
                 return;
             if (!original.handle || !layout.handle) {

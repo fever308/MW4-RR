@@ -118,6 +118,7 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
     }
     SparsePool().Poll();
     LiveRR().Poll();
+    rrsssdiag::Session().Summary(GetTickCount64(), LiveRR().Enabled(), LiveRR().SssEnabled());
     // Idle windows are reported a few times, so a missing blur dispatch is visible, and a window
     // whose set of rejection stages differs from the last one's, so new rejections show.
     static ULONGLONG distance_report{};

@@ -23,7 +23,7 @@
 #include <sstream>
 extern "C" __declspec(dllexport) const char *NAME = "MW4 Ray Reconstruction";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Beta 2: Ray Reconstruction with Subsurface Scattering and transparency guides.";
+    "Beta 2 Subsurface Scattering recognition diagnostic 1 (temporary test build).";
 static void WriteLog(const char *text) {
     rrtrace::LastError preserve;
     reshade::log::message(reshade::log::level::warning, text);
@@ -566,6 +566,7 @@ static void OnPipeline(reshade::api::device *device, reshade::api::pipeline_layo
     }
 }
 static void OnDestroyPipeline(reshade::api::device *, reshade::api::pipeline pipeline) {
+    rrsssdiag::Session().Forget(pipeline.handle);
     SssPipelines().Forget(pipeline.handle);
     CoveragePipelines().Forget(pipeline.handle);
     rrbypass::Removed(pipeline);
@@ -636,14 +637,33 @@ static bool SssOwnedDraw(reshade::api::command_list *list,
 }
 #include "rr_glass_render.inl"
 #include "rr_blend_render.inl"
+// Observe native draw callbacks independently of the feature toggles. No game objects retained.
+static void DiagnosticDraw(reshade::api::command_list *l, bool indirect, bool unknown = false) noexcept {
+    if (rrinternal::active || !rrsssdiag::Session().Active() ||
+        l->get_device()->get_api() != reshade::api::device_api::d3d12)
+        return;
+    try {
+        uint64_t pipeline{};
+        {
+            std::lock_guard lock(audit_graphics_mutex);
+            auto it = audit_graphics.find(l->get_native());
+            if (it != audit_graphics.end())
+                pipeline = it->second.pipeline.pipeline;
+        }
+        rrsssdiag::Session().Draw(pipeline, indirect, unknown);
+    } catch (...) {
+    }
+}
 static bool AuditDraw(reshade::api::command_list *l, uint32_t c, uint32_t i, uint32_t f,
                       uint32_t fi) {
+    DiagnosticDraw(l, false);
     GlassDraw(l, false, c, i);
     CoverageDraw(l, {false, c, i, f, 0, fi});
     return SssOwnedDraw(l, {false, c, i, f, 0, fi});
 }
 static bool AuditDrawIndexed(reshade::api::command_list *l, uint32_t c, uint32_t i, uint32_t f,
                              int32_t b, uint32_t fi) {
+    DiagnosticDraw(l, false);
     GlassDraw(l, true, c, i);
     CoverageDraw(l, {true, c, i, f, b, fi});
     return SssOwnedDraw(l, {true, c, i, f, b, fi});
@@ -905,6 +925,9 @@ static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_com
     if (t == reshade::api::indirect_command::unknown || t == reshade::api::indirect_command::draw ||
         t == reshade::api::indirect_command::draw_indexed)
         OitSceneDraw(l);
+    if (t == reshade::api::indirect_command::draw || t == reshade::api::indirect_command::draw_indexed ||
+        t == reshade::api::indirect_command::unknown)
+        DiagnosticDraw(l, true, t == reshade::api::indirect_command::unknown);
     CoverageIndirectArm(l, t);
     WithGraphicsBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
     WithBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
@@ -956,6 +979,10 @@ static unsigned ReportGameConfig(const rrgameconfig::File &file, bool gate_allow
 static bool RegisterRuntimeCallbacks(HMODULE module) {
     if (!reshade::register_addon(module))
         return FALSE;
+    rrsssdiag::Session().logger = &WriteLog;
+    WriteLog("SSS-DIAG build=beta2-recognition-1 base=98ed6ad expectedBytes=56388 "
+             "expectedHash=9ee7cea57f70d741; CPU metadata only; automatic 10 minute recording; "
+             "no game shader files saved");
     reshade::register_overlay("MW4 Ray Reconstruction", &DrawSettings);
     rrbypass::logger = &WriteLog;
     reshade::register_event<reshade::addon_event::init_device>(&OnDevice);
