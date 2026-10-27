@@ -357,6 +357,7 @@ struct ControllerCpuTest {
         assert(f.feature && releases == 1); // fatal: what it holds stays put
         f.feature = nullptr;
         f.parameters = nullptr;
+        releases = destroys = 0; // later tests count from zero
     }
     static void Run() {
         DevTests();
