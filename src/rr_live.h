@@ -96,6 +96,24 @@ class Controller {
                                                      "until it fits, retried every second";
         Log(line.c_str());
     }
+    // RR switched off (SetEnabled) at this tick, 0 while on. After ReleaseDelay off, Poll gives
+    // back the feature and every slot (ReleaseWhileOff), so a player who turns RR off gets its
+    // VRAM back; a quick A/B toggle keeps it and resumes without re-creating RR.
+    UINT64 off_since{};
+    bool off_released{};
+    static constexpr UINT64 ReleaseDelay = 10000;
+    void ReleaseWhileOff(UINT64 now) {
+        if (enabled || !off_since || now - off_since < ReleaseDelay || off_released || fatal ||
+            retired || foreign_call || !(initialized || feature || parameters))
+            return;
+        // Reconfigure waits for outstanding GPU work: it refuses until every slot can retire,
+        // and a later Poll tries again.
+        layout_pending = true;
+        if (!Reconfigure())
+            return;
+        off_released = true;
+        Log("RR off: its GPU memory was released; turning it on creates RR again");
+    }
     // BeforeSR's latest refusal and how often it repeated in a row, for its rate-limited log.
     struct Refusal {
         std::string what;
@@ -658,8 +676,25 @@ class Controller {
         Resume(water_failed, water_pause, now, "Water responsivity mask");
         Resume(blend_failed, blend_pause, now, "Transparency albedo blend");
         std::string report;
-        if (health.Report(now, report))
+        if (health.Report(now, report)) {
+            // RR's own VRAM (its ledger: slots and persistent textures, not NGX's feature) and
+            // the most slots in flight at once since the last line, to size ReserveAhead.
+            char memory[160];
+            snprintf(memory, sizeof(memory),
+                     " memory[ledgerMB=%llu slots=%zu prepared=%zu outputs=%zu peakBusy=%zu]",
+                     (unsigned long long)(budget.bytes >> 20), slots.size(), Prepared(false),
+                     Prepared(true), peak_busy);
+            report += memory;
+            peak_busy = 0;
             Log(report.c_str());
+        }
+    }
+    size_t peak_busy{};
+    void CountBusy() {
+        size_t n{};
+        for (const auto &v : slots)
+            n += v.busy;
+        peak_busy = (std::max)(peak_busy, n);
     }
     // A submitted SR recording that resolves its guide hands it to later
     // SSS-masked lighting if admitted. A rejected one writes zeros, so a record
@@ -943,6 +978,7 @@ class Controller {
                 return false;
             if (early) {
                 s.busy = true;
+                CountBusy();
                 s.awaiting_prepass = true;
                 s.frame = camera_frame;
                 s.viewport = camera_view;
@@ -1019,6 +1055,8 @@ class Controller {
         if (enabled == value)
             return;
         enabled = value;
+        off_since = value ? 0 : GetTickCount64();
+        off_released = false;
         if (++generation == 0) {
             Failure("RR enable generation overflow", true);
             return;
@@ -1057,6 +1095,7 @@ class Controller {
             std::lock_guard lock(mutex);
             try {
                 PollLocked();
+                ReleaseWhileOff(GetTickCount64());
             } catch (const std::exception &e) {
                 Failure(e.what());
             }
@@ -1172,6 +1211,7 @@ class Controller {
                 return false;
             }
             s.busy = true;
+            CountBusy();
             // A null classification view unless a water test wants it this frame.
             // The guide mode follows it, so every water test waits and fails together.
             s.gpu.WaterTarget(pipelines, WaterWanted() && !water_failed &&

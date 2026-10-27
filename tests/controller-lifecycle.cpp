@@ -319,8 +319,48 @@ struct ControllerCpuTest {
         c.weapon_linear = false;
         c.feature = nullptr;
     }
+    // RR turned off gives back its feature and slots after ReleaseDelay, once, and not while
+    // it is on, quickly toggled back, or fatal.
+    static void ReleaseWhileOff() {
+        auto rig = [](Controller &c) {
+            c.logger = &Logged;
+            c.feature = reinterpret_cast<NVSDK_NGX_Handle *>(1);
+            c.parameters = reinterpret_cast<NVSDK_NGX_Parameter *>(2);
+            c.api.release = ReleaseFeature;
+            c.api.destroy = DestroyParameters;
+            c.initialized = true;
+            c.SetEnabled(true);
+        };
+        releases = destroys = 0;
+        Controller c;
+        rig(c);
+        c.ReleaseWhileOff(c.off_since + Controller::ReleaseDelay * 10);
+        assert(c.feature && !releases); // on: kept
+        c.SetEnabled(false);
+        const auto off = c.off_since;
+        assert(off);
+        c.ReleaseWhileOff(off + Controller::ReleaseDelay - 1);
+        assert(c.feature && c.initialized && !releases); // a quick toggle keeps RR
+        c.ReleaseWhileOff(off + Controller::ReleaseDelay);
+        assert(!c.feature && !c.parameters && !c.initialized && releases == 1 && destroys == 1);
+        assert(logged == "RR off: its GPU memory was released; turning it on creates RR again\n");
+        logged.clear();
+        c.ReleaseWhileOff(off + Controller::ReleaseDelay * 2);
+        assert(releases == 1 && logged.empty()); // once
+        c.SetEnabled(true);
+        assert(!c.off_since && !c.off_released);
+        Controller f;
+        rig(f);
+        f.SetEnabled(false);
+        f.fatal = true;
+        f.ReleaseWhileOff(f.off_since + Controller::ReleaseDelay);
+        assert(f.feature && releases == 1); // fatal: what it holds stays put
+        f.feature = nullptr;
+        f.parameters = nullptr;
+    }
     static void Run() {
         DevTests();
+        ReleaseWhileOff();
         RetirementFailure();
         FailureRecovers();
         StatsReaders();
