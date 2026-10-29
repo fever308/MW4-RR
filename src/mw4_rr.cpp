@@ -23,7 +23,7 @@
 #include <sstream>
 extern "C" __declspec(dllexport) const char *NAME = "MW4 Ray Reconstruction";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Beta 2 Subsurface Scattering recognition diagnostic 1 (temporary test build).";
+    "DIAGNOSTIC 2 - targeted Subsurface Scattering shader capture. NOT A RELEASE.";
 static void WriteLog(const char *text) {
     rrtrace::LastError preserve;
     reshade::log::message(reshade::log::level::warning, text);
@@ -980,10 +980,10 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
     if (!reshade::register_addon(module))
         return FALSE;
     rrsssdiag::Session().logger = &WriteLog;
-    WriteLog("SSS-DIAG build=beta2-recognition-1 base=98ed6ad expectedBytes=56388 "
-             "expectedHash=9ee7cea57f70d741; CPU metadata only; automatic 10 minute recording; "
-             "no game shader files saved");
-    reshade::register_overlay("MW4 Ray Reconstruction", &DrawSettings);
+    WriteLog("SSS-DIAG build=beta2-target-capture-2 base=98ed6ad targetBytes=56352 "
+             "targetHash=c6c858a6310ca6a2; DIAGNOSTIC ONLY; saves one matching game shader "
+             "beside the game executable for private analysis; no automatic upload; 10 minute recording");
+    reshade::register_overlay("MW4 RR - DIAGNOSTIC 2", &DrawSettings);
     rrbypass::logger = &WriteLog;
     reshade::register_event<reshade::addon_event::init_device>(&OnDevice);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);

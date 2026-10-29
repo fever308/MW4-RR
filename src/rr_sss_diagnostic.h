@@ -2,6 +2,7 @@
 // Temporary CPU-only observer. Never patches a shader, submits GPU work or retains a game object.
 #include <reshade.hpp>
 #include "rr_sss_runtime_shader.h"
+#include "rr_sss_target_capture.h"
 #include <d3d12shader.h>
 #include <atomic>
 #include <mutex>
@@ -185,6 +186,8 @@ class Tracker {
             }
             if (!ps_count)
                 return;
+            if (ps_count == 1 && ps)
+                rrssscapture::Session().Observe(ps->code, ps->code_size);
             bool full = false, firstOverflow = false;
             {
                 std::lock_guard lock(mutex);

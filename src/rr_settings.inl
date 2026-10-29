@@ -88,6 +88,7 @@ static bool Foreground() {
     return foreground == GetCurrentProcessId();
 }
 static void OnRuntime(reshade::api::effect_runtime *runtime) {
+    rrssscapture::Poll(&WriteLog);
     Observer().Poll();
     {
         std::lock_guard lock(settings_mutex);
@@ -153,7 +154,17 @@ static void StatusRow(const char *name, rrstatus::State value) {
 static void DrawSettings(reshade::api::effect_runtime *) {
     std::lock_guard lock(settings_mutex);
     LoadSettings();
-    ImGui::TextUnformatted("MW4 Ray Reconstruction — Beta 2");
+    ImGui::TextUnformatted("MW4 Ray Reconstruction - DIAGNOSTIC 2 (NOT A RELEASE)");
+    ImGui::TextWrapped("Subsurface Scattering variant capture: %s",
+                       rrssscapture::Label(rrssscapture::Session().Status()));
+    if (!rrsssdiag::Session().Active() && rrssscapture::Session().Status() == rrssscapture::State::Waiting)
+        ImGui::TextWrapped("Recording ended after 10 minutes without finding the target. Send ReShade.log.");
+    const auto capture_path = rrssscapture::Session().Output();
+    if (!capture_path.empty())
+        ImGui::TextWrapped("Capture file: %s", rrssscapture::Utf8(capture_path).c_str());
+    ImGui::TextWrapped("Temporary test build. Saves one matching game shader for private analysis. "
+                       "No automatic upload. This does not fix the noise.");
+    ImGui::Separator();
     bool changed = ImGui::Checkbox("Ray reconstruction (F8)", &requested_rr);
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
