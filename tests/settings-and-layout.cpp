@@ -28,6 +28,8 @@ static_assert(defaults.blend);
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
               defaults.weapon_depth && defaults.preset == 6);
 static_assert(defaults.tolerate_isolated && defaults.water);
+// The edge-aware Subsurface Scattering fill is an experiment: off by default.
+static_assert(!defaults.sss_edge_fill);
 // The water responsivity mask starts on, and only preset F wants it.
 static_assert(rrwater::Settings{}.responsivity && rrwater::Settings{}.strength == 1.0f);
 static_assert(rrwater::Wanted(rrwater::Settings{}, true) &&

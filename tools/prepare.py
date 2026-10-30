@@ -68,6 +68,14 @@ def main():
                                '-D', 'RR_SSS_MASK=1', '-D', 'RR_FILL_HISTORY=1',
                                '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
                                *extra)), False)
+          for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))],
+        # The same with the edge-aware no-history fill (src/rr_edge_fill.h), a panel experiment.
+        *[(f'RRVrrtScaleSssHistory2Edge{suffix}',
+           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_ssshistory2_edge',
+                        flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',
+                               '-D', 'RR_SSS_MASK=1', '-D', 'RR_FILL_HISTORY=1',
+                               '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
+                               '-D', 'RR_FILL_EDGE=1', *extra)), False)
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])

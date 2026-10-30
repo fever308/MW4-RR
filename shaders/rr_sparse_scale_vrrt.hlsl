@@ -90,6 +90,59 @@ uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
 #if RR_FILL_PREFER_NATIVE&&!RR_FILL_SPATIAL
 #error RR_FILL_PREFER_NATIVE needs RR_FILL_SPATIAL
 #endif
+// RR_FILL_EDGE (as RR_FILL_SPATIAL): the no-history fill weights samples by surface
+// (src/rr_edge_fill.h) instead of the group mean. Neighbours come from the immutable raw
+// snapshot the output was copied from (t3/t4), so support crosses group and strip
+// boundaries without racing the in-place output. Surface inputs are this frame's: the
+// prepass PackedSurface the native spatial denoiser binds (t5) and the guide conversion's
+// normals (t6) and Status (t7), all at the lighting extent. Only the private root binds them.
+#ifndef RR_FILL_EDGE
+#define RR_FILL_EDGE 0
+#endif
+#if RR_FILL_EDGE&&!RR_FILL_SPATIAL
+#error RR_FILL_EDGE needs RR_FILL_SPATIAL
+#endif
+#if RR_FILL_EDGE
+#include "../src/rr_edge_fill.h"
+#ifdef RR_PACKED_FLOAT
+Texture2D<float4> rawLighting:register(t3);
+Texture2D<float> rawWeights:register(t4);
+#else
+Texture2D<uint4> rawLighting:register(t3);
+Texture2D<uint> rawWeights:register(t4);
+#endif
+Texture2D<uint4> packedSurface:register(t5);
+Texture2D<float4> surfaceNormal:register(t6);
+Texture2D<uint> surfaceStatus:register(t7);
+EdgeSurface LoadSurface(uint2 q){
+ const uint4 s=packedSurface.Load(int3(q,0));const float3 n=surfaceNormal.Load(int3(q,0)).xyz;
+ EdgeSurface r;r.depth=asfloat(s.x);r.word=s.w;r.nx=n.x;r.ny=n.y;r.nz=n.z;
+ r.status=surfaceStatus.Load(int3(q,0));return r;
+}
+uint2 EdgeFill(uint2 p,uint w,uint h,out uint outcome){
+ const EdgeSurface c=LoadSurface(p);
+ outcome=RR_EDGE_OUTCOME_UNCLASSIFIED;
+ if(!EdgeClassified(c))return 0;
+ float4 sum=0;float total=0;
+ [unroll]for(int dy=-RR_EDGE_RADIUS;dy<=RR_EDGE_RADIUS;++dy)
+ [unroll]for(int dx=-RR_EDGE_RADIUS;dx<=RR_EDGE_RADIUS;++dx){
+  const int2 q=int2(p)+int2(dx,dy);
+  if((dx==0&&dy==0)||!EdgeInside(q.x,q.y,w,h))continue;
+#ifdef RR_PACKED_FLOAT
+  const uint2 raw=asuint(rawLighting.Load(int3(q,0))).zw;const uint rw=asuint(rawWeights.Load(int3(q,0)));
+#else
+  const uint2 raw=rawLighting.Load(int3(q,0)).zw;const uint rw=rawWeights.Load(int3(q,0));
+#endif
+  const float4 v=UnpackLobe(raw);
+  if(!EdgeFresh(rw,v))continue;
+  EdgeAccumulate(sum,total,v,EdgeWeight(c,LoadSurface(uint2(q)),dx,dy));
+ }
+ float4 mean=0;
+ if(!EdgeResolve(sum,total,mean)){outcome=RR_EDGE_OUTCOME_NO_NEIGHBOUR;return 0;}
+ outcome=RR_EDGE_OUTCOME_EDGE;
+ const uint4 m=f32tof16(mean);return uint2(m.x|(m.y<<16),m.z|(m.w<<16));
+}
+#endif
 #if RR_FILL_SPATIAL
 groupshared uint3 fillTile[256]; // packed lobe 2, fresh flag
 uint2 GroupMean(uint2 gt,out uint n){
@@ -162,7 +215,14 @@ void main(uint3 id:SV_DispatchThreadID){
  outWeights=(outWeights&~0x000fff00u)|((fb?wt:nw)&0x000fff00u);
 #if RR_FILL_SPATIAL
  uint found=1;
- if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY)cb=GroupMean(gt.xy,found);
+ if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY){
+#if RR_FILL_EDGE
+  uint outcome;const uint2 e=EdgeFill(p,w,h,outcome);
+  cb=outcome==RR_EDGE_OUTCOME_EDGE?e:outcome==RR_EDGE_OUTCOME_NO_NEIGHBOUR?nc.zw:GroupMean(gt.xy,found);
+#else
+  cb=GroupMean(gt.xy,found);
+#endif
+ }
 #if RR_FILL_PREFER_NATIVE
  if(fb&&((nw>>8)&4095)>=RR_FILL_HISTORY){
   cb=nc.zw;outWeights=(outWeights&~0x000fff00u)|(nw&0x000fff00u);}
