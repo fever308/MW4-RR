@@ -252,9 +252,27 @@ static bool PinInspector() {
                                   GET_MODULE_HANDLE_EX_FLAG_PIN,
                               reinterpret_cast<LPCWSTR>(&PinInspector), &self) != FALSE;
 }
+static void OnDeviceWork(reshade::api::device *d);
+// The first device and queue install hooks; their handlers' time is logged once.
+static void TimedFirst(std::atomic<bool> &once, const char *name, void (*work)(void *), void *arg) {
+    auto &t = rrtiming::Global();
+    const bool first = !once.load(std::memory_order_relaxed);
+    t.Milestone(once, name);
+    const auto begin = rrtiming::Now();
+    work(arg);
+    if (first) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "RR startup: %s handler took %.1f ms", name,
+                      rrtiming::Ms(rrtiming::Now() - begin));
+        t.Log(line);
+    }
+}
 static void OnDevice(reshade::api::device *d) {
     static std::atomic<bool> first{};
-    rrtiming::Global().Milestone(first, "first device");
+    TimedFirst(first, "first device",
+               [](void *p) { OnDeviceWork(static_cast<reshade::api::device *>(p)); }, d);
+}
+static void OnDeviceWork(reshade::api::device *d) {
     try {
         if (d->get_api() == reshade::api::device_api::d3d12 && PinInspector()) {
             d->create_private_data<rrbindings::DeviceState>();
@@ -282,9 +300,13 @@ static void OnDestroyDevice(reshade::api::device *d) {
     if (rrbindings::State(d))
         d->destroy_private_data<rrbindings::DeviceState>();
 }
+static void OnQueueWork(reshade::api::command_queue *q);
 static void OnQueue(reshade::api::command_queue *q) {
     static std::atomic<bool> first{};
-    rrtiming::Global().Milestone(first, "first command queue");
+    TimedFirst(first, "first command queue",
+               [](void *p) { OnQueueWork(static_cast<reshade::api::command_queue *>(p)); }, q);
+}
+static void OnQueueWork(reshade::api::command_queue *q) {
     try {
         if (q->get_device()->get_api() == reshade::api::device_api::d3d12 && PinInspector())
             if (!AlbedoInspector().AttachQueue(

@@ -63,7 +63,7 @@ inline const Target *ClassifiedTarget(unsigned n, const reshade::api::pipeline_s
         const auto &s = *static_cast<const reshade::api::shader_desc *>(o.data);
         if (!s.code || !s.code_size)
             continue;
-        const auto v = classifier.Classify(s.code, s.code_size, rrsss::ReplayCompiler());
+        const auto v = classifier.Classify(s.code, s.code_size, nullptr, &rrsss::ReplayCompiler);
         if (v.target) {
             hash = v.target->hash;
             return v.target;

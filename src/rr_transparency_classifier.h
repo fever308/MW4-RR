@@ -104,7 +104,9 @@ class Classifier {
                         std::span<const Profile> profiles = Profiles)
         : registry(registry), profiles(profiles) {}
 
-    Verdict Classify(const void *code, size_t size, HMODULE module) noexcept {
+    // load, if given, supplies the compiler only when a candidate needs it.
+    Verdict Classify(const void *code, size_t size, HMODULE module,
+                     HMODULE (*load)() = nullptr) noexcept {
         Verdict v;
         try {
             if (!code || !size || size > 4 * 1024 * 1024) {
@@ -160,7 +162,8 @@ class Classifier {
             std::lock_guard lock(slot->mutex);
             if (!slot->done) {
                 const auto start = Now();
-                slot->result = Decide(*v.profile, code, size, hash, module, slot->target);
+                slot->result = Decide(*v.profile, code, size, hash,
+                                      module || !load ? module : load(), slot->target);
                 v.micros = Now() - start;
                 rrtiming::Global().Add(rrtiming::Stage::Classify, v.micros * 1000);
                 micros += v.micros;
