@@ -836,15 +836,19 @@ class Controller {
         }
     }
     // Right after a prepass: this frame's surface key. Skipped (the frame then has no
-    // record) while an earlier frame sharing the entry still has GPU work, since the
-    // entry's descriptors would be rewritten under it.
+    // record) while an earlier frame using the same descriptor set still has GPU work,
+    // since those descriptors would be rewritten under it. With more sets than slots this
+    // only happens if slots hold frames Sets or more apart.
     void CoverageKey(Slot &s, ID3D12GraphicsCommandList *cl) {
         if (!rrssscov::Wanted() || !sss_enabled || sss_failed || !PrepareSssCoverage(s.gpu.w, s.gpu.h))
             return;
         for (const auto &o : slots)
             if (&o != &s && o.busy && o.frame != UINT_MAX &&
-                rrssscov::Entry(o.frame) == rrssscov::Entry(s.frame)) {
-                ++coverage_key_skips; // the GPU is Ring frames behind: shown in the panel
+                CoverageHistory::Set(o.frame) == CoverageHistory::Set(s.frame)) {
+                // Shown in the panel; logged at 1, 2, 4, 8, ...
+                if (!(++coverage_key_skips & (coverage_key_skips - 1)))
+                    Log("Subsurface Scattering coverage: surface key skipped, its descriptors "
+                        "are still in flight (raw lighting this frame)");
                 return;
             }
         coverage_history.Key(cl, pipelines, s.gpu.sources[3].Get(), s.frame, s.generation);

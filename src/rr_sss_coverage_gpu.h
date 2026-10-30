@@ -13,7 +13,6 @@ namespace rrlive {
 struct CoverageHistory {
     struct Entry {
         ComPtr<ID3D12Resource> key, coverage, counters, readback;
-        ComPtr<ID3D12DescriptorHeap> heap; // 0: PackedSurface SRV, 1: key UAV
         const uint32_t *map{};
         // The frame whose key / coverage the entry holds (UINT_MAX: none), and its RR
         // generation. counted: this frame's lighting pass recorded counters into readback.
@@ -21,6 +20,13 @@ struct CoverageHistory {
         bool counted{};
     };
     std::array<Entry, rrssscov::Ring> entries;
+    // The key pass's descriptors (0: PackedSurface SRV, 1: key UAV), one set per frame
+    // modulo Sets. More sets than RR has slots, so a set is not rewritten while a frame that
+    // used it is still in flight, even when the GPU is more than Ring frames behind (the
+    // entry's textures are ordered by submission; only descriptors need this).
+    static constexpr unsigned Sets = 8;
+    std::array<ComPtr<ID3D12DescriptorHeap>, Sets> heaps;
+    static constexpr unsigned Set(unsigned frame) { return frame % Sets; }
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
     UINT w{}, h{};
@@ -79,16 +85,12 @@ struct CoverageHistory {
             void *m{};
             Check(e.readback->Map(0, nullptr, &m), "SSS coverage readback map failed");
             e.map = static_cast<const uint32_t *>(m);
+        }
+        for (auto &heap : heaps) {
             D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
                                           D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
-            rrprivate::CheckAllocation(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&e.heap)),
+            rrprivate::CheckAllocation(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
                                        "SSS coverage descriptor heap failed");
-            D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
-            u.Format = DXGI_FORMAT_R32_UINT;
-            u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-            p.device->CreateUnorderedAccessView(
-                e.key.Get(), nullptr, &u,
-                {e.heap->GetCPUDescriptorHandleForHeapStart().ptr + p.stride});
         }
         bytes = ledger.bytes - before;
         w = width;
@@ -97,8 +99,8 @@ struct CoverageHistory {
     }
     // Records this frame's surface key from the prepass PackedSurface (UNORDERED_ACCESS, as
     // the prepass leaves it) and zeroes the frame's counters. The caller holds a proven
-    // prepass recording; the descriptors are written for this recording only, after the
-    // entry's earlier frame (Ring frames before) was submitted.
+    // prepass recording; the descriptors (set Set(frame)) are written for this recording
+    // only, while no frame in flight uses that set.
     bool Key(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *surface, UINT frame,
              UINT generation) {
         if (!ready || !cl || !surface)
@@ -108,26 +110,31 @@ struct CoverageHistory {
             d.Format != DXGI_FORMAT_R32G32B32A32_UINT || d.SampleDesc.Count != 1)
             return false;
         auto &e = entries[rrssscov::Entry(frame)];
+        auto &heap = heaps[Set(frame)];
         D3D12_SHADER_RESOURCE_VIEW_DESC v{};
         v.Format = d.Format;
         v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         v.Texture2D.MipLevels = 1;
         v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        p.device->CreateShaderResourceView(surface, &v,
-                                           e.heap->GetCPUDescriptorHandleForHeapStart());
+        p.device->CreateShaderResourceView(surface, &v, heap->GetCPUDescriptorHandleForHeapStart());
+        D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+        u.Format = DXGI_FORMAT_R32_UINT;
+        u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        p.device->CreateUnorderedAccessView(
+            e.key.Get(), nullptr, &u, {heap->GetCPUDescriptorHandleForHeapStart().ptr + p.stride});
         Change(cl, surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Change(cl, e.key.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Change(cl, e.counters.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        ID3D12DescriptorHeap *heaps[] = {e.heap.Get()};
-        cl->SetDescriptorHeaps(1, heaps);
+        ID3D12DescriptorHeap *bound[] = {heap.Get()};
+        cl->SetDescriptorHeaps(1, bound);
         cl->SetComputeRootSignature(root.Get());
         cl->SetPipelineState(pipeline.Get());
         const UINT size[] = {w, h};
         cl->SetComputeRoot32BitConstants(0, 2, size, 0);
-        const auto gpu = e.heap->GetGPUDescriptorHandleForHeapStart();
+        const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
         cl->SetComputeRootDescriptorTable(1, gpu);
         cl->SetComputeRootDescriptorTable(2, {gpu.ptr + p.stride});
         cl->SetComputeRootUnorderedAccessView(3, e.counters->GetGPUVirtualAddress());
