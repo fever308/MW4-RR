@@ -246,14 +246,28 @@ int wmain(int argc, wchar_t **argv) {
     CHECK(std::string(status) == "unsupported-subsurface-scattering-structure");
     CHECK(!registry.HasHash(rrsss::ShaderHash(changed.data(), changed.size())));
     for (auto *p : {&supported, &variant}) {
-        // Flipped bits inside the DXIL bitcode.
-        for (size_t at : {p->size() / 3, p->size() / 2, p->size() * 2 / 3}) {
+        // Flipped bits inside the DXIL bitcode. Some bits decode to the same
+        // program; such a copy must get the same guide, every other one is refused.
+        std::string original, decoded;
+        rrsss::ShaderTools dxc;
+        CHECK(dxc.Create(module) && dxc.Disassemble(p->data(), p->size(), decoded) &&
+              rrsss::StructuralText(decoded, original));
+        unsigned refused = 0, refused_cached = 0;
+        for (unsigned i = 1; i < 16; ++i) {
             auto altered = *p;
-            altered[at] ^= 0x10;
-            CHECK(!cache.Get(altered.data(), altered.size(), module, status));
-            CHECK(!rrsss::BuildRuntimeShader(altered.data(), altered.size(), module, out, status) && out.empty());
-            CHECK(!registry.Has(rrsss::ShaderHash(altered.data(), altered.size()), altered.size()));
+            altered[2048 + (altered.size() - 2048) * i / 16] ^= 0x10;
+            std::string normalized;
+            const bool same = dxc.Disassemble(altered.data(), altered.size(), decoded) &&
+                              rrsss::StructuralText(decoded, normalized) && normalized == original;
+            const bool built = rrsss::BuildRuntimeShader(altered.data(), altered.size(), module, out, status);
+            CHECK(built == same && (!built || out == (p == &supported ? a : b)) && (built || out.empty()));
+            if (!same && refused_cached++ < 2) {
+                CHECK(!cache.Get(altered.data(), altered.size(), module, status));
+                CHECK(!registry.Has(rrsss::ShaderHash(altered.data(), altered.size()), altered.size()));
+            }
+            refused += !same;
         }
+        CHECK(refused >= 3);
         // The bitcode's trailing zero padding does not change the program: it
         // loses the exact pin but is still the same shader structurally.
         auto padded = *p;
