@@ -110,10 +110,11 @@ static std::string Body(const std::string &text) {
     const auto end = at == std::string::npos ? at : t.find("\n}\n", at);
     if (end == std::string::npos)
         return {};
-    // Reassembly renumbers metadata nodes, so attachments such as !tbaa are
-    // compared without their ids. Instructions and values stay exact.
-    static const std::regex id(R"(!\d+\b)");
-    return std::regex_replace(t.substr(at, end - at), id, "!N");
+    // Reassembly renumbers metadata nodes and annotates each dx.op call with a
+    // comment, so attachments such as !tbaa are compared without their ids and
+    // comments are dropped. Instructions and values stay exact.
+    static const std::regex id(R"(!\d+\b)"), comment(R"([ \t]+;[^\n]*)");
+    return std::regex_replace(std::regex_replace(t.substr(at, end - at), comment, ""), id, "!N");
 }
 static int Fingerprint(const wchar_t *shader, const wchar_t *dll) {
     auto native = Read(shader);
