@@ -41,7 +41,8 @@ static void ApplyEnabled(bool allowed) {
     if (rrweapondepth::enabled.exchange(requested_weapon_depth) != requested_weapon_depth)
         ++rrweapondepth::changes;
     // Read by RR once per frame (Controller::PrepareFgDepth): applies from the next frame.
-    rrfgdepth::enabled.store(requested_fg_weapon_depth, std::memory_order_relaxed);
+    if (rrfgdepth::enabled.exchange(requested_fg_weapon_depth) != requested_fg_weapon_depth)
+        ++rrfgdepth::changes;
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);

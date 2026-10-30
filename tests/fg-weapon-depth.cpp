@@ -96,6 +96,11 @@ static void StatusAndLabels() {
     assert(std::strcmp(line, "supplied=2 depth=1") == 0);
     s.Drain(line, sizeof(line));
     assert(line[0] == 0);
+    // A change of the setting starts the counts over.
+    s.Note(Reason::Disabled);
+    s.Reset();
+    s.Drain(line, sizeof(line));
+    assert(line[0] == 0);
     // A small buffer truncates, never overflows.
     for (unsigned i = 0; i < unsigned(Reason::Count); ++i)
         s.Note(Reason(i));

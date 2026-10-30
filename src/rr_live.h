@@ -141,13 +141,12 @@ class Controller {
     // replacement RefusalLimit times in a row; cleared when the setting is off. Textures live
     // in the slots (GpuFrame::fg_depth); their reserve growth is part of test_reserve.
     bool fg_paused{}, fg_memory_logged{}, fg_supplied_logged{};
-    unsigned fg_refusals{}, fg_diagnostics{};
+    unsigned fg_refusals{}, fg_diagnostics{}, fg_changes{};
     UINT64 fg_memory_retry_at{}, fg_summary_at{};
     struct FgSignature {
         UINT lifecycle{}, state{}, extent_w{}, extent_h{}, width{}, height{}, format{}, inverted{},
             motion{}, jittered{}, offset_x{}, offset_y{}, render_w{}, render_h{};
         bool same_list{}, same_depth{}, slot{};
-        rrfgdepth::Reason reason{};
         bool operator==(const FgSignature &) const = default;
     } fg_logged{};
     // Water responsivity mask (rr_water.h).
@@ -678,6 +677,13 @@ class Controller {
                 s.busy = false;
             }
         }
+        // Idle slots keep their texture between frames: they go too once it is unused. An idle
+        // slot's last frame has completed (it went idle above).
+        if (!rrfgdepth::enabled.load(std::memory_order_relaxed) ||
+            !rrfgdepth::status.FgSeen(GetTickCount64()))
+            for (auto &s : slots)
+                if (!s.busy && s.gpu.fg_depth)
+                    ReleaseFgTexture(s.gpu);
         const UINT64 now = GetTickCount64();
         Resume(sss_failed, sss_pause, now, "Subsurface Scattering guide");
         Resume(transparency_failed, transparency_pause, now, "Transparency guide");
@@ -732,7 +738,9 @@ class Controller {
         if (ok) {
             const UINT64 before = g.bytes;
             try {
-                g.fg_depth = g.Allocate(pipelines, budget, d);
+                // Announced like RR's depth copy: DLSS5 NR registers resources it may see.
+                g.fg_depth = g.Allocate(pipelines, budget, d, D3D12_HEAP_TYPE_DEFAULT, nullptr,
+                                        true);
                 g.fg_bytes = g.bytes - before;
                 g.fg_growth = budget.limit - old;
                 test_reserve += g.fg_growth;
@@ -755,18 +763,26 @@ class Controller {
         }
         return false;
     }
+    // Once per change of the setting, under the lock: a pause, the refusal count and the
+    // reason counts start over, so the first summary after a change is about the new setting.
+    void FgSettingChanged() {
+        const unsigned changes = rrfgdepth::changes.load(std::memory_order_relaxed);
+        if (changes == fg_changes)
+            return;
+        fg_changes = changes;
+        fg_paused = false;
+        fg_refusals = 0;
+        fg_supplied_logged = false;
+        rrfgdepth::status.Reset();
+    }
     // In AfterSR, on the frame's SR list after RR's depth source is a shader resource and
     // before RR's own passes: writes this frame's replacement (GpuFrame::FgWeaponDepth). The
     // setting is read once here, so the frame's tag follows this decision. A failure here
     // only leaves the frame's Frame Generation depth the game's own.
     void PrepareFgDepth(Slot &s, ID3D12GraphicsCommandList *cl) {
         s.fg_prepared = false;
+        FgSettingChanged();
         const bool on = rrfgdepth::enabled.load(std::memory_order_relaxed);
-        if (!on) {
-            fg_paused = false;
-            fg_refusals = 0;
-            fg_supplied_logged = false;
-        }
         const UINT64 now = GetTickCount64();
         try {
             const auto native = s.gpu.sr[1]->GetDesc();
@@ -799,7 +815,6 @@ class Controller {
         v.same_list = same_list;
         v.same_depth = same_depth;
         v.slot = s != nullptr;
-        v.reason = why;
         if (s && same_depth) {
             const auto d = s->gpu.sr[1]->GetDesc();
             v.width = UINT(d.Width);
@@ -868,14 +883,14 @@ class Controller {
         status.fg_seen_at.store(now, std::memory_order_relaxed);
         rrfgdepth::Match m;
         m.enabled = rrfgdepth::enabled.load(std::memory_order_relaxed);
-        if (!m.enabled && !rrfgdepth::observe.load(std::memory_order_relaxed)) {
-            status.Note(rrfgdepth::Reason::Disabled);
+        // Off and not observing: nothing is counted (no summary would report it).
+        if (!m.enabled && !rrfgdepth::observe.load(std::memory_order_relaxed))
             return false;
-        }
         auto list =
             fg::NativeObject<ID3D12GraphicsCommandList>(reinterpret_cast<IUnknown *>(t.command));
         auto depth = fg::NativeObject<ID3D12Resource>(reinterpret_cast<IUnknown *>(t.native));
         std::lock_guard lock(mutex);
+        FgSettingChanged();
         m.paused = fg_paused;
         m.lifecycle_now = t.lifecycle == rrfgdepth::OnlyValidNow;
         m.rr_running = enabled && !failed && !retired;
@@ -965,7 +980,7 @@ class Controller {
         const auto last = rrfgdepth::Reason(status.last.load(std::memory_order_relaxed));
         if (last == rrfgdepth::Reason::Supplied &&
             now - status.supplied_at.load(std::memory_order_relaxed) > 2000)
-            return rrfgdepth::Reason::NotRecorded;
+            return rrfgdepth::Reason::Stale;
         return last;
     }
     // Weapon depth state for the panel. Restarting: RR is being recreated with the

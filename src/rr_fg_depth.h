@@ -36,6 +36,9 @@ inline std::atomic<bool> enabled{};
 // each Frame Generation depth tag to RR's frame and log its metadata (Controller::FgDiagnose),
 // replacing nothing. For establishing the path before trying the replacement.
 inline std::atomic<bool> observe{};
+// Bumped on every change of the setting (rr_settings.inl ApplyEnabled): clears a pause and the
+// reason counts at the next frame (Controller::FgSettingChanged).
+inline std::atomic<unsigned> changes{};
 
 // Why a frame's Frame Generation depth is the game's own (Reason::Supplied: the replacement).
 enum class Reason : unsigned {
@@ -54,6 +57,7 @@ enum class Reason : unsigned {
     Memory,      // no GPU memory for the texture; retried after a second
     Rejected,    // Streamline refused the replacement; the game's tags were re-sent
     Paused,      // Streamline refused it 3 frames in a row: off until the setting changes
+    Stale,       // supplied before, but not in the last 2 s (no frame has matched since)
     Count
 };
 inline const char *Label(Reason r) {
@@ -88,6 +92,8 @@ inline const char *Label(Reason r) {
         return "unavailable: Streamline refused the replacement";
     case Reason::Paused:
         return "off: Streamline refused it 3 frames in a row (turn it off and on to retry)";
+    case Reason::Stale:
+        return "waiting: no replacement supplied in the last 2 s";
     default:
         return "unknown";
     }
@@ -96,7 +102,7 @@ inline const char *Key(Reason r) {
     static const char *keys[] = {"supplied", "disabled",     "no_fg_tags", "rr_off",
                                  "no_frame", "not_recorded", "lifecycle",  "list",
                                  "depth",    "submitted",    "format",     "projection",
-                                 "memory",   "rejected",     "paused"};
+                                 "memory",   "rejected",     "paused",     "stale"};
     static_assert(sizeof(keys) / sizeof(*keys) == unsigned(Reason::Count));
     return unsigned(r) < unsigned(Reason::Count) ? keys[unsigned(r)] : "unknown";
 }
@@ -177,6 +183,10 @@ struct Status {
     void Note(Reason r) {
         last.store(unsigned(r), std::memory_order_relaxed);
         counts[unsigned(r)].fetch_add(1, std::memory_order_relaxed);
+    }
+    void Reset() {
+        for (auto &c : counts)
+            c.store(0, std::memory_order_relaxed);
     }
     bool FgSeen(uint64_t now) const {
         const auto at = fg_seen_at.load(std::memory_order_relaxed);
