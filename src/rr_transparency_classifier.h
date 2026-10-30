@@ -45,7 +45,7 @@ inline constexpr Profile Profiles[] = {
       {rrsss::ISG1, 0x95d4f83ffd7546b6ull},
       {rrsss::OSG1, 0xee1a09becc8d24baull},
       {rrsss::PSV0, 0xc7ff980b105afc48ull}},
-     "",
+     "06fb97bfdb878e53f5763eb7c5dac9656f73cb05d3803ce9af28cbbe0a89e2bd",
      7712},
     {Kind::Refraction,
      "refraction",
@@ -54,7 +54,8 @@ inline constexpr Profile Profiles[] = {
       {rrsss::ISG1, 0x359e39e4d7906a58ull},
       {rrsss::OSG1, 0x5116c835e844e585ull},
       {rrsss::PSV0, 0x4c88c4ce42b8fc9dull}},
-     "",
+     // b723 and 5a24 (the 12672- and 12416-byte builds) both measure this.
+     "f8b26ec11e573978654b4008992d89b648c7cfdb101367a2a922066093b218bc",
      7744},
 };
 // Cheap filter: the profile whose pinned parts the container holds, else nullptr.
