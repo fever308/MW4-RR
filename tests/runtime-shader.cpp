@@ -108,7 +108,12 @@ static std::string Body(const std::string &text) {
     t.erase(std::remove(t.begin(), t.end(), '\r'), t.end());
     const auto at = t.find("\ndefine void @ps_main()");
     const auto end = at == std::string::npos ? at : t.find("\n}\n", at);
-    return end == std::string::npos ? std::string() : t.substr(at, end - at);
+    if (end == std::string::npos)
+        return {};
+    // Reassembly renumbers metadata nodes, so attachments such as !tbaa are
+    // compared without their ids. Instructions and values stay exact.
+    static const std::regex id(R"(!\d+\b)");
+    return std::regex_replace(t.substr(at, end - at), id, "!N");
 }
 static int Fingerprint(const wchar_t *shader, const wchar_t *dll) {
     auto native = Read(shader);
