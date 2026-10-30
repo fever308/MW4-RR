@@ -1,4 +1,5 @@
 #include "../src/rr_sss_runtime_shader.h"
+#include "memory-cap.h"
 #include <fstream>
 #include <iostream>
 #include <cassert>
@@ -163,6 +164,8 @@ static bool ChangedInstruction(std::string &t) {
     return true;
 }
 int wmain(int argc, wchar_t **argv) {
+    if (!CapTestMemory())
+        return 1;
     std::vector<unsigned char> out{1}; const char *status = "";
     CHECK(!rrsss::BuildRuntimeShader(nullptr, 0, nullptr, out, status) && out.empty());
     SyntheticStructure();

@@ -1483,6 +1483,58 @@ struct ControllerCpuTest {
         assert(logs.size() == 1);
     }
 
+    // Transparency guide frames that were not admitted: one line for a 10 s window with a
+    // failure, then at most one a minute while they continue, and one when frames are admitted
+    // again. The line names every failed condition and the composition outcome.
+    static void TransparencyAdmission() {
+        Controller c;
+        c.logger = [](const char *line) { logs.emplace_back(line); };
+        logs.clear();
+        using namespace rrtrans;
+        const auto unanchored = MissUnanchored | MissAnchor;
+        c.TransparencyAdmissionLocked(true, 0, Note::Anchored, 100000);
+        c.TransparencyAdmissionLocked(true, 0, Note::Anchored, 105000);
+        c.TransparencyAdmissionLocked(true, 0, Note::Anchored, 110000);
+        assert(logs.empty()); // admitted windows are quiet
+        c.TransparencyAdmissionLocked(false, unanchored, Note::Unrecognized, 115000);
+        c.TransparencyAdmissionLocked(false, unanchored, Note::Unrecognized, 120000);
+        assert(logs.size() == 1 &&
+               Logged("Transparency guide (10s): used=2 admitted=0 notAdmitted=2 failed: "
+                      "no-composition-anchor=2 composition-not-in-batch=2 anchor: "
+                      "composition-shader-unrecognized=2"));
+        for (ULONGLONG t = 125000; t < 180000; t += 5000)
+            c.TransparencyAdmissionLocked(false, MissBaseline, Note::Anchored, t);
+        assert(logs.size() == 1); // the same failures wait a minute, and keep counting
+        c.TransparencyAdmissionLocked(false, MissBaseline, Note::Anchored, 180000);
+        assert(logs.size() == 2 && logs[1].find("(60s): used=12 admitted=0 notAdmitted=12 "
+                                                "failed: baseline-rejected=12") !=
+                                       std::string::npos);
+        c.TransparencyAdmissionLocked(true, 0, Note::Anchored, 185000);
+        c.TransparencyAdmissionLocked(true, 0, Note::Anchored, 190000);
+        assert(logs.size() == 3 &&
+               logs[2] == "Transparency guide (10s): used=2 admitted=2 notAdmitted=0");
+        c.TransparencyAdmissionLocked(true, 0, Note::Anchored, 200000);
+        c.TransparencyAdmissionLocked(true, 0, Note::Anchored, 210000);
+        assert(logs.size() == 3);
+        // The pause line names why the frame was not admitted.
+        logs.clear();
+        c.SuspendTransparencyProducer(nullptr, false, unanchored, Note::NoSlot);
+        assert(logs.size() == 1 &&
+               Logged("Transparency guide paused (frame not admitted: no-composition-anchor "
+                      "(no-frame-slot), composition-not-in-batch); retrying in 5s"));
+        c.SuspendTransparencyProducer("waiting for GPU memory", true);
+        assert(logs.size() == 2 && logs[1] == "Transparency guide paused (waiting for GPU memory); "
+                                              "retrying in 1s");
+        // A rejected composition records its reason for the frame it claimed, once.
+        c.enabled = c.transparency_enabled = true;
+        c.camera_frame = 7;
+        c.camera_view = 0;
+        c.TransparencyUnsupported(Note::View);
+        c.TransparencyUnsupported(Note::Context);
+        assert(c.transparency_note.For(7, true) == Note::View);
+        assert(c.transparency_note.For(8, false) == Note::Unrecognized);
+    }
+
     // The render glue's signature refusal names the reason in the 10 s line,
     // and only while the blend is on, as the controller's own refusals do.
     static void SignatureRefusal() {
@@ -1604,6 +1656,7 @@ struct ControllerCpuTest {
         Shutdown();
         ResetUnsubmitted();
         Report();
+        TransparencyAdmission();
         SignatureRefusal();
     }
 };

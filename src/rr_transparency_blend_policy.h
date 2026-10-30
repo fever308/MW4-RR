@@ -59,8 +59,8 @@ struct Control {
     float diffuse[4]; // rgb diffuse target, w unused (0)
     float params[4];  // x specular target, y roughness target, z strength, w floor
     uint32_t reserved[4];
-    uint32_t zero[4]; // always 0: source for clearing the stats buffer
-    uint32_t padding[44];
+    uint32_t zero[8]; // always 0: source for clearing the stats buffer
+    uint32_t padding[40];
 };
 static_assert(sizeof(Control) == 256);
 static_assert(offsetof(Control, admitted) == 0);
@@ -431,18 +431,44 @@ inline const char *Label(Reason reason) {
 }
 // Log window totals. pixels is the render pixel count of the blend passes that
 // ran (width * height each); it is the denominator of eligible%.
+// touched counts eligible pixels with any opacity before the noise floor.
+// rejects counts every refusal by reason; last is the latest, and stale when a
+// blend frame was admitted after it.
+inline constexpr size_t ReasonCount = size_t(Reason::Failed) + 1;
 struct Counters {
     uint64_t frames{}, captures_oit{}, captures_refr{}, admitted{}, ran{};
-    uint64_t pixels{}, eligible{}, covered{}, opacity64{};
+    uint64_t pixels{}, eligible{}, covered{}, opacity64{}, touched{};
+    uint64_t rejects[ReasonCount]{};
     Reason last{Reason::None};
+    bool last_stale{};
+    void Refuse(Reason why) {
+        last = why;
+        last_stale = false;
+        if (size_t(why) < ReasonCount)
+            ++rejects[size_t(why)];
+    }
+    void Admitted() {
+        ++admitted;
+        last_stale = last != Reason::None;
+    }
 };
+// Why a window blended nothing, from the earliest missing step; "ok" when it did.
+inline const char *CoverageNote(const Counters &k) {
+    return !k.captures_oit && !k.captures_refr ? "no-captures"
+           : !k.admitted                       ? "no-admitted-frame"
+           : !k.ran                            ? "blend-not-run"
+           : !k.eligible                       ? "no-eligible-pixels"
+           : !k.touched                        ? "transmittance-unchanged"
+           : !k.covered                        ? "below-noise-floor"
+                                               : "ok";
+}
 // seconds: the span the counters cover.
 inline int Report(const Counters &k, char *buf, size_t n, unsigned long long seconds = 10) {
     auto ratio = [](double num, uint64_t den) { return den ? num / double(den) : 0.0; };
     return snprintf(buf, n,
                     "Transparency albedo blend (%llus): frames=%llu captures=%llu oit=%llu "
                     "refr=%llu admitted=%llu eligible=%.1f%% covered=%.1f%% meanOpacity=%.3f "
-                    "lastReject=%s",
+                    "lastReject=%s%s",
                     seconds, static_cast<unsigned long long>(k.frames),
                     static_cast<unsigned long long>(k.captures_oit + k.captures_refr),
                     static_cast<unsigned long long>(k.captures_oit),
@@ -450,7 +476,27 @@ inline int Report(const Counters &k, char *buf, size_t n, unsigned long long sec
                     static_cast<unsigned long long>(k.admitted),
                     100.0 * ratio(double(k.eligible), k.pixels),
                     100.0 * ratio(double(k.covered), k.eligible),
-                    ratio(double(k.opacity64) / 64.0, k.covered), Label(k.last));
+                    ratio(double(k.opacity64) / 64.0, k.covered), Label(k.last),
+                    k.last_stale ? "(before-last-admitted)" : "");
+}
+// The line's tail: the blend passes that ran, the pixels any capture touched,
+// why nothing was blended, and every refusal by reason.
+inline int Detail(const Counters &k, char *buf, size_t n) {
+    int at = snprintf(buf, n, " ran=%llu touched=%llu coverage=%s",
+                      static_cast<unsigned long long>(k.ran),
+                      static_cast<unsigned long long>(k.touched), CoverageNote(k));
+    bool first = true;
+    for (size_t i = 1; i < ReasonCount && at >= 0; ++i) {
+        if (!k.rejects[i])
+            continue;
+        const int m = snprintf(buf && size_t(at) < n ? buf + at : nullptr,
+                               buf && size_t(at) < n ? n - size_t(at) : 0, "%s%s=%llu",
+                               first ? " rejects: " : " ", Label(Reason(i)),
+                               static_cast<unsigned long long>(k.rejects[i]));
+        at = m < 0 ? m : at + m;
+        first = false;
+    }
+    return at;
 }
 
 inline rrstatus::State StatusOf(bool enabled, bool failed, bool unavailable, bool rr_on,

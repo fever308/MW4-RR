@@ -963,8 +963,9 @@ static void TestReport() {
     k.eligible = 250;
     k.covered = 50;
     k.opacity64 = 1600;
+    k.touched = 60;
     k.last = Reason::Split;
-    char text[256];
+    char text[400];
     const char *expected =
         "Transparency albedo blend (10s): frames=600 captures=602 oit=590 refr=12 admitted=598 "
         "eligible=25.0% covered=20.0% meanOpacity=0.500 lastReject=split";
@@ -982,6 +983,51 @@ static void TestReport() {
     assert(!strcmp(text, "Transparency albedo blend (10s): frames=0 captures=0 oit=0 refr=0 "
                          "admitted=0 eligible=0.0% covered=0.0% meanOpacity=0.000 "
                          "lastReject=none"));
+    Detail(zero, text, sizeof(text));
+    assert(!strcmp(text, " ran=0 touched=0 coverage=no-captures"));
+    Detail(k, text, sizeof(text));
+    assert(!strcmp(text, " ran=597 touched=60 coverage=ok"));
+
+    // The tester's window: refraction captures admitted, every pixel eligible,
+    // nothing covered. Each refusal is counted, and the remembered one is
+    // marked stale once a later frame was admitted.
+    Counters t{};
+    t.frames = t.captures_refr = 12;
+    t.Refuse(Reason::NoSlot);
+    t.Refuse(Reason::NoSlot);
+    t.Refuse(Reason::Order);
+    assert(t.last == Reason::Order && !t.last_stale);
+    for (int i = 0; i < 12; ++i)
+        t.Admitted();
+    assert(t.admitted == 12 && t.last_stale);
+    t.ran = 12;
+    t.pixels = t.eligible = 1000;
+    Report(t, text, sizeof(text));
+    assert(!strcmp(text, "Transparency albedo blend (10s): frames=12 captures=12 oit=0 refr=12 "
+                         "admitted=12 eligible=100.0% covered=0.0% meanOpacity=0.000 "
+                         "lastReject=order(before-last-admitted)"));
+    Detail(t, text, sizeof(text));
+    assert(!strcmp(text, " ran=12 touched=0 coverage=transmittance-unchanged rejects: no-slot=2 "
+                         "order=1"));
+    t.Refuse(Reason::Memory);
+    assert(!t.last_stale && t.rejects[size_t(Reason::Memory)] == 1);
+    t.touched = 3;
+    assert(!strcmp(CoverageNote(t), "below-noise-floor"));
+    t.covered = 2;
+    assert(!strcmp(CoverageNote(t), "ok"));
+    t.eligible = 0;
+    assert(!strcmp(CoverageNote(t), "no-eligible-pixels"));
+    t.ran = 0;
+    assert(!strcmp(CoverageNote(t), "blend-not-run"));
+    t.admitted = 0;
+    assert(!strcmp(CoverageNote(t), "no-admitted-frame"));
+    t.captures_refr = 0;
+    assert(!strcmp(CoverageNote(t), "no-captures"));
+    // A report never writes past its buffer, and returns the full length.
+    char tiny[24];
+    t.captures_refr = 1;
+    const int full = Detail(t, nullptr, 0);
+    assert(full > 0 && Detail(t, tiny, sizeof(tiny)) == full && strlen(tiny) == sizeof(tiny) - 1);
 
     const char *labels[] = {"none",   "disabled", "no-slot", "no-pipeline", "signature", "extent",
                             "memory", "order",    "split",   "typed-load",  "failed"};

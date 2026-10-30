@@ -83,6 +83,7 @@ static rrsss::PipelineRegistry &SssPipelines() {
 }
 static rrblend::CoveragePipelineRegistry &CoveragePipelines() {
     static auto *p = []() {
+        rrblend::Classification().logger = &WriteLog;
         auto *v = new rrblend::CoveragePipelineRegistry;
         v->logger = &WriteLog;
         return v;
