@@ -207,6 +207,9 @@ static void CacheEvidence(const std::vector<unsigned char> &supported,
         rrtiming::Timing t;
         rrshadercache::DiskCache disk(dir);
         rrsss::RecognizedShaders registry;
+        auto &global = rrtiming::Global();
+        const auto transform_before = global.stages[unsigned(rrtiming::Stage::Transform)].count.load();
+        const auto assemble_before = global.stages[unsigned(rrtiming::Stage::Assemble)].count.load();
         rrsss::RuntimeShaderCache warm(&registry, &disk, &t);
         for (int i = 0; i < 3; ++i) {
             auto got = warm.Get(inputs[i]->data(), inputs[i]->size(), module, status, nullptr, &outcome);
@@ -215,11 +218,12 @@ static void CacheEvidence(const std::vector<unsigned char> &supported,
                 std::exit(1);
             }
             CHECK(*got == *guides[i]);
+            CHECK(!std::strcmp(status, "ready"));
             CHECK(registry.Has(rrsss::ShaderHash(inputs[i]->data(), inputs[i]->size()), inputs[i]->size()));
         }
         // A hit skips transformation and assembly.
-        CHECK(t.stages[unsigned(rrtiming::Stage::Transform)].count == 0);
-        CHECK(t.stages[unsigned(rrtiming::Stage::Assemble)].count == 0);
+        CHECK(global.stages[unsigned(rrtiming::Stage::Transform)].count == transform_before);
+        CHECK(global.stages[unsigned(rrtiming::Stage::Assemble)].count == assemble_before);
         CHECK(t.cache_hits == 3);
         std::cout << "warm reuse of 3 builds: "
                   << rrtiming::Ms(t.stages[unsigned(rrtiming::Stage::Preparation)].total) << " ms\n";

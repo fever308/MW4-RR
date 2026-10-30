@@ -482,8 +482,11 @@ inline bool AcceptCachedShader(const void *native, size_t size, HMODULE module,
     try {
         if (const auto *known = KnownVariant(native, size)) {
             status = "cached-shader-output-mismatch";
-            return code.size() == known->output_bytes &&
-                   ShaderDigest(code.data(), code.size(), known->output_sha256);
+            const bool accepted = code.size() == known->output_bytes &&
+                                  ShaderDigest(code.data(), code.size(), known->output_sha256);
+            if (accepted)
+                status = "ready";
+            return accepted;
         }
         status = "unsupported-subsurface-scattering-shader";
         if (!StructuralCandidate(native, size))
