@@ -96,10 +96,18 @@ inline constexpr const char *OutputStructure =
     "15ab971c5d61c21c30b4d1b7c4e5653fc1fbfa145e1cf2fca2749eda11e5065a";
 // Highest scene constant-buffer byte the shader (and so the guide) reads.
 inline constexpr size_t SceneReadBytes = 12112;
-// Cheap filter before disassembly: the container's signature, runtime-info
-// and feature parts must equal the captured builds'.
-inline bool StructuralCandidate(const void *data, size_t size) noexcept {
-    if (!data || size < 32 || size > 4 * 1024 * 1024)
+// A DXBC part pinned by the FNV-1a64 of its payload.
+struct PartPin {
+    uint32_t fourcc;
+    uint64_t hash;
+};
+inline constexpr uint32_t SFI0 = 0x30494653u, ISG1 = 0x31475349u, OSG1 = 0x3147534fu,
+                          PSV0 = 0x30565350u;
+// Cheap filter before any full hash or disassembly: the container is well
+// formed and holds each pinned part exactly once with the pinned payload.
+inline bool ContainerParts(const void *data, size_t size, const PartPin *pins,
+                           size_t count) noexcept {
+    if (!data || size < 32 || size > 4 * 1024 * 1024 || !pins || !count || count > 8)
         return false;
     const auto *b = static_cast<const unsigned char *>(data);
     auto u32 = [&](size_t at) {
@@ -107,35 +115,40 @@ inline bool StructuralCandidate(const void *data, size_t size) noexcept {
         std::memcpy(&v, b + at, 4);
         return v;
     };
-    const uint32_t count = u32(28);
-    if (std::memcmp(b, "DXBC", 4) || u32(24) != size || count > 64 || 32 + 4ull * count > size)
+    const uint32_t parts = u32(28);
+    if (std::memcmp(b, "DXBC", 4) || u32(24) != size || parts > 64 || 32 + 4ull * parts > size)
         return false;
-    struct Part {
-        uint32_t fourcc;
-        uint64_t hash;
-        bool seen;
-    } parts[] = {{0x30494653u, 0xa8c7f832281a39c5ull, false},  // SFI0
-                 {0x31475349u, 0x95d4f83ffd7546b6ull, false},  // ISG1
-                 {0x3147534fu, 0x5116c835e844e585ull, false},  // OSG1
-                 {0x30565350u, 0xdc71665911d748feull, false}}; // PSV0
-    for (uint32_t i = 0; i < count; ++i) {
+    bool seen[8]{};
+    for (uint32_t i = 0; i < parts; ++i) {
         const uint32_t at = u32(32 + 4 * i);
         if (at > size - 8 || u32(at + 4) > size - 8 - at)
             return false;
-        for (auto &p : parts)
-            if (p.fourcc == u32(at)) {
-                if (p.seen || ShaderHash(b + at + 8, u32(at + 4)) != p.hash)
+        for (size_t p = 0; p < count; ++p)
+            if (pins[p].fourcc == u32(at)) {
+                if (seen[p] || ShaderHash(b + at + 8, u32(at + 4)) != pins[p].hash)
                     return false;
-                p.seen = true;
+                seen[p] = true;
             }
     }
-    return std::all_of(std::begin(parts), std::end(parts), [](const Part &p) { return p.seen; });
+    return std::all_of(seen, seen + count, [](bool v) { return v; });
+}
+// The captured builds' signature, runtime-info and feature parts.
+inline constexpr PartPin CandidateParts[] = {{SFI0, 0xa8c7f832281a39c5ull},
+                                             {ISG1, 0x95d4f83ffd7546b6ull},
+                                             {OSG1, 0x5116c835e844e585ull},
+                                             {PSV0, 0xdc71665911d748feull}};
+inline bool StructuralCandidate(const void *data, size_t size) noexcept {
+    return ContainerParts(data, size, CandidateParts, std::size(CandidateParts));
 }
 // Removes what a rebuild may change without changing behavior: the shader
 // hash and debug name, and the scene constant buffer's declared layout and
-// size, which must still cover every byte the shader reads. Each other
-// declaration, instruction and metadata line is kept verbatim.
-inline bool StructuralText(const std::string &text, std::string &out) {
+// size, which must still cover every byte the shader reads (read_bytes, the
+// highest byte its constant row loads reach). Each other declaration,
+// instruction and metadata line is kept verbatim. Shared by every shader that
+// declares the engine's scene constants at b3: the captured builds of the SSS
+// composite and of the refraction composite differ exactly there.
+inline bool StructuralText(const std::string &text, std::string &out,
+                           size_t read_bytes = SceneReadBytes) {
     out.clear();
     std::vector<std::string> lines;
     for (size_t at = 0; at <= text.size();) {
@@ -177,7 +190,7 @@ inline bool StructuralText(const std::string &text, std::string &out) {
     if (!scene || !std::regex_match(*scene, m, resource))
         return false;
     const auto bytes = std::stoul(m[2].str());
-    if (bytes % 16 || bytes < SceneReadBytes || bytes > 65536)
+    if (bytes % 16 || bytes < read_bytes || bytes > 65536)
         return false;
     const auto declared = "[" + m[2].str() + " x i8]";
     *scene = m[1].str() + "S" + m[3].str();
@@ -229,9 +242,10 @@ inline bool StructuralText(const std::string &text, std::string &out) {
             out += l + '\n';
     return true;
 }
-inline bool StructureMatches(const std::string &text, const char *expected) {
+inline bool StructureMatches(const std::string &text, const char *expected,
+                             size_t read_bytes = SceneReadBytes) {
     std::string normalized;
-    return StructuralText(text, normalized) &&
+    return StructuralText(text, normalized, read_bytes) &&
            ShaderDigest(normalized.data(), normalized.size(), expected);
 }
 inline bool TransformRuntimeShader(std::string &text) {

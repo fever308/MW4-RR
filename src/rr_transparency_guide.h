@@ -1,5 +1,6 @@
 #pragma once
 #include "rr_transparency_policy.h"
+#include "rr_transparency_admission.h"
 #include "rr_gpu_common.h"
 #include "feed_fg_identity.h"
 namespace rrtrans {

@@ -16,6 +16,7 @@
 #include "rr_ngx_log.h"
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
+#include "rr_transparency_shaders.h"
 #include <atomic>
 #include <mutex>
 #include <deque>
@@ -575,6 +576,7 @@ class Controller {
         transparency_pipeline = {};
         transparency_source.Reset();
         transparency_composition = {};
+        transparency_note = {};
         CoverageReconfigured();
         initialized = false;
         signaled = 0;
@@ -1838,24 +1840,32 @@ class Controller {
                 s.gpu.header_map[7] = sss_accept ? 1u : 0u;
                 if (s.sss_used)
                     SealSssMask(s, sss_accept);
+                const auto route = s.transparency.producer_copy ? rrtrans::Route::Producer
+                                   : s.transparency.at_draw     ? rrtrans::Route::AtDraw
+                                                                : rrtrans::Route::Prepared;
                 s.transparency_accepted =
                     s.transparency_used && s.transparency.written && s.transparency.anchored &&
-                    (s.transparency.producer_copy
-                         ? rrtrans::AdmitProducer(a, glass_pre[k], glass_anchor[k], b,
-                                                  s.transparency.prep_submitted,
-                                                  s.transparency.anchor_submitted, baseline)
-                     : s.transparency.at_draw
-                         ? rrtrans::AdmitAtDraw(a, glass_pre[k], glass_anchor[k], b,
-                                                s.transparency.prep_submitted,
-                                                s.transparency.anchor_submitted, baseline)
-                         : rrtrans::Admit(a, glass_pre[k], glass_anchor[k], b,
-                                          s.transparency.prep_submitted,
-                                          s.transparency.anchor_submitted, baseline));
-                if (s.transparency_used && s.transparency.producer_copy) {
-                    if (s.transparency_accepted)
-                        transparency_backoff = 0;
-                    else if (!transparency_producer_suspended)
-                        SuspendTransparencyProducer(nullptr);
+                    rrtrans::RouteAdmits(route, a, glass_pre[k], glass_anchor[k], b,
+                                         s.transparency.prep_submitted,
+                                         s.transparency.anchor_submitted, baseline);
+                if (s.transparency_used) {
+                    const auto misses = s.transparency_accepted
+                                            ? 0u
+                                            : rrtrans::Misses(route, a, glass_pre[k],
+                                                              glass_anchor[k], b,
+                                                              s.transparency.prep_submitted,
+                                                              s.transparency.anchor_submitted,
+                                                              baseline, s.transparency.written,
+                                                              s.transparency.anchored);
+                    const auto note = transparency_note.For(s.frame, CompositionRecognized());
+                    TransparencyAdmissionLocked(s.transparency_accepted, misses, note,
+                                                GetTickCount64());
+                    if (s.transparency.producer_copy) {
+                        if (s.transparency_accepted)
+                            transparency_backoff = 0;
+                        else if (!transparency_producer_suspended)
+                            SuspendTransparencyProducer(nullptr, false, misses, note);
+                    }
                 }
                 // Never part of acceptance: an unadmitted blend only reads no coverage.
                 SealCoverage(s, a, cover[k], b, baseline);
