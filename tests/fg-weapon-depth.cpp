@@ -31,7 +31,7 @@ static void Classification() {
 static rrfgdepth::Match Ready() {
     rrfgdepth::Match m;
     m.enabled = m.lifecycle_now = m.rr_running = m.slot = m.prepared = m.same_list = m.unsubmitted =
-        m.same_depth = true;
+        m.same_depth = m.list_ok = true;
     return m;
 }
 static void Decisions() {
@@ -87,6 +87,12 @@ static void Decisions() {
     assert(Decide(m) == Reason::Supplied);
     m.unsubmitted = true;
     assert(Decide(m) == Reason::Order);
+    // A copy list cannot take the replacement's barrier.
+    m.unsubmitted = false;
+    m.list_ok = false;
+    assert(Decide(m) == Reason::ListType);
+    m.same_list = true; // the SR list itself is never checked
+    assert(Decide(m) == Reason::Submitted);
 
     using rrfgdepth::Prepare;
     assert(Prepare(true, false, true, true, true, false) == Reason::Supplied);

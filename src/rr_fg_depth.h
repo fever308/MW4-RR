@@ -64,6 +64,7 @@ enum class Reason : unsigned {
     Rejected,    // Streamline refused the replacement; the game's tags were re-sent
     Paused,      // Streamline refused it 3 frames in a row: off until the setting changes
     Stale,       // supplied before, but not in the last 2 s (no frame has matched since)
+    ListType,    // tagged on a list that cannot take a shader-resource barrier (a copy list)
     Count
 };
 inline const char *Label(Reason r) {
@@ -100,15 +101,17 @@ inline const char *Label(Reason r) {
         return "off: Streamline refused it 3 frames in a row (turn it off and on to retry)";
     case Reason::Stale:
         return "waiting: no replacement supplied in the last 2 s";
+    case Reason::ListType:
+        return "unavailable: Frame Generation's depth is tagged on a copy command list";
     default:
         return "unknown";
     }
 }
 inline const char *Key(Reason r) {
-    static const char *keys[] = {"supplied", "disabled",     "no_fg_tags", "rr_off",
-                                 "no_frame", "not_recorded", "lifecycle",  "order",
-                                 "depth",    "submitted",    "format",     "projection",
-                                 "memory",   "rejected",     "paused",     "stale"};
+    static const char *keys[] = {
+        "supplied",  "disabled", "no_fg_tags", "rr_off",    "no_frame", "not_recorded",
+        "lifecycle", "order",    "depth",      "submitted", "format",   "projection",
+        "memory",    "rejected", "paused",     "stale",     "list_type"};
     static_assert(sizeof(keys) / sizeof(*keys) == unsigned(Reason::Count));
     return unsigned(r) < unsigned(Reason::Count) ? keys[unsigned(r)] : "unknown";
 }
@@ -140,13 +143,14 @@ inline unsigned FgDepthIndex(const uint32_t *types, unsigned count) {
 // reason names the first thing that is missing.
 struct Match {
     // same_list: tagged on this frame's SR list. other_list: on another known list.
-    // unsubmitted: the SR list has not been submitted yet. same_depth: the tag's depth is the
-    // texture SR read. game_copy: another texture with that texture's dimensions and format,
-    // the game's own copy for Frame Generation (every frame since 2026-10-30: one persistent
-    // texture, while SR's depth rotates among three). Its contents are not compared: it is
-    // taken to hold this frame's depth, as Frame Generation is told it does.
+    // unsubmitted: the SR list has not been submitted yet. list_ok: that other list is a
+    // direct or compute list (the replacement's barrier is recorded on it). same_depth: the tag's
+    // depth is the texture SR read. game_copy: another texture with that texture's dimensions and
+    // format, the game's own copy for Frame Generation (every frame since 2026-10-30: one
+    // persistent texture, while SR's depth rotates among three). Its contents are not compared: it
+    // is taken to hold this frame's depth, as Frame Generation is told it does.
     bool enabled{}, paused{}, lifecycle_now{}, rr_running{}, slot{}, prepared{}, same_list{},
-        other_list{}, unsubmitted{}, same_depth{}, game_copy{};
+        other_list{}, list_ok{}, unsubmitted{}, same_depth{}, game_copy{};
     Reason prepare{}; // why AfterSR did not prepare it (when !prepared)
 };
 inline constexpr Reason Decide(const Match &m) {
@@ -169,6 +173,8 @@ inline constexpr Reason Decide(const Match &m) {
             return Reason::Submitted;
     } else if (!m.other_list || m.unsubmitted)
         return Reason::Order;
+    else if (!m.list_ok)
+        return Reason::ListType;
     if (!m.same_depth && !m.game_copy)
         return Reason::Depth;
     return Reason::Supplied;
@@ -227,11 +233,13 @@ struct Status {
 };
 inline Status status;
 
-// The content check (Controller::FgProbe, observe-only): the 2026-10-30 sessions showed that
+// The content check (Controller::FgProbe; only with FgWeaponDepthObserve=1 and the replacement
+// on, since it allocates a readback on the render thread): the 2026-10-30 sessions showed that
 // the game tags Frame Generation with its own persistent depth texture (same size and format),
 // never one of SR's rotating depths, so a pointer cannot tell what it holds. One frame of both
 // depth planes is read back and compared here, world and weapon (SR depth above `slice`)
 // separately: a plain copy matches everywhere; a weapon-corrected copy differs in the weapon.
+// It was: bit-identical on all 6 frames checked, weapon included.
 struct Comparison {
     uint64_t world{}, world_equal{}, weapon{}, weapon_equal{}, fg_above_one{};
     float world_max_diff{}, weapon_sr_min{}, weapon_sr_max{}, weapon_fg_min{}, weapon_fg_max{};

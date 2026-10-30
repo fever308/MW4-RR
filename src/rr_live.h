@@ -161,8 +161,8 @@ class Controller {
         static constexpr int NoMatch = INT_MIN;
         bool operator==(const FgSignature &) const = default;
     } fg_logged{};
-    // The content check (rrfgdepth::Compare, observe-only): a readback of the game's Frame
-    // Generation depth plane (first half) and this frame's SR depth plane (second half, from
+    // The content check (rrfgdepth::Compare; FgWeaponDepthObserve=1 only): a readback of the game's
+    // Frame Generation depth plane (first half) and this frame's SR depth plane (second half, from
     // GpuFrame::depth_buffer), both copied on Frame Generation's list at its tag. armed: recorded,
     // waiting for the slot, which waits for that list, to retire; ready: its GPU work is done.
     struct FgProbe {
@@ -1064,6 +1064,7 @@ class Controller {
         D3D12_RESOURCE_DESC tagged{};
         if (depth)
             tagged = depth->GetDesc();
+        const auto type = list ? list->GetType() : D3D12_COMMAND_LIST_TYPE_COPY;
         FgProbeCollect(now);
         std::unique_lock lock(mutex);
         FgSettingChanged();
@@ -1088,7 +1089,12 @@ class Controller {
             same_list = list && s->sr_live && list.Get() == s->sr.Get();
             same_depth = depth && s->gpu.sr[1] && depth.Get() == s->gpu.sr[1].Get();
             m.same_list = same_list;
-            m.other_list = list && !same_list;
+            // A second tag for this frame on yet another list while the first is open would
+            // stop the slot tracking the first: the game's depth for that one.
+            m.other_list =
+                list && !same_list && !(s->fg_list_live && s->fg_list.Get() != list.Get());
+            m.list_ok =
+                type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
             m.unsubmitted = !s->sealed;
             m.same_depth = same_depth;
             if (depth && s->gpu.sr[1] && !same_depth) {
@@ -1123,11 +1129,14 @@ class Controller {
         // declares before Streamline's copy. The slot now waits for this list. With the game's
         // own copy, a few frames also get the content check (FgProbe): what that copy holds.
         FgProbeRecording probe;
-        const bool probing = m.game_copy && FgProbeArm(t, *s, tagged, now, probe);
+        const bool probing = m.game_copy && rrfgdepth::observe.load(std::memory_order_relaxed) &&
+                             FgProbeArm(t, *s, tagged, now, probe);
         s->fg_list = list;
         s->fg_list_live = true;
-        s->fg_probe = probing;
-        s->fg_probe_submitted = false;
+        if (probing) { // a second tag on the same list keeps the check it armed
+            s->fg_probe = true;
+            s->fg_probe_submitted = false;
+        }
         ComPtr<ID3D12Resource> texture = s->gpu.fg_depth;
         lock.unlock();
         // Recorded on the native list with RR's own hooks quiet, outside the lock: a barrier
