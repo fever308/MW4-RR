@@ -772,8 +772,12 @@ class Controller {
         }
         const auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
         if (!coverage_history.Matches(s.gpu.w, s.gpu.h) || !s.sss.marked ||
-            e.key_frame != s.frame || e.coverage_frame != s.frame || e.generation != s.generation)
+            e.key_frame != s.frame || e.coverage_frame != s.frame || e.generation != s.generation) {
+            // A record from before a camera cut never outlives the cut.
+            if (s.camera.reset != 0)
+                coverage_record = {};
             return;
+        }
         coverage_record = {true, s.frame, s.generation, s.gpu.w, s.gpu.h, CoverageCamera(s)};
     }
     static rrssscov::Camera CoverageCamera(const Slot &s) {
@@ -1478,6 +1482,8 @@ class Controller {
         reason = rrssscov::Check(coverage_record, match->frame, generation, match->gpu.w,
                                  match->gpu.h, match->viewport, camera.reset);
         coverage_reason = reason;
+        if (reason == rrssscov::FrameReason::Reset)
+            coverage_record = {}; // a cut: the record is from before it
         if (reason != rrssscov::FrameReason::Ready)
             return false;
         const auto &previous = coverage_history.entries[rrssscov::Entry(coverage_record.frame)];
