@@ -368,7 +368,7 @@ static void Shapes() {
         CHECK(EdgeShape(s, n, st, light));
         CHECK(!EdgeShape(Tex(w + 2, h, DXGI_FORMAT_R32G32B32A32_UINT), n, st, light));
         CHECK(!EdgeShape(s, Tex(w, h + 1, DXGI_FORMAT_R16G16B16A16_FLOAT), st, light));
-        CHECK(!EdgeShape(s, n, Tex(w / 2 + 1, h, DXGI_FORMAT_R32_UINT), light));
+        CHECK(!EdgeShape(s, n, Tex(w + 1, h, DXGI_FORMAT_R32_UINT), light));
         CHECK(!EdgeShape(Tex(w, h, DXGI_FORMAT_R32G32B32A32_FLOAT), n, st, light));
         CHECK(!EdgeShape(s, Tex(w, h, DXGI_FORMAT_R32G32B32A32_FLOAT), st, light));
         CHECK(!EdgeShape(s, n, Tex(w, h, DXGI_FORMAT_R16_FLOAT), light));
