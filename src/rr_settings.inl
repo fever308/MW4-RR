@@ -87,11 +87,20 @@ static bool Foreground() {
     GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
     return foreground == GetCurrentProcessId();
 }
-static void OnRuntime(reshade::api::effect_runtime *runtime) {
+// times, if given, receives the observer poll, settings lock wait and settings load durations.
+static void OnRuntime(reshade::api::effect_runtime *runtime, uint64_t *times = nullptr) {
+    const auto begin = rrtiming::Now();
     Observer().Poll();
+    const auto polled = rrtiming::Now();
     {
         std::lock_guard lock(settings_mutex);
+        const auto locked = rrtiming::Now();
         LoadSettings();
+        if (times) {
+            times[0] = polled - begin;
+            times[1] = locked - polled;
+            times[2] = rrtiming::Now() - locked;
+        }
         const bool foreground = Foreground();
         static bool down[3]{};
         const int keys[] = {VK_F8, VK_F9, VK_F11};
@@ -144,7 +153,46 @@ static void OnPresent(reshade::api::effect_runtime *runtime) {
     if (!focused)
         shown.unfocused_presents.fetch_add(1, std::memory_order_relaxed);
     shown.focused.store(focused, std::memory_order_relaxed);
+    static std::atomic<bool> first{};
+    rrtiming::Global().Milestone(first, "first present");
     OnRuntime(runtime);
+    rrtiming::Global().Summary();
+}
+// Entry and exit records for each runtime (re)creation, so that a long gap
+// in the log shows whether it was spent in this handler or before it.
+static void OnInitRuntime(reshade::api::effect_runtime *runtime) {
+    static std::atomic<unsigned> inits{};
+    const unsigned n = inits.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto &t = rrtiming::Global();
+    char line[240];
+    if (n <= 8) {
+        std::snprintf(line, sizeof(line), "RR startup: effect runtime init #%u entered at %.1f s",
+                      n, double(rrtiming::Now() - t.start) / 1e9);
+        t.Log(line);
+    }
+    uint64_t times[3]{};
+    const auto begin = rrtiming::Now();
+    OnRuntime(runtime, times);
+    if (n <= 8) {
+        std::snprintf(line, sizeof(line),
+                      "RR startup: effect runtime init #%u handler took %.1f ms (observer %.1f, "
+                      "settings wait %.1f, settings %.1f)",
+                      n, rrtiming::Ms(rrtiming::Now() - begin), rrtiming::Ms(times[0]),
+                      rrtiming::Ms(times[1]), rrtiming::Ms(times[2]));
+        t.Log(line);
+    }
+    t.Summary(true);
+}
+static void OnSwapchain(reshade::api::swapchain *, bool resize) {
+    static std::atomic<unsigned> inits{};
+    const unsigned n = inits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 8)
+        return;
+    auto &t = rrtiming::Global();
+    char line[160];
+    std::snprintf(line, sizeof(line), "RR startup: swapchain init #%u (%s) at %.1f s", n,
+                  resize ? "resize" : "create", double(rrtiming::Now() - t.start) / 1e9);
+    t.Log(line);
 }
 static void StatusRow(const char *name, rrstatus::State value) {
     ImGui::Text("%s: %s", name, rrstatus::Label(value));

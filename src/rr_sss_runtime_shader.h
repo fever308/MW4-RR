@@ -15,6 +15,8 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include "rr_shader_cache.h"
+#include "rr_startup_timing.h"
 #pragma comment(lib, "bcrypt.lib")
 
 namespace rrsss {
@@ -325,7 +327,10 @@ inline bool AssembleShader(ShaderTools &dxc, const std::string &text, std::vecto
     return true;
 }
 inline bool BuildRuntimeShader(const void *native, size_t size, HMODULE module,
-                               std::vector<unsigned char> &out, const char *&status) noexcept {
+                               std::vector<unsigned char> &out, const char *&status,
+                               rrtiming::Local *local = nullptr) noexcept {
+    using rrtiming::Scope;
+    using rrtiming::Stage;
     out.clear();
     status = "unsupported-subsurface-scattering-shader";
     const auto *known = KnownVariant(native, size);
@@ -339,21 +344,22 @@ inline bool BuildRuntimeShader(const void *native, size_t size, HMODULE module,
             return false;
         std::string text;
         status = "shader-disassembly-failed";
-        if (!dxc.Disassemble(native, size, text))
+        if (Scope s(Stage::Disassemble, local); !dxc.Disassemble(native, size, text))
             return false;
         // Captured builds must match too, so the structure check is proven on them.
         status = "unsupported-subsurface-scattering-structure";
-        if (!StructureMatches(text, InputStructure))
+        if (Scope s(Stage::Structure, local); !StructureMatches(text, InputStructure))
             return false;
         status = "shader-transformation-rejected";
-        if (!TransformRuntimeShader(text))
+        if (Scope s(Stage::Transform, local); !TransformRuntimeShader(text))
             return false;
         std::vector<unsigned char> code;
-        if (!AssembleShader(dxc, text, code, &status))
+        if (Scope s(Stage::Assemble, local); !AssembleShader(dxc, text, code, &status))
             return false;
         // Pins the complete validated output, including original instructions,
         // bindings and output signatures, to the tested transformation result:
         // byte for byte for a captured build, structurally for another build.
+        Scope check(Stage::OutputCheck, local);
         status = "shader-output-mismatch";
         if (known && (code.size() != known->output_bytes ||
                       !ShaderDigest(code.data(), code.size(), known->output_sha256)))
@@ -410,12 +416,115 @@ public:
         return false;
     }
 };
+// The scene constant buffer size a disassembly declares, from the same
+// resource line StructuralText normalizes.
+inline bool DeclaredSceneBytes(const std::string &text, size_t &bytes) {
+    static const std::regex resource(
+        R"(^!\d+ = !\{i32 0, %hostlayout\.scene\* undef, !"", i32 0, i32 3, i32 1, i32 (\d{1,6}), null\}\r?$)");
+    const std::string marker = "%hostlayout.scene* undef";
+    std::string found;
+    for (auto at = text.find(marker); at != std::string::npos; at = text.find(marker, at + 1)) {
+        const auto begin = text.rfind('\n', at), end = text.find('\n', at);
+        const auto line = text.substr(begin == std::string::npos ? 0 : begin + 1,
+                                      (end == std::string::npos ? text.size() : end) -
+                                          (begin == std::string::npos ? 0 : begin + 1));
+        if (line.empty() || line[0] != '!')
+            continue;
+        if (!found.empty())
+            return false;
+        found = line;
+    }
+    std::smatch m;
+    if (found.empty() || !std::regex_match(found, m, resource))
+        return false;
+    bytes = std::stoul(m[1].str());
+    return true;
+}
+// Changes whenever TransformRuntimeShader, AssembleShader or the acceptance
+// rules change, so that a cached guide is never reused across them. The
+// shipped fingerprints are part of the cache key too.
+inline constexpr unsigned TransformVersion = 1;
+inline std::string TransformIdentity() {
+    std::string id = "sss-guide/" + std::to_string(TransformVersion) + "/" + InputStructure +
+                     "/" + OutputStructure + "/" + std::to_string(SceneReadBytes);
+    for (const auto &v : Variants)
+        id += std::string("/") + v.sha256 + ">" + v.output_sha256;
+    return id;
+}
+// Accepts a cached guide for this input by the same rules a fresh preparation
+// ends with, without transforming or assembling again. A captured build's
+// guide must be its pinned output byte for byte. Another build must still
+// pass the input structure check, and its guide must pass DXC validation, the
+// output structure check and declare the input's own scene buffer size. The
+// cache file's own checksum authorizes nothing.
+inline bool AcceptCachedShader(const void *native, size_t size, HMODULE module,
+                               const std::vector<unsigned char> &code, const char *&status,
+                               rrtiming::Local *local = nullptr) noexcept {
+    using rrtiming::Scope;
+    using rrtiming::Stage;
+    status = "cached-shader-invalid";
+    if (code.empty() || code.size() > 4 * 1024 * 1024)
+        return false;
+    try {
+        if (const auto *known = KnownVariant(native, size)) {
+            status = "cached-shader-output-mismatch";
+            return code.size() == known->output_bytes &&
+                   ShaderDigest(code.data(), code.size(), known->output_sha256);
+        }
+        status = "unsupported-subsurface-scattering-shader";
+        if (!StructuralCandidate(native, size))
+            return false;
+        status = "shader-compiler-unavailable";
+        ShaderTools dxc;
+        if (!dxc.Create(module))
+            return false;
+        std::string input, generated;
+        size_t input_bytes = 0, output_bytes = 0;
+        status = "shader-disassembly-failed";
+        if (Scope s(Stage::Disassemble, local); !dxc.Disassemble(native, size, input))
+            return false;
+        status = "unsupported-subsurface-scattering-structure";
+        if (Scope s(Stage::Structure, local);
+            !StructureMatches(input, InputStructure) || !DeclaredSceneBytes(input, input_bytes))
+            return false;
+        Scope check(Stage::OutputCheck, local);
+        using Microsoft::WRL::ComPtr;
+        ComPtr<IDxcBlobEncoding> blob;
+        ComPtr<IDxcOperationResult> validated;
+        HRESULT result = E_FAIL;
+        status = "cached-shader-validation-failed";
+        if (FAILED(dxc.library->CreateBlobWithEncodingOnHeapCopy(code.data(), UINT32(code.size()),
+                                                                 0, &blob)) ||
+            FAILED(dxc.validator->Validate(blob.Get(), DxcValidatorFlags_Default, &validated)) ||
+            !validated || FAILED(validated->GetStatus(&result)) || FAILED(result))
+            return false;
+        status = "cached-shader-output-mismatch";
+        if (!dxc.Disassemble(code.data(), code.size(), generated) ||
+            !StructureMatches(generated, OutputStructure) ||
+            !DeclaredSceneBytes(generated, output_bytes) || output_bytes != input_bytes)
+            return false;
+        status = "ready";
+        return true;
+    } catch (...) {
+        status = "shader-preparation-exception";
+        return false;
+    }
+}
+// A cached guide refused for these reasons may still be good: it is kept.
+inline bool CachedRejectionTransient(const char *status) noexcept {
+    return !status || !std::strcmp(status, "shader-compiler-unavailable") ||
+           !std::strcmp(status, "shader-preparation-exception");
+}
 // One slot per distinct input (SHA-256 and size): an input never receives
 // another build's guide, and a failure stays with the input that caused it.
+// With a disk cache, a guide this PC prepared before is reused after it is
+// accepted again; each preparation has numbered start and end records.
 class RuntimeShaderCache {
     struct Slot {
         std::array<unsigned char, 32> digest{};
         size_t size{};
+        unsigned id{};
+        std::atomic<bool> announced{};
         std::mutex mutex;
         bool attempted{};
         const char *result = "not-prepared";
@@ -424,20 +533,55 @@ class RuntimeShaderCache {
     std::mutex mutex;
     std::vector<std::shared_ptr<Slot>> slots;
     RecognizedShaders *recognized{};
-public:
+    rrshadercache::DiskCache *disk{};
+    rrtiming::Timing *timing{};
+    std::mutex identity_mutex;
+    HMODULE identity_module{};
+    std::string identity;
+    // The compiler's identity, hashed once per module.
+    const std::string &CompilerIdentity(HMODULE module, rrtiming::Local *local) {
+        std::lock_guard lock(identity_mutex);
+        if (module && module != identity_module) {
+            rrtiming::Scope scope(rrtiming::Stage::CompilerIdentity, local, timing);
+            identity_module = module;
+            if (!rrshadercache::ModuleIdentity(module, identity))
+                identity.clear();
+        }
+        static const std::string none;
+        return module ? identity : none;
+    }
+    rrtiming::Timing &Timer() { return timing ? *timing : rrtiming::Global(); }
+
+  public:
     static constexpr size_t Capacity = 16;
-    explicit RuntimeShaderCache(RecognizedShaders *recognized = nullptr) : recognized(recognized) {}
+    // The disk cache identity of an input's guide.
+    void Identify(const std::array<unsigned char, 32> &digest, size_t size, HMODULE module,
+                  rrshadercache::Identity &id, rrtiming::Local *local = nullptr) {
+        id.role = "sss-guide";
+        id.transform = TransformIdentity();
+        id.compiler = CompilerIdentity(module, local);
+        id.input = digest;
+        id.input_size = size;
+    }
+    explicit RuntimeShaderCache(RecognizedShaders *recognized = nullptr,
+                                rrshadercache::DiskCache *disk = nullptr,
+                                rrtiming::Timing *timing = nullptr)
+        : recognized(recognized), disk(disk), timing(timing) {}
     std::shared_ptr<const std::vector<unsigned char>> Get(const void *native, size_t size,
                                                          HMODULE module, const char *&status,
-                                                         bool *attempted = nullptr) {
+                                                         bool *attempted = nullptr,
+                                                         const char **cache = nullptr) {
         if (attempted)
             *attempted = false;
+        if (cache)
+            *cache = "not-used";
         std::array<unsigned char, 32> digest{};
         if ((!KnownVariant(native, size) && !StructuralCandidate(native, size)) ||
             !Sha256(native, size, digest)) {
             status = "unsupported-subsurface-scattering-shader";
             return {};
         }
+        auto &t = Timer();
         std::shared_ptr<Slot> slot;
         {
             std::lock_guard lock(mutex);
@@ -452,23 +596,88 @@ public:
                 slot = std::make_shared<Slot>();
                 slot->digest = digest;
                 slot->size = size;
+                slot->id = unsigned(slots.size() + 1);
                 slots.push_back(slot);
             }
         }
-        std::lock_guard lock(slot->mutex);
-        if (!slot->attempted) {
-            slot->attempted = true;
-            if (attempted)
-                *attempted = true;
-            auto prepared = std::make_shared<std::vector<unsigned char>>();
-            if (BuildRuntimeShader(native, size, module, *prepared, slot->result)) {
-                slot->code = std::move(prepared);
-                if (recognized)
-                    recognized->Add(ShaderHash(native, size), size);
-            }
+        // Announced by the first request, before any wait, so that a
+        // preparation that never finishes still has its start record.
+        if (!slot->announced.exchange(true)) {
+            t.preparations_started.fetch_add(1, std::memory_order_relaxed);
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                          "RR shader preparation #%u started: input fnv=%016llx bytes=%zu %s", slot->id,
+                          (unsigned long long)ShaderHash(native, size), size,
+                          KnownVariant(native, size) ? "captured" : "structural-candidate");
+            t.Log(line);
         }
-        status = slot->result;
-        return slot->code;
+        std::string record;
+        std::shared_ptr<const std::vector<unsigned char>> code;
+        {
+            std::unique_lock lock(slot->mutex, std::try_to_lock);
+            if (!lock) {
+                rrtiming::Scope wait(rrtiming::Stage::SlotWait, nullptr, &t);
+                lock.lock();
+            }
+            if (!slot->attempted) {
+                slot->attempted = true;
+                if (attempted)
+                    *attempted = true;
+                rrtiming::Local local;
+                rrshadercache::Outcome outcome;
+                auto prepared = std::make_shared<std::vector<unsigned char>>();
+                bool ready;
+                {
+                    rrtiming::Scope total(rrtiming::Stage::Preparation, &local, &t);
+                    rrshadercache::Identity id;
+                    rrshadercache::Identity *keyed = nullptr;
+                    if (disk) {
+                        Identify(digest, size, module, id, &local);
+                        keyed = &id;
+                    }
+                    ready = rrshadercache::Prepare(
+                        disk, keyed, *prepared, slot->result, outcome,
+                        [&](std::vector<unsigned char> &out, const char *&why) {
+                            return BuildRuntimeShader(native, size, module, out, why, &local);
+                        },
+                        [&](const std::vector<unsigned char> &out, const char *&why) {
+                            return AcceptCachedShader(native, size, module, out, why, &local);
+                        },
+                        [](const char *why) { return CachedRejectionTransient(why); },
+                        &local, &t);
+                }
+                if (ready) {
+                    slot->code = std::move(prepared);
+                    if (recognized)
+                        recognized->Add(ShaderHash(native, size), size);
+                }
+                t.preparations_finished.fetch_add(1, std::memory_order_relaxed);
+                using rrtiming::Ms;
+                using rrtiming::Stage;
+                auto ms = [&](Stage s) { return Ms(local.ns[unsigned(s)]); };
+                char line[512];
+                std::snprintf(
+                    line, sizeof(line),
+                    "RR shader preparation #%u finished in %.1f ms: %s; cache %s%s%s, store %s; "
+                    "compiler-identity %.1f, cache-load %.1f, cache-validate %.1f, disassembly %.1f, "
+                    "structure %.1f, transform %.1f, assembly %.1f, output-check %.1f, "
+                    "cache-store %.1f ms",
+                    slot->id, ms(Stage::Preparation), slot->result, outcome.cache,
+                    outcome.invalid ? ":" : "", outcome.invalid ? outcome.invalid : "",
+                    outcome.store, ms(Stage::CompilerIdentity), ms(Stage::CacheLoad),
+                    ms(Stage::CacheValidate), ms(Stage::Disassemble), ms(Stage::Structure),
+                    ms(Stage::Transform), ms(Stage::Assemble), ms(Stage::OutputCheck),
+                    ms(Stage::CacheStore));
+                record = line;
+                if (cache)
+                    *cache = outcome.cache;
+            }
+            status = slot->result;
+            code = slot->code;
+        }
+        if (!record.empty())
+            t.Log(record.c_str());
+        return code;
     }
 };
 inline RecognizedShaders &Recognized() {
@@ -482,7 +691,8 @@ inline bool CompositeShader(uint64_t bound, uint64_t observed, size_t bytes) {
     return observed == bound && Recognized().Has(observed, bytes);
 }
 inline RuntimeShaderCache &RuntimeShader() {
-    static RuntimeShaderCache cache(&Recognized());
+    static rrshadercache::DiskCache disk(rrshadercache::DiskCache::DefaultDirectory());
+    static RuntimeShaderCache cache(&Recognized(), &disk);
     return cache;
 }
 } // namespace rrsss

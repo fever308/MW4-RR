@@ -186,6 +186,8 @@ UNINSTALL / ROLLBACK
 Close the campaign and COD HQ. Remove mw4-rr.addon64 and mw4-rr-dxcompiler.dll
 from the campaign folder. Restore your own backups if rolling back, including
 your game configuration if desired. Leave unrelated addon files intact.
+To also remove the locally prepared shader cache, delete the folder
+%LOCALAPPDATA%\MW4-RR\ShaderCache (paste it into the Explorer address bar).
 
 SUPPORT DEVELOPMENT
 

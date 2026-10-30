@@ -12,7 +12,14 @@ variant, and the full path to the pinned DXC DLL, in that order, to
 `build/tests/runtime-shader.exe`. This verifies both pinned guides, that each
 adds only the guide output to its own instructions, mixed concurrent cache
 reuse, per-input failure isolation, structural acceptance of an equivalent
-in-memory rebuild, and refusal of altered inputs. `--fingerprint <shader> <dll>`
+in-memory rebuild, and refusal of altered inputs. With the same files, it also checks the local shader cache: a cold
+preparation is stored, a new cache instance reuses it without transforming,
+and intact entries holding another build's guide, the native input or a guide
+for another scene buffer size are refused and replaced. `--cache <supported>
+<variant> <dll>` runs only those cache checks and needs no expected guide.
+`shader-cache` tests the cache and the startup timing synthetically, with fake
+preparation and acceptance and temporary directories; it uses no game shader.
+`--fingerprint <shader> <dll>`
 prints the fingerprints used to pin a newly captured variant. These private
 fixture files are not distributed.
 

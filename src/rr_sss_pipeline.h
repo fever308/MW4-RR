@@ -48,8 +48,10 @@ struct PipelinePatch {
             if (!s.code || !s.code_size || s.code_size > 4 * 1024 * 1024)
                 continue;
             // The container check is cheap and skips unrelated shaders.
+            rrtiming::Global().pixel_shaders.fetch_add(1, std::memory_order_relaxed);
             if (!StructuralCandidate(s.code, s.code_size))
                 continue;
+            rrtiming::Global().candidates.fetch_add(1, std::memory_order_relaxed);
             if (Recognized().Has(Hash(s.code, s.code_size), s.code_size))
                 return true;
             // Another build is prepared here, once per input, so that its
@@ -391,9 +393,13 @@ class PipelineRegistry {
                 const auto expected = description.Expected(observed, helper);
                 PipelineProof::QualityScope quality(native_device.Get(), expected);
                 reshade::api::pipeline made{};
-                if (!device->create_pipeline(layout, description.count, description.objects.data(),
-                                             &made) ||
-                    !made.handle)
+                bool created;
+                {
+                    rrtiming::Scope scope(rrtiming::Stage::AlternateCreate);
+                    created = device->create_pipeline(layout, description.count,
+                                                      description.objects.data(), &made);
+                }
+                if (!created || !made.handle)
                     return false;
                 out = fg::NativeObject<ID3D12PipelineState>(
                     reinterpret_cast<ID3D12PipelineState *>(made.handle));

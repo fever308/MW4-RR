@@ -535,8 +535,12 @@ class CoveragePipelineRegistry {
         {
             PipelineProof::QualityScope quality(native_device.Get(), expected);
             reshade::api::pipeline made{};
-            if (!device->create_pipeline(layout, patch.count, patch.objects.data(), &made) ||
-                !made.handle)
+            bool created;
+            {
+                rrtiming::Scope scope(rrtiming::Stage::AlternateCreate);
+                created = device->create_pipeline(layout, patch.count, patch.objects.data(), &made);
+            }
+            if (!created || !made.handle)
                 return "variant-creation-failed";
             out.variant = fg::NativeObject<ID3D12PipelineState>(
                 reinterpret_cast<ID3D12PipelineState *>(made.handle));
