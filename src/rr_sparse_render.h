@@ -93,10 +93,12 @@ static rredgefill::State EdgeFillState() {
 }
 // The edge fill's surface: the PackedSurface this native spatial dispatch itself binds at
 // t13 (its same-surface input) must be this frame's prepass surface in the slot, in a
-// tracked, unaliased, readable state on this list; plus that slot's converted guides.
+// tracked readable state on this list; plus that slot's converted guides. Like the
+// dispatch's own t0/t1 (SparsePair), a null-sided aliasing barrier on the list does not
+// disqualify it: the game reads it here. An aliasing barrier naming it does.
 static const char *SparseEdgeInputs(reshade::api::command_list *list,
                                     ID3D12GraphicsCommandList *native, uint64_t effective,
-                                    rrsparsecopy::EdgeInputs &out) {
+                                    rrsparsecopy::EdgeInputs &out, char (&detail)[96]) {
     auto *state = rrbindings::State(list->get_device());
     if (!state || !state->tracker.Healthy())
         return "binding tracker unavailable";
@@ -120,9 +122,16 @@ static const char *SparseEdgeInputs(reshade::api::command_list *list,
     auto bound = fg::NativeObject<ID3D12Resource>((ID3D12Resource *)v.resource);
     if (!bound || bound.Get() != out.surface.Get())
         return "native t13 is not this frame's prepass surface";
-    if (!SparseLayouts().GetUnaliased(native, bound.Get(), out.surface_state) ||
-        !rrsparsecopy::Readable(out.surface_state))
-        return "prepass surface state unproven";
+    rrsparsecopy::Layouts::Alias alias{};
+    if (!SparseLayouts().Get(native, bound.Get(), out.surface_state, alias))
+        return "prepass surface state not tracked on this list";
+    if (alias == rrsparsecopy::Layouts::Alias::Named)
+        return "prepass surface named by an aliasing barrier";
+    if (!rrsparsecopy::Readable(out.surface_state)) {
+        snprintf(detail, sizeof(detail), "prepass surface state 0x%x is not read-only",
+                 unsigned(out.surface_state));
+        return detail;
+    }
     return nullptr;
 }
 static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
@@ -205,8 +214,9 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
     // proven inputs that path keeps the baseline group mean.
     const bool edge_wanted = mask && privateValid && rredgefill::enabled.load();
     rrsparsecopy::EdgeInputs edge;
-    const char *edge_why = edge_wanted ? SparseEdgeInputs(list, native.Get(), effective, edge)
-                                       : nullptr;
+    char edge_detail[96]{};
+    const char *edge_why =
+        edge_wanted ? SparseEdgeInputs(list, native.Get(), effective, edge, edge_detail) : nullptr;
     bool masked = false, edged = false;
     bool replaced = mask && privateValid &&
                     SparsePool().Apply(native.Get(), input, output, scale.Get(),
