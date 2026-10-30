@@ -57,6 +57,11 @@ class Controller {
         // this frame (fg_prepared), or why not.
         bool fg_prepared{};
         rrfgdepth::Reason fg_prepare{rrfgdepth::Reason::NotRecorded};
+        // The list Frame Generation's depth was tagged on, when not the SR list: its copy reads
+        // gpu.fg_depth, so the slot waits for it (fg_list_live until submitted or reset, then
+        // the slot's fence covers that submission).
+        ComPtr<ID3D12GraphicsCommandList> fg_list;
+        bool fg_list_live{};
         std::array<Observed, 4> states{};
         rreval::Options options;
     };
@@ -146,7 +151,7 @@ class Controller {
     struct FgSignature {
         UINT lifecycle{}, state{}, extent_w{}, extent_h{}, width{}, height{}, format{}, inverted{},
             motion{}, jittered{}, offset_x{}, offset_y{}, render_w{}, render_h{};
-        bool same_list{}, same_depth{}, slot{};
+        bool same_list{}, same_depth{}, slot{}, submitted{};
         bool operator==(const FgSignature &) const = default;
     } fg_logged{};
     // Water responsivity mask (rr_water.h).
@@ -544,6 +549,9 @@ class Controller {
         if (foreign_call)
             return false;
         for (const auto &s : slots)
+            if (s.fg_list_live) // Frame Generation's copy of a slot texture is not submitted yet
+                return false;
+        for (const auto &s : slots)
             if (!rrpreset::CanRetire(
                     s.poisoned, s.pre_live, s.sr_live, s.sss.live,
                     s.transparency.Live() || s.coverage.Live(), s.pending_sr,
@@ -664,6 +672,7 @@ class Controller {
                 }
             }
             if (s.busy && !s.pre_live && !s.sr_live && !s.sss.live && !s.transparency.Live() &&
+                !s.fg_list_live &&
                 !s.pending_sr && Complete(s, done)) {
                 auto cache = std::move(s.gpu);
                 cache.Retire();
@@ -815,6 +824,7 @@ class Controller {
         v.same_list = same_list;
         v.same_depth = same_depth;
         v.slot = s != nullptr;
+        v.submitted = s && s->sealed;
         if (s && same_depth) {
             const auto d = s->gpu.sr[1]->GetDesc();
             v.width = UINT(d.Width);
@@ -836,11 +846,11 @@ class Controller {
             char line[512];
             snprintf(line, sizeof(line),
                      "FG depth tag: frame=%u view=%u lifecycle=%u extent=%ux%u state=0x%x "
-                     "rrFrame=%u sameList=%u sameDepth=%u depth=%ux%u format=%u "
+                     "rrFrame=%u sameList=%u srSubmitted=%u sameDepth=%u depth=%ux%u format=%u "
                      "srSubrect=%u,%u+%ux%u camera{depthInverted=%u cameraMotionIncluded=%u "
                      "mvJittered=%u near=%g far=%g} -> %s",
                      t.frame, t.viewport, t.lifecycle, t.extent_width, t.extent_height, t.state,
-                     unsigned(v.slot), unsigned(same_list), unsigned(same_depth), v.width, v.height,
+                     unsigned(v.slot), unsigned(same_list), unsigned(v.submitted), unsigned(same_depth), v.width, v.height,
                      v.format, v.offset_x, v.offset_y, v.render_w, v.render_h, v.inverted, v.motion,
                      v.jittered, s ? s->camera.near_plane : 0.f, s ? s->camera.far_plane : 0.f,
                      rrfgdepth::Key(why));
@@ -889,7 +899,7 @@ class Controller {
         auto list =
             fg::NativeObject<ID3D12GraphicsCommandList>(reinterpret_cast<IUnknown *>(t.command));
         auto depth = fg::NativeObject<ID3D12Resource>(reinterpret_cast<IUnknown *>(t.native));
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex);
         FgSettingChanged();
         m.paused = fg_paused;
         m.lifecycle_now = t.lifecycle == rrfgdepth::OnlyValidNow;
@@ -912,6 +922,7 @@ class Controller {
             same_list = list && s->sr_live && list.Get() == s->sr.Get();
             same_depth = depth && s->gpu.sr[1] && depth.Get() == s->gpu.sr[1].Get();
             m.same_list = same_list;
+            m.other_list = list && !same_list;
             m.unsubmitted = !s->sealed;
             m.same_depth = same_depth;
         }
@@ -932,6 +943,21 @@ class Controller {
         out.mipLevels = 1;
         out.arrayLayers = 1;
         out.gpuVirtualAddress = 0;
+        if (same_list)
+            return true;
+        // Another list: the SR list ended with the texture a shader resource and has been
+        // submitted, so it is back in COMMON (simultaneous-access); make it the state the tag
+        // declares before Streamline's copy. The slot now waits for this list.
+        s->fg_list = list;
+        s->fg_list_live = true;
+        ComPtr<ID3D12Resource> texture = s->gpu.fg_depth;
+        lock.unlock();
+        // A barrier only, recorded on the native list with RR's own hooks quiet, outside the
+        // lock: no binding the game set is changed.
+        rrinternal::Scope copy_guard;
+        rrcompute::Tracker::Internal state_guard;
+        Change(list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         return true;
     }
     // Streamline's result for a replacement FgTag supplied. A refusal already re-sent the
@@ -2074,6 +2100,8 @@ class Controller {
                 s.sr_live = false;
                 s.pending_sr = false;
             }
+            if (s.fg_list.Get() == cl)
+                s.fg_list_live = false;
             if (!s.recorded && (s.pre.Get() == cl || s.sr.Get() == cl))
                 policy.Reject();
         }
@@ -2088,7 +2116,7 @@ class Controller {
         submissions.back().locked = true;
         submissions.back().touched.resize(slots.size());
         std::vector<int> pre(slots.size(), -1), producer(pre), consumer(pre), glass_pre(pre),
-            glass_anchor(pre), cover(pre);
+            glass_anchor(pre), cover(pre), fg_copy(pre);
         bool any = false;
         auto index = [&](ID3D12CommandList *c) { return rrsss::RecordingIndex(n, lists, c); };
         for (unsigned k = 0; k < slots.size(); ++k) {
@@ -2099,9 +2127,11 @@ class Controller {
             glass_pre[k] = s.transparency.prep_live ? index(s.transparency.preparation.Get()) : -1;
             glass_anchor[k] = s.transparency.anchor_live ? index(s.transparency.anchor.Get()) : -1;
             cover[k] = s.coverage.Live() ? index(s.coverage.capture.Get()) : -1;
+            fg_copy[k] = s.fg_list_live ? index(s.fg_list.Get()) : -1;
             if (rrsss::Present(pre[k]) || rrsss::Present(producer[k]) ||
                 rrsss::Present(consumer[k]) || rrsss::Present(glass_pre[k]) ||
-                rrsss::Present(glass_anchor[k]) || rrsss::Present(cover[k])) {
+                rrsss::Present(glass_anchor[k]) || rrsss::Present(cover[k]) ||
+                rrsss::Present(fg_copy[k])) {
                 submissions.back().touched[k] = true;
                 any = true;
             }
@@ -2193,6 +2223,8 @@ class Controller {
                 s.transparency.anchor_submitted = true;
             if (rrsss::Present(cover[k]))
                 s.coverage.submitted = true;
+            if (rrsss::Present(fg_copy[k]))
+                s.fg_list_live = false; // the fence signaled after this call covers it
         }
     }
     void After(ID3D12CommandQueue *q) {

@@ -25,9 +25,13 @@ namespace rrfgdepth {
 // is ever changed; every other call, and the slSetTag legacy entry (no frame), pass unchanged.
 //
 // With eOnlyValidNow Streamline copies the tagged resource on the tagging command list when it
-// is tagged. The replacement is written on that same list by RR's AfterSR (step 2), before
-// the tag, into a texture owned by that frame's RR slot, which is retained until the list's
-// GPU work completes (the slot's fence). The game's depth is only read.
+// is tagged. The replacement is written on the SR list by RR's AfterSR (step 2), into a texture
+// owned by that frame's RR slot. The game's depth is only read. Step 3 is either on the SR
+// list itself (the replacement is written earlier on the same list), or, as the first session
+// with this build showed (2026-10-30, every frame), on another list: then only once the SR list
+// has been submitted, so the GPU runs RR's write before Streamline's copy (same queue in order;
+// another queue waits on RR's fence, Controller::Before). The slot then also tracks the
+// tagging list and is not reused until that list has been submitted and its GPU work is done.
 
 // The setting as applied (rr_settings.inl ApplyEnabled). Read once per frame by AfterSR,
 // so a change applies from the next frame RR records; the frame's tag follows that frame.
@@ -49,7 +53,7 @@ enum class Reason : unsigned {
     NoFrame,     // RR recorded no SR for this tag's frame and viewport
     NotRecorded, // RR's SR recording for this frame did not write the replacement
     Lifecycle,   // the depth tag is not eOnlyValidNow: Streamline would read it later
-    List,        // the tag is on another command list than this frame's SR
+    Order,       // tagged on another list while this frame's SR list was not yet submitted
     Depth,       // the tagged depth is not the depth this frame's SR used
     Submitted,   // the frame's SR list was already submitted
     Format,      // the depth is neither D32_FLOAT_S8X24_UINT nor R32_FLOAT
@@ -76,8 +80,8 @@ inline const char *Label(Reason r) {
         return "unavailable: not prepared for this frame";
     case Reason::Lifecycle:
         return "unavailable: the game tags depth for Frame Generation in an unexpected way";
-    case Reason::List:
-        return "unavailable: Frame Generation depth is tagged on another command list";
+    case Reason::Order:
+        return "unavailable: Frame Generation's depth was tagged before RR's frame was submitted";
     case Reason::Depth:
         return "unavailable: Frame Generation is given another depth than RR";
     case Reason::Submitted:
@@ -100,7 +104,7 @@ inline const char *Label(Reason r) {
 }
 inline const char *Key(Reason r) {
     static const char *keys[] = {"supplied", "disabled",     "no_fg_tags", "rr_off",
-                                 "no_frame", "not_recorded", "lifecycle",  "list",
+                                 "no_frame", "not_recorded", "lifecycle",  "order",
                                  "depth",    "submitted",    "format",     "projection",
                                  "memory",   "rejected",     "paused",     "stale"};
     static_assert(sizeof(keys) / sizeof(*keys) == unsigned(Reason::Count));
@@ -133,8 +137,10 @@ inline unsigned FgDepthIndex(const uint32_t *types, unsigned count) {
 // What a tag call finds for its frame (Controller::FgTag). Checked in this order, so a
 // reason names the first thing that is missing.
 struct Match {
+    // same_list: tagged on this frame's SR list. other_list: on another known list.
+    // unsubmitted: the SR list has not been submitted yet.
     bool enabled{}, paused{}, lifecycle_now{}, rr_running{}, slot{}, prepared{}, same_list{},
-        unsubmitted{}, same_depth{};
+        other_list{}, unsubmitted{}, same_depth{};
     Reason prepare{}; // why AfterSR did not prepare it (when !prepared)
 };
 inline constexpr Reason Decide(const Match &m) {
@@ -150,10 +156,13 @@ inline constexpr Reason Decide(const Match &m) {
         return Reason::NoFrame;
     if (!m.prepared)
         return m.prepare == Reason::Supplied ? Reason::NotRecorded : m.prepare;
-    if (!m.same_list)
-        return Reason::List;
-    if (!m.unsubmitted)
-        return Reason::Submitted;
+    // On the SR list: before it is submitted (the write precedes the tag on that list). On
+    // another list: only after the SR list is submitted, so the write runs first on the GPU.
+    if (m.same_list) {
+        if (!m.unsubmitted)
+            return Reason::Submitted;
+    } else if (!m.other_list || m.unsubmitted)
+        return Reason::Order;
     if (!m.same_depth)
         return Reason::Depth;
     return Reason::Supplied;

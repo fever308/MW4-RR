@@ -59,9 +59,19 @@ static void Decisions() {
     assert(Decide(m) == Reason::Memory);
     m.prepare = Reason::Supplied;
     assert(Decide(m) == Reason::NotRecorded);
+    // Another list (the game's case, 2026-10-30): only once the SR list was submitted.
     m = Ready();
     m.same_list = false;
-    assert(Decide(m) == Reason::List);
+    m.other_list = true;
+    assert(Decide(m) == Reason::Order);
+    m.unsubmitted = false;
+    assert(Decide(m) == Reason::Supplied);
+    m.same_depth = false;
+    assert(Decide(m) == Reason::Depth);
+    m = Ready();
+    m.same_list = false; // no list at all
+    m.unsubmitted = false;
+    assert(Decide(m) == Reason::Order);
     m = Ready();
     m.unsubmitted = false;
     assert(Decide(m) == Reason::Submitted);
