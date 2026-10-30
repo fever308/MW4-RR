@@ -739,8 +739,8 @@ class Controller {
             const UINT64 before = g.bytes;
             try {
                 // Announced like RR's depth copy: DLSS5 NR registers resources it may see.
-                g.fg_depth = g.Allocate(pipelines, budget, d, D3D12_HEAP_TYPE_DEFAULT, nullptr,
-                                        true);
+                g.fg_depth =
+                    g.Allocate(pipelines, budget, d, D3D12_HEAP_TYPE_DEFAULT, nullptr, true);
                 g.fg_bytes = g.bytes - before;
                 g.fg_growth = budget.limit - old;
                 test_reserve += g.fg_growth;
