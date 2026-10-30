@@ -301,8 +301,7 @@ inline bool ReadFgTag(const sl::ResourceTag *tags, uint32_t count, FgTag &v) {
         return false;
     __try {
         for (uint32_t i = 0; i < count; ++i) {
-            if (tags[i].structType != sl::ResourceTag::s_structType ||
-                tags[i].structVersion != 1)
+            if (tags[i].structType != sl::ResourceTag::s_structType || tags[i].structVersion != 1)
                 return false;
             types[i] = tags[i].type;
         }

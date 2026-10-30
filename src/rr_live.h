@@ -144,8 +144,8 @@ class Controller {
     unsigned fg_refusals{}, fg_diagnostics{};
     UINT64 fg_memory_retry_at{}, fg_summary_at{};
     struct FgSignature {
-        UINT lifecycle{}, state{}, extent_w{}, extent_h{}, width{}, height{}, format{},
-            inverted{}, motion{}, jittered{}, offset_x{}, offset_y{}, render_w{}, render_h{};
+        UINT lifecycle{}, state{}, extent_w{}, extent_h{}, width{}, height{}, format{}, inverted{},
+            motion{}, jittered{}, offset_x{}, offset_y{}, render_w{}, render_h{};
         bool same_list{}, same_depth{}, slot{};
         rrfgdepth::Reason reason{};
         bool operator==(const FgSignature &) const = default;
@@ -770,10 +770,9 @@ class Controller {
         const UINT64 now = GetTickCount64();
         try {
             const auto native = s.gpu.sr[1]->GetDesc();
-            const bool format_ok =
-                native.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                    ? s.gpu.use_depth && s.gpu.depth
-                    : native.Format == DXGI_FORMAT_R32_FLOAT && !s.gpu.use_depth;
+            const bool format_ok = native.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                       ? s.gpu.use_depth && s.gpu.depth
+                                       : native.Format == DXGI_FORMAT_R32_FLOAT && !s.gpu.use_depth;
             rrweapondepth::Mapping map;
             const bool mapped = rrweapondepth::Map(s.projection, map);
             auto why = rrfgdepth::Prepare(on, fg_paused, rrfgdepth::status.FgSeen(now), format_ok,
@@ -826,10 +825,10 @@ class Controller {
                      "srSubrect=%u,%u+%ux%u camera{depthInverted=%u cameraMotionIncluded=%u "
                      "mvJittered=%u near=%g far=%g} -> %s",
                      t.frame, t.viewport, t.lifecycle, t.extent_width, t.extent_height, t.state,
-                     unsigned(v.slot), unsigned(same_list), unsigned(same_depth), v.width,
-                     v.height, v.format, v.offset_x, v.offset_y, v.render_w, v.render_h,
-                     v.inverted, v.motion, v.jittered, s ? s->camera.near_plane : 0.f,
-                     s ? s->camera.far_plane : 0.f, rrfgdepth::Key(why));
+                     unsigned(v.slot), unsigned(same_list), unsigned(same_depth), v.width, v.height,
+                     v.format, v.offset_x, v.offset_y, v.render_w, v.render_h, v.inverted, v.motion,
+                     v.jittered, s ? s->camera.near_plane : 0.f, s ? s->camera.far_plane : 0.f,
+                     rrfgdepth::Key(why));
             Log(line);
         }
         if (!fg_summary_at)
@@ -840,8 +839,7 @@ class Controller {
             rrfgdepth::status.Drain(counts, sizeof(counts));
             if (counts[0]) {
                 char line[448];
-                snprintf(line, sizeof(line), "Weapon depth for Frame Generation (10s): %s",
-                         counts);
+                snprintf(line, sizeof(line), "Weapon depth for Frame Generation (10s): %s", counts);
                 Log(line);
             }
         }
@@ -874,8 +872,8 @@ class Controller {
             status.Note(rrfgdepth::Reason::Disabled);
             return false;
         }
-        auto list = fg::NativeObject<ID3D12GraphicsCommandList>(
-            reinterpret_cast<IUnknown *>(t.command));
+        auto list =
+            fg::NativeObject<ID3D12GraphicsCommandList>(reinterpret_cast<IUnknown *>(t.command));
         auto depth = fg::NativeObject<ID3D12Resource>(reinterpret_cast<IUnknown *>(t.native));
         std::lock_guard lock(mutex);
         m.paused = fg_paused;

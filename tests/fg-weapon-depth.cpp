@@ -11,10 +11,10 @@ using rrfgdepth::Reason;
 static void Classification() {
     using rrfgdepth::FgDepthIndex;
     // The game's calls for one frame (mw4-rr-trace.log, 2026-10-17).
-    const uint32_t sr_inputs[] = {3, 1, 4};  // color-in, motion, color-out
-    const uint32_t sr_depth[] = {0};         // SR's depth, alone
-    const uint32_t fg_inputs[] = {2, 0, 1};  // HUD-less, depth, motion
-    const uint32_t present[] = {53, 23};     // back buffer, UI
+    const uint32_t sr_inputs[] = {3, 1, 4}; // color-in, motion, color-out
+    const uint32_t sr_depth[] = {0};        // SR's depth, alone
+    const uint32_t fg_inputs[] = {2, 0, 1}; // HUD-less, depth, motion
+    const uint32_t present[] = {53, 23};    // back buffer, UI
     assert(FgDepthIndex(sr_inputs, 3) == 3);
     assert(FgDepthIndex(sr_depth, 1) == 1);
     assert(FgDepthIndex(fg_inputs, 3) == 1);
@@ -30,8 +30,8 @@ static void Classification() {
 
 static rrfgdepth::Match Ready() {
     rrfgdepth::Match m;
-    m.enabled = m.lifecycle_now = m.rr_running = m.slot = m.prepared = m.same_list =
-        m.unsubmitted = m.same_depth = true;
+    m.enabled = m.lifecycle_now = m.rr_running = m.slot = m.prepared = m.same_list = m.unsubmitted =
+        m.same_depth = true;
     return m;
 }
 static void Decisions() {

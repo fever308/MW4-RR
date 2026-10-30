@@ -39,21 +39,21 @@ inline std::atomic<bool> observe{};
 
 // Why a frame's Frame Generation depth is the game's own (Reason::Supplied: the replacement).
 enum class Reason : unsigned {
-    Supplied,       // the replacement was tagged and Streamline returned success
-    Disabled,       // the setting is off
-    NoFgTags,       // no Frame Generation depth tag in the last 2 s (Frame Generation off?)
-    RrOff,          // RR is off, failed or restarting: it tracks the frame and owns the texture
-    NoFrame,        // RR recorded no SR for this tag's frame and viewport
-    NotRecorded,    // RR's SR recording for this frame did not write the replacement
-    Lifecycle,      // the depth tag is not eOnlyValidNow: Streamline would read it later
-    List,           // the tag is on another command list than this frame's SR
-    Depth,          // the tagged depth is not the depth this frame's SR used
-    Submitted,      // the frame's SR list was already submitted
-    Format,         // the depth is neither D32_FLOAT_S8X24_UINT nor R32_FLOAT
-    Projection,     // the frame's projection is not the game's reverse-Z (rrweapondepth::Map)
-    Memory,         // no GPU memory for the texture; retried after a second
-    Rejected,       // Streamline refused the replacement; the game's tags were re-sent
-    Paused,         // Streamline refused it 3 frames in a row: off until the setting changes
+    Supplied,    // the replacement was tagged and Streamline returned success
+    Disabled,    // the setting is off
+    NoFgTags,    // no Frame Generation depth tag in the last 2 s (Frame Generation off?)
+    RrOff,       // RR is off, failed or restarting: it tracks the frame and owns the texture
+    NoFrame,     // RR recorded no SR for this tag's frame and viewport
+    NotRecorded, // RR's SR recording for this frame did not write the replacement
+    Lifecycle,   // the depth tag is not eOnlyValidNow: Streamline would read it later
+    List,        // the tag is on another command list than this frame's SR
+    Depth,       // the tagged depth is not the depth this frame's SR used
+    Submitted,   // the frame's SR list was already submitted
+    Format,      // the depth is neither D32_FLOAT_S8X24_UINT nor R32_FLOAT
+    Projection,  // the frame's projection is not the game's reverse-Z (rrweapondepth::Map)
+    Memory,      // no GPU memory for the texture; retried after a second
+    Rejected,    // Streamline refused the replacement; the game's tags were re-sent
+    Paused,      // Streamline refused it 3 frames in a row: off until the setting changes
     Count
 };
 inline const char *Label(Reason r) {
@@ -93,10 +93,10 @@ inline const char *Label(Reason r) {
     }
 }
 inline const char *Key(Reason r) {
-    static const char *keys[] = {"supplied", "disabled", "no_fg_tags", "rr_off", "no_frame",
-                                 "not_recorded", "lifecycle", "list", "depth", "submitted",
-                                 "format", "projection", "memory", "rejected",
-                                 "paused"};
+    static const char *keys[] = {"supplied", "disabled",     "no_fg_tags", "rr_off",
+                                 "no_frame", "not_recorded", "lifecycle",  "list",
+                                 "depth",    "submitted",    "format",     "projection",
+                                 "memory",   "rejected",     "paused"};
     static_assert(sizeof(keys) / sizeof(*keys) == unsigned(Reason::Count));
     return unsigned(r) < unsigned(Reason::Count) ? keys[unsigned(r)] : "unknown";
 }
@@ -156,13 +156,13 @@ inline constexpr Reason Decide(const Match &m) {
 // depth tag within the last 2 s. Supplied means prepare it.
 inline constexpr Reason Prepare(bool enabled, bool paused, bool fg_seen, bool format_ok,
                                 bool mapped, bool memory_wait) {
-    return !enabled       ? Reason::Disabled
-           : paused       ? Reason::Paused
-           : !fg_seen     ? Reason::NoFgTags
-           : !format_ok   ? Reason::Format
-           : !mapped      ? Reason::Projection
-           : memory_wait  ? Reason::Memory
-                          : Reason::Supplied;
+    return !enabled      ? Reason::Disabled
+           : paused      ? Reason::Paused
+           : !fg_seen    ? Reason::NoFgTags
+           : !format_ok  ? Reason::Format
+           : !mapped     ? Reason::Projection
+           : memory_wait ? Reason::Memory
+                         : Reason::Supplied;
 }
 // Streamline refusals in a row before the replacement pauses until the setting changes.
 inline constexpr unsigned RefusalLimit = 3;
@@ -192,8 +192,8 @@ struct Status {
             const unsigned n = counts[i].exchange(0, std::memory_order_relaxed);
             if (!n || used >= size)
                 continue;
-            const int w = snprintf(out + used, size - used, "%s%s=%u", used ? " " : "",
-                                   Key(Reason(i)), n);
+            const int w =
+                snprintf(out + used, size - used, "%s%s=%u", used ? " " : "", Key(Reason(i)), n);
             if (w < 0)
                 break;
             used += size_t(w) < size - used ? size_t(w) : size - used - 1;
