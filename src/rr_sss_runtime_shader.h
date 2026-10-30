@@ -428,7 +428,10 @@ public:
     static constexpr size_t Capacity = 16;
     explicit RuntimeShaderCache(RecognizedShaders *recognized = nullptr) : recognized(recognized) {}
     std::shared_ptr<const std::vector<unsigned char>> Get(const void *native, size_t size,
-                                                         HMODULE module, const char *&status) {
+                                                         HMODULE module, const char *&status,
+                                                         bool *attempted = nullptr) {
+        if (attempted)
+            *attempted = false;
         std::array<unsigned char, 32> digest{};
         if ((!KnownVariant(native, size) && !StructuralCandidate(native, size)) ||
             !Sha256(native, size, digest)) {
@@ -455,6 +458,8 @@ public:
         std::lock_guard lock(slot->mutex);
         if (!slot->attempted) {
             slot->attempted = true;
+            if (attempted)
+                *attempted = true;
             auto prepared = std::make_shared<std::vector<unsigned char>>();
             if (BuildRuntimeShader(native, size, module, *prepared, slot->result)) {
                 slot->code = std::move(prepared);

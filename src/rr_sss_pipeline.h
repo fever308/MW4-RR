@@ -47,16 +47,20 @@ struct PipelinePatch {
             const auto &s = *static_cast<const reshade::api::shader_desc *>(o.data);
             if (!s.code || !s.code_size || s.code_size > 4 * 1024 * 1024)
                 continue;
+            // The container check is cheap and skips unrelated shaders.
+            if (!StructuralCandidate(s.code, s.code_size))
+                continue;
             if (Recognized().Has(Hash(s.code, s.code_size), s.code_size))
                 return true;
             // Another build is prepared here, once per input, so that its
-            // identity is known before any of its draws.
-            if (StructuralCandidate(s.code, s.code_size)) {
-                const char *status = nullptr;
-                if (RuntimeShader().Get(s.code, s.code_size, ReplayCompiler(), status))
-                    return true;
+            // identity is known before any of its draws. Its refusal is
+            // reported once, not for every pipeline that uses it.
+            const char *status = nullptr;
+            bool attempted = false;
+            if (RuntimeShader().Get(s.code, s.code_size, ReplayCompiler(), status, &attempted))
+                return true;
+            if (attempted)
                 rejected = status;
-            }
         }
         return false;
     }

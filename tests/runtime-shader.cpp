@@ -215,9 +215,12 @@ int wmain(int argc, wchar_t **argv) {
         CHECK(got[i] && *got[i] == (i % 2 ? b : a));
         CHECK(got[i] == got[i % 2]);
     }
-    // A failure stays with its input.
+    // A failure stays with its input, and is attempted once.
     rrsss::RuntimeShaderCache isolated;
-    CHECK(!isolated.Get(supported.data(), supported.size(), nullptr, status));
+    bool attempted = false;
+    CHECK(!isolated.Get(supported.data(), supported.size(), nullptr, status, &attempted) && attempted);
+    CHECK(std::string(status) == "shader-compiler-unavailable");
+    CHECK(!isolated.Get(supported.data(), supported.size(), nullptr, status, &attempted) && !attempted);
     CHECK(std::string(status) == "shader-compiler-unavailable");
     CHECK(isolated.Get(variant.data(), variant.size(), module, status) && std::string(status) == "ready");
     CHECK(!isolated.Get(supported.data(), supported.size(), module, status));
