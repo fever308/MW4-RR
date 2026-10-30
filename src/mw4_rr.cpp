@@ -23,7 +23,7 @@
 #include <sstream>
 extern "C" __declspec(dllexport) const char *NAME = "MW4 Ray Reconstruction";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Beta 2: Ray Reconstruction with Subsurface Scattering and transparency guides.";
+    "Beta 3: Ray Reconstruction with Subsurface Scattering and transparency guides.";
 static void WriteLog(const char *text) {
     rrtrace::LastError preserve;
     reshade::log::message(reshade::log::level::warning, text);
@@ -83,6 +83,7 @@ static rrsss::PipelineRegistry &SssPipelines() {
 }
 static rrblend::CoveragePipelineRegistry &CoveragePipelines() {
     static auto *p = []() {
+        rrblend::Classification().logger = &WriteLog;
         auto *v = new rrblend::CoveragePipelineRegistry;
         v->logger = &WriteLog;
         return v;
@@ -239,6 +240,8 @@ static rrtrace::Probe &Observer() {
         v->replace_evaluate = &SrReplacement;
         v->after_evaluate = &SrCompleted;
         v->after_constants = &FrameCamera;
+        v->fg_depth = [](const rrtrace::FgTag &t, sl::Resource &r) { return LiveRR().FgTag(t, r); };
+        v->fg_result = [](const rrtrace::FgTag &t, sl::Result r) { LiveRR().FgResult(t, r); };
         v->before_shutdown = &BeforeNgxShutdown;
         v->after_shutdown = &AfterNgxShutdown;
         return v;
@@ -251,7 +254,27 @@ static bool PinInspector() {
                                   GET_MODULE_HANDLE_EX_FLAG_PIN,
                               reinterpret_cast<LPCWSTR>(&PinInspector), &self) != FALSE;
 }
+static void OnDeviceWork(reshade::api::device *d);
+// The first device and queue install hooks; their handlers' time is logged once.
+static void TimedFirst(std::atomic<bool> &once, const char *name, void (*work)(void *), void *arg) {
+    auto &t = rrtiming::Global();
+    const bool first = !once.load(std::memory_order_relaxed);
+    t.Milestone(once, name);
+    const auto begin = rrtiming::Now();
+    work(arg);
+    if (first) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "RR startup: %s handler took %.1f ms", name,
+                      rrtiming::Ms(rrtiming::Now() - begin));
+        t.Log(line);
+    }
+}
 static void OnDevice(reshade::api::device *d) {
+    static std::atomic<bool> first{};
+    TimedFirst(first, "first device",
+               [](void *p) { OnDeviceWork(static_cast<reshade::api::device *>(p)); }, d);
+}
+static void OnDeviceWork(reshade::api::device *d) {
     try {
         if (d->get_api() == reshade::api::device_api::d3d12 && PinInspector()) {
             d->create_private_data<rrbindings::DeviceState>();
@@ -279,7 +302,13 @@ static void OnDestroyDevice(reshade::api::device *d) {
     if (rrbindings::State(d))
         d->destroy_private_data<rrbindings::DeviceState>();
 }
+static void OnQueueWork(reshade::api::command_queue *q);
 static void OnQueue(reshade::api::command_queue *q) {
+    static std::atomic<bool> first{};
+    TimedFirst(first, "first command queue",
+               [](void *p) { OnQueueWork(static_cast<reshade::api::command_queue *>(p)); }, q);
+}
+static void OnQueueWork(reshade::api::command_queue *q) {
     try {
         if (q->get_device()->get_api() == reshade::api::device_api::d3d12 && PinInspector())
             if (!AlbedoInspector().AttachQueue(
@@ -531,12 +560,18 @@ struct PipelineInfo {
     bool compute{};
 };
 static std::unordered_map<uint64_t, PipelineInfo> shader_hashes;
-static void OnPipeline(reshade::api::device *device, reshade::api::pipeline_layout layout,
-                       uint32_t count, const reshade::api::pipeline_subobject *objects,
-                       reshade::api::pipeline pipeline) {
-    rrtrace::LastError preserve_error;
-    SssPipelines().Initialize(device, layout, count, objects, pipeline);
-    CoveragePipelines().Initialize(device, layout, count, objects, pipeline);
+static void OnPipelineWork(reshade::api::device *device, reshade::api::pipeline_layout layout,
+                           uint32_t count, const reshade::api::pipeline_subobject *objects,
+                           reshade::api::pipeline pipeline) {
+    {
+        rrtiming::Scope scope(rrtiming::Stage::SssInitialize);
+        SssPipelines().Initialize(device, layout, count, objects, pipeline);
+    }
+    {
+        rrtiming::Scope scope(rrtiming::Stage::CoverageInitialize);
+        CoveragePipelines().Initialize(device, layout, count, objects, pipeline);
+    }
+    rrtiming::Scope scope(rrtiming::Stage::PipelineHash);
     try {
         uint64_t hash = 14695981039346656037ull;
         bool found = false, compute = false;
@@ -564,6 +599,20 @@ static void OnPipeline(reshade::api::device *device, reshade::api::pipeline_layo
         SparseFailure("RR provenance/context exception; RR blocked");
         WriteLog("buffer pipeline hash unavailable");
     }
+}
+static void OnPipeline(reshade::api::device *device, reshade::api::pipeline_layout layout,
+                       uint32_t count, const reshade::api::pipeline_subobject *objects,
+                       reshade::api::pipeline pipeline) {
+    rrtrace::LastError preserve_error;
+    auto &t = rrtiming::Global();
+    static std::atomic<bool> first{};
+    t.Milestone(first, "first pipeline");
+    t.pipelines.fetch_add(1, std::memory_order_relaxed);
+    {
+        rrtiming::Scope scope(rrtiming::Stage::PipelineCallback);
+        OnPipelineWork(device, layout, count, objects, pipeline);
+    }
+    t.Summary();
 }
 static void OnDestroyPipeline(reshade::api::device *, reshade::api::pipeline pipeline) {
     SssPipelines().Forget(pipeline.handle);
@@ -615,7 +664,7 @@ static bool SssOwnedDraw(reshade::api::command_list *list,
                 return false;
             graphics = i->second;
         }
-        if (graphics.pipeline.shader != 0x9ee7cea57f70d741ull)
+        if (!rrsss::Recognized().HasHash(graphics.pipeline.shader))
             return false;
         auto variant = SssPipelines().Find(list->get_device(), graphics.pipeline.pipeline);
         if (!variant)
@@ -958,6 +1007,7 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
         return FALSE;
     reshade::register_overlay("MW4 Ray Reconstruction", &DrawSettings);
     rrbypass::logger = &WriteLog;
+    rrtiming::Global().logger.store(&WriteLog, std::memory_order_release);
     reshade::register_event<reshade::addon_event::init_device>(&OnDevice);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
     reshade::register_event<reshade::addon_event::init_command_queue>(&OnQueue);
@@ -982,7 +1032,8 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
         &AuditRenderTargets);
     reshade::register_event<reshade::addon_event::draw>(&AuditDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(&AuditDrawIndexed);
-    reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnRuntime);
+    reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnInitRuntime);
+    reshade::register_event<reshade::addon_event::init_swapchain>(&OnSwapchain);
     reshade::register_event<reshade::addon_event::reshade_present>(&OnPresent);
     return true;
 }

@@ -12,14 +12,19 @@ inline void Transition(ID3D12GraphicsCommandList *cl, ID3D12Resource *resource,
     cl->ResourceBarrier(1, &b);
 }
 struct ResolvePipeline {
-    ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> pipeline;
-    template <class Pipelines> void Prepare(Pipelines &p) {
-        if (pipeline)
+    ComPtr<ID3D12RootSignature> root, coverage_root;
+    ComPtr<ID3D12PipelineState> pipeline, coverage_pipeline;
+    // coverage: the Subsurface Scattering coverage resolve (rrssscov), the same layout plus
+    // parameter 5, a u3 table.
+    template <class Pipelines> void Prepare(Pipelines &p, bool coverage = false) {
+        auto &r = coverage ? coverage_root : root;
+        auto &pso = coverage ? coverage_pipeline : pipeline;
+        if (pso)
             return;
         D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
-                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}};
-        D3D12_ROOT_PARAMETER args[5]{};
+                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0},
+                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 3, 0, 0}};
+        D3D12_ROOT_PARAMETER args[6]{};
         args[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         for (unsigned i = 0; i < 2; ++i) {
             args[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -27,9 +32,14 @@ struct ResolvePipeline {
             args[3 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
             args[3 + i].Descriptor.ShaderRegister = 1 + i;
         }
-        D3D12_ROOT_SIGNATURE_DESC desc{5, args};
-        p.Root(desc, root);
-        p.Pipeline(root.Get(), RRSSSDeinterleave, sizeof(RRSSSDeinterleave), pipeline);
+        args[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        args[5].DescriptorTable = {1, &ranges[2]};
+        D3D12_ROOT_SIGNATURE_DESC desc{coverage ? 6u : 5u, args};
+        p.Root(desc, r);
+        if (coverage)
+            p.Pipeline(r.Get(), RRSSSDeinterleaveCoverage, sizeof(RRSSSDeinterleaveCoverage), pso);
+        else
+            p.Pipeline(r.Get(), RRSSSDeinterleave, sizeof(RRSSSDeinterleave), pso);
     }
 };
 struct Gpu {
@@ -140,7 +150,8 @@ struct Gpu {
         view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
         p.device->CreateRenderTargetView(target.Get(), &view,
                                          rtv->GetCPUDescriptorHandleForHeapStart());
-        hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        // The third descriptor is the coverage resolve's u3 (Resolve), written per frame.
+        hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
         if (!heap)
             rrprivate::CheckAllocation(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
                   "SSS resolve heap allocation failed");
@@ -170,23 +181,39 @@ struct Gpu {
         Transition(cl, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                    D3D12_RESOURCE_STATE_COMMON);
     }
+    // coverage: a w x h R8_UINT texture in COMMON for the coverage resolve, given exactly
+    // when the producer recorded with the marker initializer (Producer::marked); it is left
+    // in COMMON. The caller prepares p.sss with coverage before recording.
     template <class Pipelines>
     void Resolve(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *header,
-                 ID3D12Resource *stats, ID3D12Resource *history) {
+                 ID3D12Resource *stats, ID3D12Resource *history,
+                 ID3D12Resource *coverage = nullptr) {
+        if (coverage) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.Format = DXGI_FORMAT_R8_UINT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            p.device->CreateUnorderedAccessView(
+                coverage, nullptr, &uav,
+                {heap->GetCPUDescriptorHandleForHeapStart().ptr + 2 * stride});
+            Transition(cl, coverage, D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         Transition(cl, target.Get(), D3D12_RESOURCE_STATE_COMMON,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Transition(cl, guide.Get(), D3D12_RESOURCE_STATE_COMMON,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
         cl->SetDescriptorHeaps(1, heaps);
-        cl->SetPipelineState(p.sss.pipeline.Get());
-        cl->SetComputeRootSignature(p.sss.root.Get());
+        cl->SetPipelineState(coverage ? p.sss.coverage_pipeline.Get() : p.sss.pipeline.Get());
+        cl->SetComputeRootSignature(coverage ? p.sss.coverage_root.Get() : p.sss.root.Get());
         cl->SetComputeRootConstantBufferView(0, header->GetGPUVirtualAddress());
         const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
         cl->SetComputeRootDescriptorTable(1, gpu);
         cl->SetComputeRootDescriptorTable(2, {gpu.ptr + stride});
         cl->SetComputeRootUnorderedAccessView(3, stats->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(4, history->GetGPUVirtualAddress());
+        if (coverage)
+            cl->SetComputeRootDescriptorTable(5, {gpu.ptr + 2 * stride});
         const auto groups = Layout{width, height}.Dispatch();
         cl->Dispatch(groups.ThreadGroupCountX, groups.ThreadGroupCountY, groups.ThreadGroupCountZ);
         D3D12_RESOURCE_BARRIER barrier{};
@@ -196,6 +223,9 @@ struct Gpu {
                    D3D12_RESOURCE_STATE_COMMON);
         Transition(cl, guide.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (coverage)
+            Transition(cl, coverage, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_COMMON);
     }
     void Finish(ID3D12GraphicsCommandList *cl) {
         Transition(cl, guide.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,

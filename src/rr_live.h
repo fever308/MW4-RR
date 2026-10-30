@@ -1,9 +1,11 @@
 #pragma once
 #include "rr_live_gpu.h"
+#include "rr_sss_coverage_gpu.h"
 #include "rr_live_policy.h"
 #include "rr_guide_health.h"
 #include "rr_water.h"
 #include "rr_weapon_depth.h"
+#include "rr_fg_depth.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
@@ -16,6 +18,7 @@
 #include "rr_ngx_log.h"
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
+#include "rr_transparency_shaders.h"
 #include <atomic>
 #include <mutex>
 #include <deque>
@@ -32,6 +35,8 @@ class Controller {
     };
     struct Slot {
         rrsss::Producer sss;
+        // The coverage key pass's descriptor set this frame used (CoverageHistory::Sets: none).
+        unsigned coverage_set = CoverageHistory::Sets;
         bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
@@ -51,6 +56,15 @@ class Controller {
         UINT64 fence_value{};
         rrtrace::CameraInfo camera;
         std::array<float, 16> view{}, projection{};
+        // Weapon depth for Frame Generation (rr_fg_depth.h): AfterSR wrote gpu.fg_depth for
+        // this frame (fg_prepared), or why not.
+        bool fg_prepared{};
+        rrfgdepth::Reason fg_prepare{rrfgdepth::Reason::NotRecorded};
+        // The list Frame Generation's depth was tagged on, when not the SR list: its copy reads
+        // gpu.fg_depth. Keep the recording live until Reset and fence every execution,
+        // including replays; after Reset, the last submission must still complete.
+        ComPtr<ID3D12GraphicsCommandList> fg_list;
+        bool fg_list_live{};
         std::array<Observed, 4> states{};
         rreval::Options options;
     };
@@ -131,6 +145,23 @@ class Controller {
     WeaponHold weapon_hold{};
     unsigned weapon_hold_changes{};
     rrweapondepth::Mapping weapon_logged{}; // The mapping last written to the log.
+    // Weapon depth for Frame Generation (rr_fg_depth.h). fg_paused: Streamline refused the
+    // replacement RefusalLimit times in a row; retained for the session in Beta 3. Textures live
+    // in the slots (GpuFrame::fg_depth); their reserve growth is part of test_reserve.
+    bool fg_paused{}, fg_memory_logged{}, fg_supplied_logged{};
+    unsigned fg_refusals{}, fg_diagnostics{}, fg_pairs{};
+    UINT64 fg_memory_retry_at{}, fg_summary_at{};
+    struct FgSignature {
+        UINT lifecycle{}, state{}, extent_w{}, extent_h{}, width{}, height{}, format{}, inverted{},
+            motion{}, jittered{}, offset_x{}, offset_y{}, render_w{}, render_h{};
+        bool same_list{}, same_depth{}, slot{}, submitted{};
+        // The tagged depth's own description, and the frame delta of the RR slot whose SR depth
+        // it is (NoMatch: none of the slots').
+        UINT fg_width{}, fg_height{}, fg_format{}, fg_flags{};
+        int match{NoMatch};
+        static constexpr int NoMatch = INT_MIN;
+        bool operator==(const FgSignature &) const = default;
+    } fg_logged{};
     // Water responsivity mask (rr_water.h).
     rrwater::Settings water;
     rrwater::Status water_status;
@@ -162,6 +193,15 @@ class Controller {
     // Latest guide an admitted SR submission resolves, for SSS-masked lighting.
     rrsssmask::Record sss_mask;
     ComPtr<ID3D12Resource> sss_mask_guide;
+    // Subsurface Scattering coverage selection (rr_sss_coverage.h): the history ring, the
+    // record sealed with the latest admitted guide, and the panel's counts. The ring is in the
+    // persistent ledger; coverage_reserve is the budget growth it added, given back by
+    // Reconfigure with test_reserve.
+    CoverageHistory coverage_history;
+    rrssscov::Record coverage_record;
+    bool coverage_failed{};
+    UINT64 coverage_retry_after{};
+    UINT64 coverage_key_skips{}; // surface keys skipped because the entry was still in flight
     bool hit_enabled{};
     unsigned hit_reports{};
     HMODULE runtime{};
@@ -197,6 +237,14 @@ class Controller {
             logger(s);
     }
 
+    // Bytes that the pool projections count once, not per slot: the persistent allocations and
+    // every slot's Frame Generation depth texture (SlotReservationParts leaves it out).
+    UINT64 Kept() const {
+        UINT64 total = persistent.bytes;
+        for (const auto &s : slots)
+            total += s.gpu.fg_bytes;
+        return total;
+    }
     // Whether a shared texture (weapon depth's) is used in this evaluation; creates it on
     // first use. The reserve first grows by the texture's size on top of everything it
     // already holds, so the texture never takes room the pool or the SSS and transparency
@@ -518,6 +566,9 @@ class Controller {
         if (foreign_call)
             return false;
         for (const auto &s : slots)
+            if (s.fg_list_live) // an executable FG recording still refers to the slot texture
+                return false;
+        for (const auto &s : slots)
             if (!rrpreset::CanRetire(
                     s.poisoned, s.pre_live, s.sr_live, s.sss.live,
                     s.transparency.Live() || s.coverage.Live(), s.pending_sr,
@@ -556,6 +607,11 @@ class Controller {
         water_retry_after = 0;
         sss_mask = {};
         sss_mask_guide.Reset();
+        coverage_record = {};
+        // Its allocations are in the persistent ledger released below; its budget growth is
+        // in test_reserve.
+        coverage_history.Release();
+        coverage_retry_after = 0;
         history.Reset();
         zero.Reset();
         persistent.Release(budget);
@@ -575,6 +631,10 @@ class Controller {
         transparency_pipeline = {};
         transparency_source.Reset();
         transparency_composition = {};
+        transparency_note = {};
+        transparency_counters = {};
+        transparency_window = transparency_logged_at = 0;
+        transparency_failing = false;
         CoverageReconfigured();
         initialized = false;
         signaled = 0;
@@ -634,14 +694,24 @@ class Controller {
                 }
             }
             if (s.busy && !s.pre_live && !s.sr_live && !s.sss.live && !s.transparency.Live() &&
+                !s.fg_list_live &&
                 !s.pending_sr && Complete(s, done)) {
                 auto cache = std::move(s.gpu);
                 cache.Retire();
+                // Once Frame Generation stops tagging depth, its textures go as slots retire.
+                if (!rrfgdepth::status.FgSeen(GetTickCount64()))
+                    ReleaseFgTexture(cache);
                 s = {};
                 s.gpu = std::move(cache);
                 s.busy = false;
             }
         }
+        // Idle slots keep their texture between frames: they go too once it is unused. An idle
+        // slot's last frame has completed (it went idle above).
+        if (!rrfgdepth::status.FgSeen(GetTickCount64()))
+            for (auto &s : slots)
+                if (!s.busy && s.gpu.fg_depth)
+                    ReleaseFgTexture(s.gpu);
         const UINT64 now = GetTickCount64();
         Resume(sss_failed, sss_pause, now, "Subsurface Scattering guide");
         Resume(transparency_failed, transparency_pause, now, "Transparency guide");
@@ -662,8 +732,298 @@ class Controller {
             sss_mask = {};
             sss_mask_guide.Reset();
         }
+        SealSssCoverage(s, accepted);
     }
-
+    // The coverage record follows the guide: replaced by an admitted guide whose frame
+    // recorded both its surface key and its coverage, dropped with a rejected one. An
+    // admitted frame without coverage keeps the older record: Check still limits its age,
+    // generation and extent, and with MaxAge < Ring its entry is not rewritten while usable.
+    void SealSssCoverage(const Slot &s, bool accepted) {
+        if (!accepted) {
+            if (coverage_record.valid && coverage_record.frame == s.frame)
+                coverage_record = {};
+            return;
+        }
+        const auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
+        if (!coverage_history.Matches(s.gpu.w, s.gpu.h) || !s.sss.marked ||
+            e.key_frame != s.frame || e.coverage_frame != s.frame || e.generation != s.generation) {
+            // A record from before a camera cut never outlives the cut.
+            if (s.camera.reset != 0)
+                coverage_record = {};
+            return;
+        }
+        coverage_record = {true, s.frame, s.generation, s.gpu.w, s.gpu.h, CoverageCamera(s)};
+    }
+    static rrssscov::Camera CoverageCamera(const Slot &s) {
+        rrssscov::Camera c;
+        c.view = s.view;
+        c.projection = s.projection;
+        c.jitter = {s.camera.jitter[0], s.camera.jitter[1]};
+        c.frame = s.frame;
+        c.viewport = s.viewport;
+        c.valid = s.camera.readable && s.camera.basis_valid && s.camera.projection_valid;
+        c.reset = s.camera.reset != 0;
+        return c;
+    }
+    // Allocates the coverage history once it is wanted and a mandatory RR slot exists; a
+    // budget or memory shortage retries a second later, any other failure turns the
+    // coverage selection off for the session. Never fails RR.
+    bool PrepareSssCoverage(UINT w, UINT h) {
+        if (coverage_history.ready)
+            return coverage_history.Matches(w, h);
+        const UINT64 now = GetTickCount64();
+        if (coverage_failed || now < coverage_retry_after || !pipelines.device)
+            return false;
+        const UINT64 n = CoverageHistory::Bytes(pipelines.device.Get(), w, h);
+        const UINT64 old = budget.limit;
+        const UINT64 before = persistent.bytes;
+        try {
+            if (!n || old > UINT64_MAX - n || !budget.Reserve(pipelines.device.Get(), old + n))
+                throw rrprivate::AllocationDeferred();
+            test_reserve += budget.limit - old;
+            coverage_history.Prepare(pipelines, budget, persistent, w, h);
+            coverage_retry_after = 0;
+            Log("Subsurface Scattering coverage history allocated");
+            return true;
+        } catch (const rrprivate::AllocationDeferred &) {
+            CoverageUnwind(before, old);
+            if (!coverage_retry_after)
+                Log("Subsurface Scattering coverage history waiting for GPU memory; retried "
+                    "every second");
+            coverage_retry_after = now + 1000;
+        } catch (const std::exception &e) {
+            CoverageUnwind(before, old);
+            coverage_failed = true;
+            const std::string line =
+                std::string("Subsurface Scattering coverage selection unavailable: ") + e.what();
+            Log(line.c_str());
+        }
+        return false;
+    }
+    // A failed preparation: nothing references its resources yet, so they and the budget
+    // growth are given back.
+    void CoverageUnwind(UINT64 before, UINT64 old_limit) {
+        coverage_history.Release();
+        persistent.Unwind(budget, before);
+        if (budget.limit > old_limit) {
+            test_reserve -= (std::min)(test_reserve, budget.limit - old_limit);
+            budget.limit = (std::max)(old_limit, budget.bytes);
+        }
+    }
+    // Right after a prepass: this frame's surface key, with a descriptor set no busy slot
+    // holds. Skipped (the frame then has no record) only if every set is held, which needs
+    // more busy slots than Sets.
+    void CoverageKey(Slot &s, ID3D12GraphicsCommandList *cl) {
+        if (!sss_enabled || sss_failed || !PrepareSssCoverage(s.gpu.w, s.gpu.h))
+            return;
+        std::array<bool, CoverageHistory::Sets> held{};
+        for (const auto &o : slots)
+            if (&o != &s && o.busy && o.coverage_set < CoverageHistory::Sets)
+                held[o.coverage_set] = true;
+        unsigned set = 0;
+        while (set < CoverageHistory::Sets && held[set])
+            ++set;
+        if (set == CoverageHistory::Sets) {
+            // Logged at 1, 2, 4, 8, ...
+            if (!(++coverage_key_skips & (coverage_key_skips - 1)))
+                Log("Subsurface Scattering coverage: surface key skipped, every descriptor set "
+                    "is still in flight (raw lighting this frame)");
+            return;
+        }
+        if (coverage_history.Key(cl, pipelines, s.gpu.sources[3].Get(), s.frame, s.generation,
+                                 set))
+            s.coverage_set = set;
+    }
+    // The Subsurface Scattering pass of slot s records coverage (marker initializer).
+    bool CoverageMarking(const Slot &s, const rrsss::StencilSetup &stencil) const {
+        return coverage_history.Matches(s.gpu.w, s.gpu.h) &&
+               stencil.required && stencil.marker;
+    }
+    // The coverage texture this slot's resolve writes, or null for the baseline resolve.
+    ID3D12Resource *CoverageTarget(const Slot &s) {
+        auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
+        if (!s.sss.marked)
+            return nullptr;
+        // A marked producer gives 65504 where the baseline gives 0, so its resolve takes the
+        // coverage variant even when no record can be kept (the stamps below). Marking needs
+        // a matching ring and Reconfigure retires every slot before releasing it, so this
+        // test does not fail for a marked recording.
+        if (!coverage_history.Matches(s.gpu.w, s.gpu.h))
+            return nullptr;
+        if (e.key_frame == s.frame && e.generation == s.generation)
+            e.coverage_frame = s.frame;
+        return e.coverage.Get();
+    }
+    // Weapon depth for Frame Generation (rr_fg_depth.h). Gives back a slot's texture and the
+    // reserve it added, never below what is still allocated. Only for a slot whose GPU work
+    // completed, or in AfterSR before the frame records it.
+    void ReleaseFgTexture(GpuFrame &g) {
+        if (!g.fg_depth)
+            return;
+        const UINT64 growth = g.fg_growth;
+        g.ReleaseFg(budget);
+        test_reserve -= (std::min)(test_reserve, growth);
+        budget.limit = (std::max)(
+            {Budget::Minimum, budget.bytes, budget.limit - (std::min)(growth, budget.limit)});
+    }
+    // The slot's texture at w x h, created on first use. Like UseTest, the reserve grows by
+    // its size first, so it never takes room RR's pool counted on. False: no GPU memory (a
+    // second's wait; RR keeps running).
+    bool FgTexture(Slot &s, UINT w, UINT h, UINT64 now) {
+        auto &g = s.gpu;
+        if (g.fg_depth) {
+            const auto d = g.fg_depth->GetDesc();
+            if (d.Width == w && d.Height == h)
+                return true;
+            ReleaseFgTexture(g); // this slot's last use completed before it was reused
+        }
+        auto d = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+        const UINT64 n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+        const UINT64 old = budget.limit;
+        bool ok = n && n != UINT64_MAX && old <= UINT64_MAX - n &&
+                  budget.Reserve(pipelines.device.Get(), old + n);
+        if (ok) {
+            const UINT64 before = g.bytes;
+            try {
+                // Announced like RR's depth copy: DLSS5 NR registers resources it may see.
+                g.fg_depth =
+                    g.Allocate(pipelines, budget, d, D3D12_HEAP_TYPE_DEFAULT, nullptr, true);
+                g.fg_bytes = g.bytes - before;
+                g.fg_growth = budget.limit - old;
+                test_reserve += g.fg_growth;
+            } catch (const std::exception &) {
+                g.fg_depth.Reset();
+                g.Unwind(budget, before);
+                budget.limit = old;
+                ok = false;
+            }
+        }
+        if (ok) {
+            fg_memory_logged = false;
+            return true;
+        }
+        fg_memory_retry_at = now + 1000;
+        if (!fg_memory_logged) {
+            fg_memory_logged = true;
+            Log("Weapon depth for Frame Generation: not enough GPU memory; the game's depth is "
+                "used, retried every second");
+        }
+        return false;
+    }
+    // In AfterSR, on the frame's SR list after RR's depth source is a shader resource and
+    // before RR's own passes: writes this frame's replacement (GpuFrame::FgWeaponDepth). A
+    // failure here only leaves the frame's Frame Generation depth the game's own.
+    void PrepareFgDepth(Slot &s, ID3D12GraphicsCommandList *cl) {
+        s.fg_prepared = false;
+        const UINT64 now = GetTickCount64();
+        try {
+            const auto native = s.gpu.sr[1]->GetDesc();
+            const bool format_ok = native.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                       ? s.gpu.use_depth && s.gpu.depth
+                                       : native.Format == DXGI_FORMAT_R32_FLOAT && !s.gpu.use_depth;
+            rrweapondepth::Mapping map;
+            const bool mapped = rrweapondepth::Map(s.projection, map);
+            auto why = rrfgdepth::Prepare(fg_paused, rrfgdepth::status.FgSeen(now), format_ok,
+                                          mapped, now < fg_memory_retry_at);
+            if (why == rrfgdepth::Reason::Supplied &&
+                (native.Width > UINT_MAX || !FgTexture(s, UINT(native.Width), native.Height, now)))
+                why = rrfgdepth::Reason::Memory;
+            s.fg_prepare = why;
+            if (why != rrfgdepth::Reason::Supplied)
+                return;
+            s.gpu.FgWeaponDepth(cl, pipelines, map);
+            s.fg_prepared = true;
+        } catch (const std::exception &e) {
+            s.fg_prepare = rrfgdepth::Reason::NotRecorded;
+            std::string line = std::string("Weapon depth for Frame Generation: ") + e.what();
+            Log(line.c_str());
+        }
+    }
+    // One diagnostic line when a Frame Generation depth tag's metadata changes, at most 24 a
+    // session, and a 10 s summary of the reasons. Metadata only: no resource is read.
+    void FgDiagnose(const rrtrace::FgTag &t, const Slot *s, bool same_list, bool same_depth,
+                    ID3D12Resource *depth, const D3D12_RESOURCE_DESC &tagged, rrfgdepth::Reason why,
+                    UINT64 now) {
+        FgSignature v{t.lifecycle, t.state, t.extent_width, t.extent_height};
+        v.fg_width = UINT(tagged.Width);
+        v.fg_height = tagged.Height;
+        v.fg_format = UINT(tagged.Format);
+        v.fg_flags = UINT(tagged.Flags);
+        for (auto &o : slots)
+            if (depth && o.recorded && o.gpu.sr[1].Get() == depth) {
+                v.match = int(INT64(o.frame) - INT64(t.frame));
+                break;
+            }
+        v.same_list = same_list;
+        v.same_depth = same_depth;
+        v.slot = s != nullptr;
+        v.submitted = s && s->sealed;
+        if (s && same_depth) {
+            const auto d = s->gpu.sr[1]->GetDesc();
+            v.width = UINT(d.Width);
+            v.height = d.Height;
+            v.format = UINT(d.Format);
+            v.offset_x = s->options.depth_x;
+            v.offset_y = s->options.depth_y;
+            v.render_w = s->options.width;
+            v.render_h = s->options.height;
+        }
+        if (s) {
+            v.inverted = s->camera.depth_inverted;
+            v.motion = s->camera.camera_motion;
+            v.jittered = s->camera.motion_jittered;
+        }
+        char delta[16] = "none";
+        if (v.match != FgSignature::NoMatch)
+            snprintf(delta, sizeof(delta), "%+d", v.match);
+        if (!(v == fg_logged) && fg_diagnostics < 24) {
+            fg_logged = v;
+            ++fg_diagnostics;
+            char line[640];
+            snprintf(line, sizeof(line),
+                     "FG depth tag: frame=%u view=%u lifecycle=%u extent=%ux%u state=0x%x "
+                     "rrFrame=%u sameList=%u srSubmitted=%u sameDepth=%u depth=%ux%u format=%u "
+                     "srSubrect=%u,%u+%ux%u camera{depthInverted=%u cameraMotionIncluded=%u "
+                     "mvJittered=%u near=%g far=%g} tagged=%ux%u format=%u flags=0x%x "
+                     "srDepthOfFrame=%s -> %s",
+                     t.frame, t.viewport, t.lifecycle, t.extent_width, t.extent_height, t.state,
+                     unsigned(v.slot), unsigned(same_list), unsigned(v.submitted),
+                     unsigned(same_depth), v.width, v.height, v.format, v.offset_x, v.offset_y,
+                     v.render_w, v.render_h, v.inverted, v.motion, v.jittered,
+                     s ? s->camera.near_plane : 0.f, s ? s->camera.far_plane : 0.f, v.fg_width,
+                     v.fg_height, v.fg_format, v.fg_flags, delta, rrfgdepth::Key(why));
+            Log(line);
+        }
+        // The identities themselves for the first frames whose depth is not SR's: whether the
+        // game alternates depth textures, or tags a texture RR never saw.
+        if (s && !same_depth && fg_pairs < 16) {
+            ++fg_pairs;
+            char line[384];
+            int n = snprintf(line, sizeof(line),
+                             "FG depth pair: frame=%u tagged=%p srDepth=%p slots{", t.frame,
+                             static_cast<void *>(depth), static_cast<void *>(s->gpu.sr[1].Get()));
+            for (auto &o : slots)
+                if (o.recorded && n > 0 && size_t(n) < sizeof(line))
+                    n += snprintf(line + n, sizeof(line) - n, " %u:%p", o.frame,
+                                  static_cast<void *>(o.gpu.sr[1].Get()));
+            if (n > 0 && size_t(n) < sizeof(line))
+                snprintf(line + n, sizeof(line) - n, " }");
+            Log(line);
+        }
+        if (!fg_summary_at)
+            fg_summary_at = now;
+        if (now - fg_summary_at >= 10000) {
+            fg_summary_at = now;
+            char counts[384];
+            rrfgdepth::status.Drain(counts, sizeof(counts));
+            if (counts[0]) {
+                char line[448];
+                snprintf(line, sizeof(line), "Weapon depth for Frame Generation (10s): %s", counts);
+                Log(line);
+            }
+        }
+    }
 #include "rr_live_pool.inl"
   public:
     explicit Controller(rreval::Api (*loader)(HMODULE) = &rreval::Api::Load) : resolve(loader) {}
@@ -678,6 +1038,143 @@ class Controller {
     void SetTolerateIsolated(bool value) {
         std::lock_guard lock(mutex);
         tolerate_isolated = value;
+    }
+    // Weapon depth for Frame Generation (rr_fg_depth.h), from the Streamline tag hook with no
+    // other lock held: true hands Frame Generation this frame's replacement in `out` (the
+    // game's depth tag description, copied). Native identities are read before the lock.
+    bool FgTag(const rrtrace::FgTag &t, sl::Resource &out) {
+        auto &status = rrfgdepth::status;
+        const UINT64 now = GetTickCount64();
+        status.fg_seen_at.store(now, std::memory_order_relaxed);
+        rrfgdepth::Match m;
+        auto list =
+            fg::NativeObject<ID3D12GraphicsCommandList>(reinterpret_cast<IUnknown *>(t.command));
+        auto depth = fg::NativeObject<ID3D12Resource>(reinterpret_cast<IUnknown *>(t.native));
+        D3D12_RESOURCE_DESC tagged{};
+        if (depth)
+            tagged = depth->GetDesc();
+        const auto type = list ? list->GetType() : D3D12_COMMAND_LIST_TYPE_COPY;
+        std::unique_lock lock(mutex);
+        m.paused = fg_paused;
+        m.lifecycle_now = t.lifecycle == rrfgdepth::OnlyValidNow;
+        m.rr_running = enabled && !failed && !retired;
+        Slot *s{};
+        for (auto &v : slots)
+            if (v.recorded && v.frame == t.frame && v.viewport == t.viewport &&
+                t.frame != UINT_MAX) {
+                if (s) {
+                    s = nullptr; // two slots for one frame: no identity
+                    break;
+                }
+                s = &v;
+            }
+        m.slot = s != nullptr;
+        bool same_list = false, same_depth = false;
+        if (s) {
+            m.prepared = s->fg_prepared;
+            m.prepare = s->fg_prepare;
+            same_list = list && s->sr_live && list.Get() == s->sr.Get();
+            same_depth = depth && s->gpu.sr[1] && depth.Get() == s->gpu.sr[1].Get();
+            m.same_list = same_list;
+            // A second tag for this frame on yet another list while the first is open would
+            // stop the slot tracking the first: the game's depth for that one.
+            m.other_list =
+                list && !same_list && !(s->fg_list_live && s->fg_list.Get() != list.Get());
+            m.list_ok =
+                type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            m.unsubmitted = !s->sealed;
+            m.same_depth = same_depth;
+            if (depth && s->gpu.sr[1] && !same_depth) {
+                const auto sr = s->gpu.sr[1]->GetDesc();
+                m.game_copy = tagged.Dimension == sr.Dimension && tagged.Width == sr.Width &&
+                              tagged.Height == sr.Height && tagged.Format == sr.Format &&
+                              tagged.MipLevels == sr.MipLevels &&
+                              tagged.DepthOrArraySize == sr.DepthOrArraySize;
+            }
+        }
+        const auto why = rrfgdepth::Decide(m);
+        FgDiagnose(t, s, same_list, same_depth || m.game_copy, depth.Get(), tagged, why, now);
+        if (why != rrfgdepth::Reason::Supplied) {
+            status.Note(why);
+            return false;
+        }
+        const auto d = s->gpu.fg_depth->GetDesc();
+        out.native = s->gpu.fg_depth.Get();
+        out.memory = nullptr;
+        out.view = nullptr;
+        out.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        out.width = UINT(d.Width);
+        out.height = d.Height;
+        out.nativeFormat = DXGI_FORMAT_R32_FLOAT;
+        out.mipLevels = 1;
+        out.arrayLayers = 1;
+        out.gpuVirtualAddress = 0;
+        if (same_list)
+            return true;
+        // Another list: the SR list ended with the texture a shader resource and has been
+        // submitted, so it is back in COMMON (simultaneous-access); make it the state the tag
+        // declares before Streamline's copy. The slot now waits for this list.
+        // A second tag on the same recording already has the declared state: Streamline
+        // restores NPSR after its copy, and decay waits until submission completes.
+        const bool transition = !s->fg_list_live;
+        s->fg_list = list;
+        s->fg_list_live = true;
+        ComPtr<ID3D12Resource> texture = s->gpu.fg_depth;
+        lock.unlock();
+        // Recorded on the native list with RR's own hooks quiet, outside the lock: a barrier,
+        // so no binding the game set is changed.
+        rrinternal::Scope copy_guard;
+        rrcompute::Tracker::Internal state_guard;
+        if (transition)
+            Change(list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        return true;
+    }
+    // Streamline's result for a replacement FgTag supplied. A refusal already re-sent the
+    // game's tags; RefusalLimit in a row pause the replacement for the session.
+    void FgResult(const rrtrace::FgTag &t, sl::Result r) {
+        auto &status = rrfgdepth::status;
+        std::lock_guard lock(mutex);
+        if (r == sl::Result::eOk) {
+            status.Note(rrfgdepth::Reason::Supplied);
+            status.supplied_at.store(GetTickCount64(), std::memory_order_relaxed);
+            fg_refusals = 0;
+            if (!fg_supplied_logged) {
+                fg_supplied_logged = true;
+                char line[256];
+                snprintf(line, sizeof(line),
+                         "Weapon depth for Frame Generation: replacement supplied from frame %u "
+                         "(Streamline accepted the tag; whether Frame Generation uses it is not "
+                         "observed)",
+                         t.frame);
+                Log(line);
+            }
+            return;
+        }
+        status.Note(rrfgdepth::Reason::Rejected);
+        char line[160];
+        snprintf(line, sizeof(line),
+                 "Weapon depth for Frame Generation: Streamline refused the replacement (%d) on "
+                 "frame %u; the game's depth was tagged instead",
+                 int(r), t.frame);
+        Log(line);
+        if (++fg_refusals >= rrfgdepth::RefusalLimit && !fg_paused) {
+            fg_paused = true;
+            Log("Weapon depth for Frame Generation: off for this session after 3 refusals in a row");
+        }
+    }
+    // The panel's line: the last reason, Supplied only while replacements were supplied within
+    // the last 2 s.
+    rrfgdepth::Reason FgState() const {
+        auto &status = rrfgdepth::status;
+        const UINT64 now = GetTickCount64();
+        if (!status.FgSeen(now))
+            return rrfgdepth::Reason::NoFgTags;
+        const auto last = rrfgdepth::Reason(status.last.load(std::memory_order_relaxed));
+        if (last == rrfgdepth::Reason::Supplied &&
+            now - status.supplied_at.load(std::memory_order_relaxed) > 2000)
+            return rrfgdepth::Reason::Stale;
+        return last;
     }
     // Weapon depth state for the panel. Restarting: RR is being recreated with the
     // depth type the setting asks for (the change takes effect once in-flight frames retire).
@@ -739,6 +1236,7 @@ class Controller {
             sss_enabled = value;
             sss_mask = {};
             sss_mask_guide.Reset();
+            coverage_record = {};
             policy.Reject();
         }
     }
@@ -764,9 +1262,77 @@ class Controller {
             *age = match->frame - sss_mask.frame;
         return sss_mask_guide;
     }
+    // This frame's surface for the edge-aware no-history fill (rr_edge_fill.h), from the
+    // slot SssMask() matches on cl: its prepass PackedSurface and the guide conversion's
+    // normals and Status, recorded earlier on cl and left COMMON. False without exactly
+    // one such slot with converted guides.
+    bool EdgeSurface(ID3D12GraphicsCommandList *cl, ComPtr<ID3D12Resource> &surface,
+                     ComPtr<ID3D12Resource> &normal, ComPtr<ID3D12Resource> &status) {
+        std::lock_guard lock(mutex);
+        const Slot *match{};
+        for (const auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                if (match)
+                    return false;
+                match = &s;
+            }
+        if (!match || !match->gpu.sources[3] || !match->gpu.guides[0] || !match->gpu.guides[3])
+            return false;
+        surface = match->gpu.sources[3];
+        normal = match->gpu.guides[0];
+        status = match->gpu.guides[3];
+        return true;
+    }
     void ToggleSss() {
         std::lock_guard lock(mutex);
         SetSssEnabled(!sss_enabled);
+    }
+    // The coverage selection's inputs for the SSS-masked first spatial pass on cl's frame
+    // (rr_sss_coverage.h). reason reports unavailable inputs for the raw-lighting fallback.
+    bool SssCoverage(ID3D12GraphicsCommandList *cl, rrsparsecopy::CoverageInputs &out,
+                     rrssscov::FrameReason &reason) {
+        std::lock_guard lock(mutex);
+        out = {};
+        // Every return leaves its reason for the panel.
+        reason = rrssscov::FrameReason::NoStorage;
+        if (!sss_enabled || sss_failed || !coverage_history.ready)
+            return false;
+        const Slot *match{};
+        for (const auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                if (match)
+                    return false;
+                match = &s;
+            }
+        if (!match)
+            return false;
+        auto &current = coverage_history.entries[rrssscov::Entry(match->frame)];
+        if (current.key_frame != match->frame || current.generation != generation)
+            return false;
+        const auto camera = CoverageCamera(*match);
+        reason = rrssscov::Check(coverage_record, match->frame, generation, match->gpu.w,
+                                 match->gpu.h, match->viewport, camera.reset);
+        if (reason == rrssscov::FrameReason::Reset)
+            coverage_record = {}; // a cut: the record is from before it
+        if (reason != rrssscov::FrameReason::Ready)
+            return false;
+        const auto &previous = coverage_history.entries[rrssscov::Entry(coverage_record.frame)];
+        if (previous.key_frame != coverage_record.frame ||
+            previous.coverage_frame != coverage_record.frame ||
+            previous.generation != coverage_record.generation) {
+            reason = rrssscov::FrameReason::NoStorage;
+            return false;
+        }
+        const unsigned age = match->frame - coverage_record.frame;
+        if (!rrssscov::Make(camera, coverage_record.camera, match->gpu.w, match->gpu.h, age,
+                            out.constants)) {
+            reason = rrssscov::FrameReason::Camera;
+            return false;
+        }
+        out.current = current.key;
+        out.previous = previous.key;
+        out.coverage = previous.coverage;
+        return true;
     }
     bool SpecularHitEnabled() {
         std::lock_guard lock(mutex);
@@ -897,7 +1463,7 @@ class Controller {
                 depth = (std::max)(depth, d);
                 water_bytes = (std::max)(water_bytes, slot.gpu.water.bytes);
             }
-            const UINT64 kept = persistent.bytes;
+            const UINT64 kept = Kept();
             auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
             texture.Flags = D3D12_RESOURCE_FLAG_NONE;
             auto buffer = rrprivate::Buffer(((UINT64(s.gpu.w) * 4 + 255) & ~255ull) * s.gpu.h);
@@ -942,6 +1508,7 @@ class Controller {
             s.sss.variant = variant;
             s.sss.original = original;
             s.sss.stencil = stencil;
+            s.sss.mark = CoverageMarking(s, stencil);
             s.sss.live = true;
             rrinternal::Scope copies;
             rrcompute::Tracker::Internal state;
@@ -1180,6 +1747,7 @@ class Controller {
             cl->Dispatch(x, y, z);
             dispatched = true;
             s.gpu.Convert(cl, pipelines);
+            CoverageKey(s, cl);
             restore.Restore(cl, true);
             return true;
         } catch (const std::exception &e) {
@@ -1686,10 +2254,11 @@ class Controller {
                 if (i != 1 || !s->gpu.use_depth)
                     Change(cl.Get(), s->gpu.sr[i].Get(), states[i],
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0);
+            PrepareFgDepth(*s, cl.Get());
             s->gpu.GateBegin(cl.Get(), pipelines, history.Get());
             if (s->sss_used) {
                 s->gpu.sss.Resolve(cl.Get(), pipelines, s->gpu.header.Get(), s->gpu.stats.Get(),
-                                   history.Get());
+                                   history.Get(), CoverageTarget(*s));
             }
             CoverageBlend(*s, cl.Get(), o.width, o.height);
             if (s->transparency_used)
@@ -1769,6 +2338,8 @@ class Controller {
                 s.sr_live = false;
                 s.pending_sr = false;
             }
+            if (s.fg_list.Get() == cl)
+                s.fg_list_live = false;
             if (!s.recorded && (s.pre.Get() == cl || s.sr.Get() == cl))
                 policy.Reject();
         }
@@ -1783,7 +2354,7 @@ class Controller {
         submissions.back().locked = true;
         submissions.back().touched.resize(slots.size());
         std::vector<int> pre(slots.size(), -1), producer(pre), consumer(pre), glass_pre(pre),
-            glass_anchor(pre), cover(pre);
+            glass_anchor(pre), cover(pre), fg_copy(pre);
         bool any = false;
         auto index = [&](ID3D12CommandList *c) { return rrsss::RecordingIndex(n, lists, c); };
         for (unsigned k = 0; k < slots.size(); ++k) {
@@ -1794,9 +2365,11 @@ class Controller {
             glass_pre[k] = s.transparency.prep_live ? index(s.transparency.preparation.Get()) : -1;
             glass_anchor[k] = s.transparency.anchor_live ? index(s.transparency.anchor.Get()) : -1;
             cover[k] = s.coverage.Live() ? index(s.coverage.capture.Get()) : -1;
+            fg_copy[k] = s.fg_list_live ? index(s.fg_list.Get()) : -1;
             if (rrsss::Present(pre[k]) || rrsss::Present(producer[k]) ||
                 rrsss::Present(consumer[k]) || rrsss::Present(glass_pre[k]) ||
-                rrsss::Present(glass_anchor[k]) || rrsss::Present(cover[k])) {
+                rrsss::Present(glass_anchor[k]) || rrsss::Present(cover[k]) ||
+                rrsss::Present(fg_copy[k])) {
                 submissions.back().touched[k] = true;
                 any = true;
             }
@@ -1838,24 +2411,32 @@ class Controller {
                 s.gpu.header_map[7] = sss_accept ? 1u : 0u;
                 if (s.sss_used)
                     SealSssMask(s, sss_accept);
+                const auto route = s.transparency.producer_copy ? rrtrans::Route::Producer
+                                   : s.transparency.at_draw     ? rrtrans::Route::AtDraw
+                                                                : rrtrans::Route::Prepared;
                 s.transparency_accepted =
                     s.transparency_used && s.transparency.written && s.transparency.anchored &&
-                    (s.transparency.producer_copy
-                         ? rrtrans::AdmitProducer(a, glass_pre[k], glass_anchor[k], b,
-                                                  s.transparency.prep_submitted,
-                                                  s.transparency.anchor_submitted, baseline)
-                     : s.transparency.at_draw
-                         ? rrtrans::AdmitAtDraw(a, glass_pre[k], glass_anchor[k], b,
-                                                s.transparency.prep_submitted,
-                                                s.transparency.anchor_submitted, baseline)
-                         : rrtrans::Admit(a, glass_pre[k], glass_anchor[k], b,
-                                          s.transparency.prep_submitted,
-                                          s.transparency.anchor_submitted, baseline));
-                if (s.transparency_used && s.transparency.producer_copy) {
-                    if (s.transparency_accepted)
-                        transparency_backoff = 0;
-                    else if (!transparency_producer_suspended)
-                        SuspendTransparencyProducer(nullptr);
+                    rrtrans::RouteAdmits(route, a, glass_pre[k], glass_anchor[k], b,
+                                         s.transparency.prep_submitted,
+                                         s.transparency.anchor_submitted, baseline);
+                if (s.transparency_used) {
+                    const auto misses = s.transparency_accepted
+                                            ? 0u
+                                            : rrtrans::Misses(route, a, glass_pre[k],
+                                                              glass_anchor[k], b,
+                                                              s.transparency.prep_submitted,
+                                                              s.transparency.anchor_submitted,
+                                                              baseline, s.transparency.written,
+                                                              s.transparency.anchored);
+                    const auto note = transparency_note.For(s.frame, CompositionRecognized());
+                    TransparencyAdmissionLocked(s.transparency_accepted, misses, note,
+                                                GetTickCount64());
+                    if (s.transparency.producer_copy) {
+                        if (s.transparency_accepted)
+                            transparency_backoff = 0;
+                        else if (!transparency_producer_suspended)
+                            SuspendTransparencyProducer(nullptr, false, misses, note);
+                    }
                 }
                 // Never part of acceptance: an unadmitted blend only reads no coverage.
                 SealCoverage(s, a, cover[k], b, baseline);

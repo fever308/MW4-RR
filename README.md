@@ -2,9 +2,18 @@
 
 A Windows x64 ReShade addon integrating NVIDIA DLSS Ray Reconstruction into the MW4 campaign's Direct3D 12 rendering path. Includes Transparency and Subsurface Scattering guides, live RR preset selection, and a ReShade status panel.
 
-**Beta 2** is the current public beta. It is a beta mostly in name: in the author's own playtesting, roughly 98% of the noise seen before is gone, but some issues may not have been caught yet. That is a personal impression from gameplay, not a measurement, and results vary by scene, hardware, and settings. See the requirements and limitations below before installing or building.
+**Beta 3** improves shader compatibility, Frame Generation depth, and Subsurface Scattering lighting. Results vary by scene, hardware, and settings. See the requirements and limitations below before installing or building.
 
-### What's new in Beta 2
+### What's new in Beta 3
+
+- Broader recognition of Subsurface Scattering and transparency shader variants.
+- A per-user cache reuses successfully prepared guide shaders on later launches.
+- Weapon-inclusive depth for Frame Generation, with the game's depth retained when the replacement cannot be supplied.
+- Subsurface Scattering history selection follows the camera and checks the current surface. Missing lighting samples are filled from nearby rays with matching depth, normal and material.
+
+These Frame Generation and Subsurface Scattering improvements apply automatically, without separate panel toggles or configuration keys.
+
+### Included features
 
 - Improved Subsurface Scattering lighting: skin and other subsurface materials use the game's native temporal lighting history where it exists, and a spatial estimate elsewhere.
 - Transparency albedo blend: texture seen through glass, particles, and refraction stays steadier while moving.
@@ -50,6 +59,11 @@ The panel also has these checkboxes, all on by default and saved in `ReShade.ini
 - Weapon depth (`WeaponDepth`): gives RR a depth in which the weapon and hands keep their own depth, still in front of the scene, instead of a flat card at the near plane. World depth stays the game's own, in the game's reverse-Z format, so third-party add-ons such as DLSS5 NR keep working. Changing it restarts RR, like a preset change.
 - Replace the game's DLSS upscaling (`ReplaceNativeSR`): RR takes the place of the game's DLSS Super Resolution pass when it can. See Architecture below.
 - Water responsivity mask (`WaterResponsivity`): tells RR to favor the current frame on running water, which it otherwise blurs. It applies on preset F only.
+
+The following features apply automatically, with no separate panel control or saved configuration key:
+
+- Weapon depth for Frame Generation: when RR is running and the required inputs and command ordering are available, Frame Generation receives weapon-inclusive depth. Otherwise it keeps the game's depth for that frame. Super Resolution and RR keep their own inputs.
+- Subsurface Scattering lighting selection and filling: camera reprojection and surface checks select history for scattering surfaces. Pixels with no ray and no history are filled from nearby rays with matching depth, normal and material. A failed coverage match uses raw lighting. This does not change the Subsurface Scattering guide supplied to RR. Camera reprojection does not itself track independent object motion.
 
 With the Subsurface Scattering Guide on, lighting on skin and other subsurface materials uses the game's native temporal history where it exists, and a spatial estimate elsewhere. The panel reports this as "SSS lighting".
 
@@ -119,7 +133,16 @@ From the repository root:
 build.cmd "path\to\NGX\include" "path\to\dxc\bin\x64"
 ```
 
-Outputs are written under `build/`. The companion DLL is the unmodified x64 DXC `dxcompiler.dll`, renamed `mw4-rr-dxcompiler.dll`. Generated shader headers contain only the project-owned HLSL compiled by the build. Runtime-generated game shader variants remain in memory and are not written to disk.
+Outputs are written under `build/`. The companion DLL is the unmodified x64 DXC `dxcompiler.dll`, renamed `mw4-rr-dxcompiler.dll`. Generated shader headers contain only the project-owned HLSL compiled by the build. Runtime-generated game shader variants are never shipped. Each PC prepares them from its own game's shaders and keeps the accepted bytecode in a local cache (see below).
+
+### Local shader cache
+
+The Subsurface Scattering guide shader is prepared from the game's own composite shader the first time the game creates it. The accepted bytecode is stored per user in `%LOCALAPPDATA%\MW4-RR\ShaderCache\v1\` as `<key>.rrsc` files and reused in later sessions. Nothing is uploaded or read from anywhere else.
+
+- The key covers the cache format, the shader role, the transformation version and its shipped fingerprints, the SHA-256 and size of the companion `mw4-rr-dxcompiler.dll`, and the SHA-256 and size of the game's shader. A game update, a new addon transformation or another compiler uses new entries.
+- An entry is used only when its header repeats that key, its size is exact and its content matches its recorded SHA-256, and only after the same output checks a fresh preparation ends with: a captured build's guide must equal its pinned output byte for byte; another build must pass the input structure check, DXC validation, the output structure check and declare the input's scene buffer size. Anything else is deleted and prepared again.
+- Only accepted results are written, through a temporary file renamed into place. Failures are never stored. At most 32 entries and 32 MB are kept, oldest removed first. A cache that cannot be read or written only means normal preparation.
+- To clear it, close the game and delete the `%LOCALAPPDATA%\MW4-RR\ShaderCache` folder.
 
 ## Tests and validation
 

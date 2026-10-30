@@ -10,6 +10,13 @@
 #include <regex>
 #include <memory>
 #include <mutex>
+#include <atomic>
+#include <cctype>
+#include <cstring>
+#include <iterator>
+#include <map>
+#include "rr_shader_cache.h"
+#include "rr_startup_timing.h"
 #pragma comment(lib, "bcrypt.lib")
 
 namespace rrsss {
@@ -29,10 +36,6 @@ inline bool ShaderDigest(const void *data, size_t size, const char *expected) no
             return false;
     return true;
 }
-inline bool SupportedRuntimeShader(const void *data, size_t size) noexcept {
-    return size == 56388 && ShaderDigest(data, size,
-        "3632196273fba431d92b8ae659cb9dac09444c43c6244205ba4b4fefab02e591");
-}
 inline bool ReplaceShaderOnce(std::string &text, const std::string &from,
                                const std::string &to) {
     const auto at = text.find(from);
@@ -40,6 +43,212 @@ inline bool ReplaceShaderOnce(std::string &text, const std::string &from,
         return false;
     text.replace(at, from.size(), to);
     return true;
+}
+inline bool Sha256(const void *data, size_t size, std::array<unsigned char, 32> &digest) noexcept {
+    return data && size && size <= 4 * 1024 * 1024 &&
+           BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+                      static_cast<PUCHAR>(const_cast<void *>(data)), ULONG(size), digest.data(),
+                      ULONG(digest.size())) >= 0;
+}
+inline uint64_t ShaderHash(const void *data, size_t size) noexcept {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < size; ++i)
+        h = (h ^ static_cast<const unsigned char *>(data)[i]) * 1099511628211ull;
+    return h;
+}
+// Captured builds of the lighting composite that carries the SSS guide and
+// produces the transparency layer. Each pins its native input and the
+// validated guide generated from it. The builds differ only in the scene
+// constant buffer's declared tail, which the shader never reads.
+struct ShaderVariant {
+    size_t bytes;
+    uint64_t hash;
+    const char *sha256;
+    size_t output_bytes;
+    const char *output_sha256;
+};
+inline constexpr ShaderVariant Variants[] = {
+    {56388, 0x9ee7cea57f70d741ull,
+     "3632196273fba431d92b8ae659cb9dac09444c43c6244205ba4b4fefab02e591", 63128,
+     "bfa44f35ca4c29500ff5f629ba3504c86eb30d7ea38c92067cb8a788780aac8b"},
+    {56352, 0xc6c858a6310ca6a2ull,
+     "7fb2e21d444b0ece2629b4caa97743c2acfdc09d1ae463dd9e362c8b1b5e7173", 63056,
+     "73291469f0018187c5028edf1c3012118753083b071294e37a57f7119a7810d8"},
+};
+inline const ShaderVariant *KnownVariant(uint64_t hash, size_t bytes) noexcept {
+    for (const auto &v : Variants)
+        if (v.hash == hash && v.bytes == bytes)
+            return &v;
+    return nullptr;
+}
+inline const ShaderVariant *KnownVariant(const void *data, size_t size) noexcept {
+    if (!data || !size || size > 4 * 1024 * 1024)
+        return nullptr;
+    for (const auto &v : Variants)
+        if (v.bytes == size && ShaderDigest(data, size, v.sha256))
+            return &v;
+    return nullptr;
+}
+// Another build is accepted only when its disassembly, normalized by
+// StructuralText, matches the captured builds': the same instructions,
+// bindings, signatures and metadata. Only fingerprints are shipped.
+inline constexpr const char *InputStructure =
+    "83e3d50d5cffcd501eb51873a68c8bd30f8157d780ab919bf8b911978777df7f";
+inline constexpr const char *OutputStructure =
+    "15ab971c5d61c21c30b4d1b7c4e5653fc1fbfa145e1cf2fca2749eda11e5065a";
+// Highest scene constant-buffer byte the shader (and so the guide) reads.
+inline constexpr size_t SceneReadBytes = 12112;
+// A DXBC part pinned by the FNV-1a64 of its payload.
+struct PartPin {
+    uint32_t fourcc;
+    uint64_t hash;
+};
+inline constexpr uint32_t SFI0 = 0x30494653u, ISG1 = 0x31475349u, OSG1 = 0x3147534fu,
+                          PSV0 = 0x30565350u;
+// Cheap filter before any full hash or disassembly: the container is well
+// formed and holds each pinned part exactly once with the pinned payload.
+inline bool ContainerParts(const void *data, size_t size, const PartPin *pins,
+                           size_t count) noexcept {
+    if (!data || size < 32 || size > 4 * 1024 * 1024 || !pins || !count || count > 8)
+        return false;
+    const auto *b = static_cast<const unsigned char *>(data);
+    auto u32 = [&](size_t at) {
+        uint32_t v;
+        std::memcpy(&v, b + at, 4);
+        return v;
+    };
+    const uint32_t parts = u32(28);
+    if (std::memcmp(b, "DXBC", 4) || u32(24) != size || parts > 64 || 32 + 4ull * parts > size)
+        return false;
+    bool seen[8]{};
+    for (uint32_t i = 0; i < parts; ++i) {
+        const uint32_t at = u32(32 + 4 * i);
+        if (at > size - 8 || u32(at + 4) > size - 8 - at)
+            return false;
+        for (size_t p = 0; p < count; ++p)
+            if (pins[p].fourcc == u32(at)) {
+                if (seen[p] || ShaderHash(b + at + 8, u32(at + 4)) != pins[p].hash)
+                    return false;
+                seen[p] = true;
+            }
+    }
+    return std::all_of(seen, seen + count, [](bool v) { return v; });
+}
+// The captured builds' signature, runtime-info and feature parts.
+inline constexpr PartPin CandidateParts[] = {{SFI0, 0xa8c7f832281a39c5ull},
+                                             {ISG1, 0x95d4f83ffd7546b6ull},
+                                             {OSG1, 0x5116c835e844e585ull},
+                                             {PSV0, 0xdc71665911d748feull}};
+inline bool StructuralCandidate(const void *data, size_t size) noexcept {
+    return ContainerParts(data, size, CandidateParts, std::size(CandidateParts));
+}
+// Removes what a rebuild may change without changing behavior: the shader
+// hash and debug name, and the scene constant buffer's declared layout and
+// size, which must still cover every byte the shader reads (read_bytes, the
+// highest byte its constant row loads reach). Each other declaration,
+// instruction and metadata line is kept verbatim. Shared by every shader that
+// declares the engine's scene constants at b3: the captured builds of the SSS
+// composite and of the refraction composite differ exactly there.
+inline bool StructuralText(const std::string &text, std::string &out,
+                           size_t read_bytes = SceneReadBytes) {
+    out.clear();
+    std::vector<std::string> lines;
+    for (size_t at = 0; at <= text.size();) {
+        auto end = text.find('\n', at);
+        if (end == std::string::npos)
+            end = text.size();
+        auto line = text.substr(at, end - at);
+        line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+        while (!line.empty() && line.back() == '\0')
+            line.pop_back();
+        lines.push_back(std::move(line));
+        at = end + 1;
+    }
+    auto once = [&](auto match) -> std::string * {
+        std::string *found = nullptr;
+        for (auto &l : lines)
+            if (match(l)) {
+                if (found)
+                    return nullptr;
+                found = &l;
+            }
+        return found;
+    };
+    auto starts = [](const std::string &l, const char *p) { return l.rfind(p, 0) == 0; };
+    for (const char *p : {"; shader debug name: ", "; shader hash: "}) {
+        if (std::count_if(lines.begin(), lines.end(),
+                          [&](const std::string &x) { return starts(x, p); }) > 1)
+            return false;
+        for (auto &l : lines)
+            if (starts(l, p))
+                l.clear();
+    }
+    const std::regex resource(
+        R"(^(!\d+ = !\{i32 0, %hostlayout\.scene\* undef, !"", i32 0, i32 3, i32 1, i32 )(\d{1,6})(, null\})$)");
+    std::smatch m;
+    auto *scene = once([&](const std::string &x) {
+        return starts(x, "!") && x.find("%hostlayout.scene* undef") != std::string::npos;
+    });
+    if (!scene || !std::regex_match(*scene, m, resource))
+        return false;
+    const auto bytes = std::stoul(m[2].str());
+    if (bytes % 16 || bytes < read_bytes || bytes > 65536)
+        return false;
+    const auto declared = "[" + m[2].str() + " x i8]";
+    *scene = m[1].str() + "S" + m[3].str();
+    auto *comment = once([&](const std::string &x) {
+        return starts(x, ";") && x.find(declared) != std::string::npos;
+    });
+    if (!comment || !ReplaceShaderOnce(*comment, declared, "[S x i8]"))
+        return false;
+    auto *layout = once([&](const std::string &x) {
+        return starts(x, "%hostlayout.struct.GfxCodeSceneConsts = type ");
+    });
+    if (!layout)
+        return false;
+    *layout = "%hostlayout.struct.GfxCodeSceneConsts = type S";
+    // Struct types that only the dropped scene layout used go with it.
+    auto ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.' || c == '$';
+    };
+    auto tokens = [&](const std::string &l) {
+        std::vector<std::string> found;
+        for (auto at = l.find("%struct."); at != std::string::npos; at = l.find("%struct.", at + 1)) {
+            auto end = at + 8;
+            while (end < l.size() && ident(l[end]))
+                ++end;
+            found.push_back(l.substr(at, end - at));
+        }
+        return found;
+    };
+    std::map<std::string, size_t> uses;
+    for (const auto &l : lines)
+        for (const auto &t : tokens(l))
+            ++uses[t];
+    for (bool removed = true; removed;) {
+        removed = false;
+        for (auto &l : lines) {
+            if (!starts(l, "%struct."))
+                continue;
+            const auto name = tokens(l).front();
+            if (l.compare(name.size(), 8, " = type ") || uses[name] != 1)
+                continue;
+            for (const auto &t : tokens(l))
+                --uses[t];
+            l.clear();
+            removed = true;
+        }
+    }
+    for (const auto &l : lines)
+        if (!l.empty())
+            out += l + '\n';
+    return true;
+}
+inline bool StructureMatches(const std::string &text, const char *expected,
+                             size_t read_bytes = SceneReadBytes) {
+    std::string normalized;
+    return StructuralText(text, normalized, read_bytes) &&
+           ShaderDigest(normalized.data(), normalized.size(), expected);
 }
 inline bool TransformRuntimeShader(std::string &text) {
     text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
@@ -79,61 +288,101 @@ inline bool TransformRuntimeShader(std::string &text) {
         std::to_string(next+1) + " = !{i32 1}\n!" + std::to_string(next+2) + " = !{i32 3, i32 1}\n";
     return true;
 }
+struct ShaderTools {
+    Microsoft::WRL::ComPtr<IDxcLibrary> library;
+    Microsoft::WRL::ComPtr<IDxcCompiler> compiler;
+    Microsoft::WRL::ComPtr<IDxcAssembler> assembler;
+    Microsoft::WRL::ComPtr<IDxcValidator> validator;
+    bool Create(HMODULE module) noexcept {
+        auto create = module ? reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(module, "DxcCreateInstance")) : nullptr;
+        return create && SUCCEEDED(create(CLSID_DxcLibrary, IID_PPV_ARGS(&library))) &&
+               SUCCEEDED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))) &&
+               SUCCEEDED(create(CLSID_DxcAssembler, IID_PPV_ARGS(&assembler))) &&
+               SUCCEEDED(create(CLSID_DxcValidator, IID_PPV_ARGS(&validator)));
+    }
+    bool Disassemble(const void *code, size_t size, std::string &text) {
+        Microsoft::WRL::ComPtr<IDxcBlobEncoding> source, disassembly;
+        if (!code || !size || size > 4 * 1024 * 1024 ||
+            FAILED(library->CreateBlobWithEncodingFromPinned(code, UINT32(size), 0, &source)) ||
+            FAILED(compiler->Disassemble(source.Get(), &disassembly)) || !disassembly ||
+            disassembly->GetBufferSize() > 4 * 1024 * 1024)
+            return false;
+        text.assign(static_cast<const char *>(disassembly->GetBufferPointer()), disassembly->GetBufferSize());
+        while (!text.empty() && text.back() == '\0') text.pop_back();
+        return true;
+    }
+};
+// Assembles and validates a transformed disassembly into a container.
+inline bool AssembleShader(ShaderTools &dxc, const std::string &text, std::vector<unsigned char> &out,
+                           const char **status = nullptr) {
+    using Microsoft::WRL::ComPtr;
+    auto fail = [&](const char *why) {
+        if (status)
+            *status = why;
+        return false;
+    };
+    out.clear();
+    ComPtr<IDxcBlobEncoding> modified;
+    if (FAILED(dxc.library->CreateBlobWithEncodingOnHeapCopy(text.data(), UINT32(text.size()), CP_UTF8, &modified)))
+        return fail("shader-assembly-failed");
+    auto succeeded = [](IDxcOperationResult *op) {
+        HRESULT result = E_FAIL;
+        return op && SUCCEEDED(op->GetStatus(&result)) && SUCCEEDED(result);
+    };
+    ComPtr<IDxcOperationResult> assembled, validated;
+    ComPtr<IDxcBlob> code;
+    if (FAILED(dxc.assembler->AssembleToContainer(modified.Get(), &assembled)) || !succeeded(assembled.Get()) ||
+        FAILED(assembled->GetResult(&code)) || !code || code->GetBufferSize() > 4 * 1024 * 1024)
+        return fail("shader-assembly-failed");
+    if (FAILED(dxc.validator->Validate(code.Get(), DxcValidatorFlags_InPlaceEdit, &validated)) || !succeeded(validated.Get()))
+        return fail("shader-validation-failed");
+    const auto *bytes = static_cast<const unsigned char *>(code->GetBufferPointer());
+    out.assign(bytes, bytes + code->GetBufferSize());
+    return true;
+}
 inline bool BuildRuntimeShader(const void *native, size_t size, HMODULE module,
-                               std::vector<unsigned char> &out, const char *&status) noexcept {
+                               std::vector<unsigned char> &out, const char *&status,
+                               rrtiming::Local *local = nullptr) noexcept {
+    using rrtiming::Scope;
+    using rrtiming::Stage;
     out.clear();
     status = "unsupported-subsurface-scattering-shader";
-    if (!SupportedRuntimeShader(native, size))
+    const auto *known = KnownVariant(native, size);
+    if (!known && !StructuralCandidate(native, size))
         return false;
     try {
         using Microsoft::WRL::ComPtr;
         status = "shader-compiler-unavailable";
-        auto create = module ? reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(module, "DxcCreateInstance")) : nullptr;
-        if (!create)
+        ShaderTools dxc;
+        if (!dxc.Create(module))
             return false;
-        ComPtr<IDxcLibrary> library;
-        ComPtr<IDxcCompiler> compiler;
-        ComPtr<IDxcAssembler> assembler;
-        ComPtr<IDxcValidator> validator;
-        if (FAILED(create(CLSID_DxcLibrary, IID_PPV_ARGS(&library))) ||
-            FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))) ||
-            FAILED(create(CLSID_DxcAssembler, IID_PPV_ARGS(&assembler))) ||
-            FAILED(create(CLSID_DxcValidator, IID_PPV_ARGS(&validator))))
-            return false;
-        ComPtr<IDxcBlobEncoding> source, disassembly, modified;
+        std::string text;
         status = "shader-disassembly-failed";
-        if (FAILED(library->CreateBlobWithEncodingFromPinned(native, UINT32(size), 0, &source)) ||
-            FAILED(compiler->Disassemble(source.Get(), &disassembly)) || !disassembly ||
-            disassembly->GetBufferSize() > 4 * 1024 * 1024)
+        if (Scope s(Stage::Disassemble, local); !dxc.Disassemble(native, size, text))
             return false;
-        std::string text(static_cast<const char *>(disassembly->GetBufferPointer()), disassembly->GetBufferSize());
-        while (!text.empty() && text.back() == '\0') text.pop_back();
+        // Captured builds must match too, so the structure check is proven on them.
+        status = "unsupported-subsurface-scattering-structure";
+        if (Scope s(Stage::Structure, local); !StructureMatches(text, InputStructure))
+            return false;
         status = "shader-transformation-rejected";
-        if (!TransformRuntimeShader(text))
+        if (Scope s(Stage::Transform, local); !TransformRuntimeShader(text))
             return false;
-        status = "shader-assembly-failed";
-        if (FAILED(library->CreateBlobWithEncodingOnHeapCopy(text.data(), UINT32(text.size()), CP_UTF8, &modified)))
-            return false;
-        auto succeeded = [](IDxcOperationResult *op) {
-            HRESULT result = E_FAIL;
-            return op && SUCCEEDED(op->GetStatus(&result)) && SUCCEEDED(result);
-        };
-        ComPtr<IDxcOperationResult> assembled, validated;
-        ComPtr<IDxcBlob> code;
-        if (FAILED(assembler->AssembleToContainer(modified.Get(), &assembled)) || !succeeded(assembled.Get()) ||
-            FAILED(assembled->GetResult(&code)) || !code)
-            return false;
-        status = "shader-validation-failed";
-        if (FAILED(validator->Validate(code.Get(), DxcValidatorFlags_InPlaceEdit, &validated)) || !succeeded(validated.Get()))
+        std::vector<unsigned char> code;
+        if (Scope s(Stage::Assemble, local); !AssembleShader(dxc, text, code, &status))
             return false;
         // Pins the complete validated output, including original instructions,
-        // bindings and output signatures, to the tested transformation result.
+        // bindings and output signatures, to the tested transformation result:
+        // byte for byte for a captured build, structurally for another build.
+        Scope check(Stage::OutputCheck, local);
         status = "shader-output-mismatch";
-        if (code->GetBufferSize() != 63128 || !ShaderDigest(code->GetBufferPointer(), code->GetBufferSize(),
-                "bfa44f35ca4c29500ff5f629ba3504c86eb30d7ea38c92067cb8a788780aac8b"))
+        if (known && (code.size() != known->output_bytes ||
+                      !ShaderDigest(code.data(), code.size(), known->output_sha256)))
             return false;
-        const auto *bytes = static_cast<const unsigned char *>(code->GetBufferPointer());
-        out.assign(bytes, bytes + code->GetBufferSize());
+        std::string generated;
+        if (!dxc.Disassemble(code.data(), code.size(), generated) ||
+            !StructureMatches(generated, OutputStructure))
+            return false;
+        out = std::move(code);
         status = "ready";
         return true;
     } catch (...) {
@@ -142,31 +391,325 @@ inline bool BuildRuntimeShader(const void *native, size_t size, HMODULE module,
         return false;
     }
 }
-class RuntimeShaderCache {
+// Builds accepted at runtime are identified at draws by FNV-1a64 and size,
+// like the captured builds. Reads take no lock: draws check this per call.
+class RecognizedShaders {
+    static constexpr unsigned Capacity = 16;
     std::mutex mutex;
-    bool attempted{};
-    const char *result = "not-prepared";
-    std::shared_ptr<const std::vector<unsigned char>> code;
+    std::array<std::atomic<uint64_t>, Capacity> hashes{};
+    std::array<std::atomic<size_t>, Capacity> sizes{};
+    std::atomic<unsigned> count{};
 public:
+    void Add(uint64_t hash, size_t bytes) {
+        std::lock_guard lock(mutex);
+        const auto n = count.load(std::memory_order_relaxed);
+        if (Has(hash, bytes) || n >= Capacity)
+            return;
+        hashes[n].store(hash, std::memory_order_relaxed);
+        sizes[n].store(bytes, std::memory_order_relaxed);
+        count.store(n + 1, std::memory_order_release);
+    }
+    bool Has(uint64_t hash, size_t bytes) const {
+        if (KnownVariant(hash, bytes))
+            return true;
+        const auto n = count.load(std::memory_order_acquire);
+        for (unsigned i = 0; i < n; ++i)
+            if (hashes[i].load(std::memory_order_relaxed) == hash &&
+                sizes[i].load(std::memory_order_relaxed) == bytes)
+                return true;
+        return false;
+    }
+    bool HasHash(uint64_t hash) const {
+        for (const auto &v : Variants)
+            if (v.hash == hash)
+                return true;
+        const auto n = count.load(std::memory_order_acquire);
+        for (unsigned i = 0; i < n; ++i)
+            if (hashes[i].load(std::memory_order_relaxed) == hash)
+                return true;
+        return false;
+    }
+};
+// The scene constant buffer size a disassembly declares, from the same
+// resource line StructuralText normalizes.
+inline bool DeclaredSceneBytes(const std::string &text, size_t &bytes) {
+    static const std::regex resource(
+        R"(^!\d+ = !\{i32 0, %hostlayout\.scene\* undef, !"", i32 0, i32 3, i32 1, i32 (\d{1,6}), null\}\r?$)");
+    const std::string marker = "%hostlayout.scene* undef";
+    std::string found;
+    for (auto at = text.find(marker); at != std::string::npos; at = text.find(marker, at + 1)) {
+        const auto begin = text.rfind('\n', at), end = text.find('\n', at);
+        const auto line = text.substr(begin == std::string::npos ? 0 : begin + 1,
+                                      (end == std::string::npos ? text.size() : end) -
+                                          (begin == std::string::npos ? 0 : begin + 1));
+        if (line.empty() || line[0] != '!')
+            continue;
+        if (!found.empty())
+            return false;
+        found = line;
+    }
+    std::smatch m;
+    if (found.empty() || !std::regex_match(found, m, resource))
+        return false;
+    bytes = std::stoul(m[1].str());
+    return true;
+}
+// Changes whenever TransformRuntimeShader, AssembleShader or the acceptance
+// rules change, so that a cached guide is never reused across them. The
+// shipped fingerprints are part of the cache key too.
+inline constexpr unsigned TransformVersion = 1;
+inline std::string TransformIdentity() {
+    std::string id = "sss-guide/" + std::to_string(TransformVersion) + "/" + InputStructure +
+                     "/" + OutputStructure + "/" + std::to_string(SceneReadBytes);
+    for (const auto &v : Variants)
+        id += std::string("/") + v.sha256 + ">" + v.output_sha256;
+    return id;
+}
+// Accepts a cached guide for this input by the same rules a fresh preparation
+// ends with, without transforming or assembling again. A captured build's
+// guide must be its pinned output byte for byte. Another build must still
+// pass the input structure check, and its guide must pass DXC validation, the
+// output structure check and declare the input's own scene buffer size. The
+// cache file's own checksum authorizes nothing.
+inline bool AcceptCachedShader(const void *native, size_t size, HMODULE module,
+                               const std::vector<unsigned char> &code, const char *&status,
+                               rrtiming::Local *local = nullptr) noexcept {
+    using rrtiming::Scope;
+    using rrtiming::Stage;
+    status = "cached-shader-invalid";
+    if (code.empty() || code.size() > 4 * 1024 * 1024)
+        return false;
+    try {
+        if (const auto *known = KnownVariant(native, size)) {
+            status = "cached-shader-output-mismatch";
+            const bool accepted = code.size() == known->output_bytes &&
+                                  ShaderDigest(code.data(), code.size(), known->output_sha256);
+            if (accepted)
+                status = "ready";
+            return accepted;
+        }
+        status = "unsupported-subsurface-scattering-shader";
+        if (!StructuralCandidate(native, size))
+            return false;
+        status = "shader-compiler-unavailable";
+        ShaderTools dxc;
+        if (!dxc.Create(module))
+            return false;
+        std::string input, generated;
+        size_t input_bytes = 0, output_bytes = 0;
+        status = "shader-disassembly-failed";
+        if (Scope s(Stage::Disassemble, local); !dxc.Disassemble(native, size, input))
+            return false;
+        status = "unsupported-subsurface-scattering-structure";
+        if (Scope s(Stage::Structure, local);
+            !StructureMatches(input, InputStructure) || !DeclaredSceneBytes(input, input_bytes))
+            return false;
+        Scope check(Stage::OutputCheck, local);
+        using Microsoft::WRL::ComPtr;
+        ComPtr<IDxcBlobEncoding> blob;
+        ComPtr<IDxcOperationResult> validated;
+        HRESULT result = E_FAIL;
+        status = "cached-shader-validation-failed";
+        if (FAILED(dxc.library->CreateBlobWithEncodingOnHeapCopy(code.data(), UINT32(code.size()),
+                                                                 0, &blob)) ||
+            FAILED(dxc.validator->Validate(blob.Get(), DxcValidatorFlags_Default, &validated)) ||
+            !validated || FAILED(validated->GetStatus(&result)) || FAILED(result))
+            return false;
+        status = "cached-shader-output-mismatch";
+        if (!dxc.Disassemble(code.data(), code.size(), generated) ||
+            !StructureMatches(generated, OutputStructure) ||
+            !DeclaredSceneBytes(generated, output_bytes) || output_bytes != input_bytes)
+            return false;
+        status = "ready";
+        return true;
+    } catch (...) {
+        status = "shader-preparation-exception";
+        return false;
+    }
+}
+// A cached guide refused for these reasons may still be good: it is kept.
+inline bool CachedRejectionTransient(const char *status) noexcept {
+    return !status || !std::strcmp(status, "shader-compiler-unavailable") ||
+           !std::strcmp(status, "shader-preparation-exception");
+}
+// One slot per distinct input (SHA-256 and size): an input never receives
+// another build's guide, and a failure stays with the input that caused it.
+// With a disk cache, a guide this PC prepared before is reused after it is
+// accepted again; each preparation has numbered start and end records.
+class RuntimeShaderCache {
+    struct Slot {
+        std::array<unsigned char, 32> digest{};
+        size_t size{};
+        unsigned id{};
+        std::atomic<bool> announced{};
+        std::mutex mutex;
+        bool attempted{};
+        const char *result = "not-prepared";
+        std::shared_ptr<const std::vector<unsigned char>> code;
+    };
+    std::mutex mutex;
+    std::vector<std::shared_ptr<Slot>> slots;
+    RecognizedShaders *recognized{};
+    rrshadercache::DiskCache *disk{};
+    rrtiming::Timing *timing{};
+    std::mutex identity_mutex;
+    HMODULE identity_module{};
+    std::string identity;
+    // The compiler's identity, hashed once per module.
+    const std::string &CompilerIdentity(HMODULE module, rrtiming::Local *local) {
+        std::lock_guard lock(identity_mutex);
+        if (module && module != identity_module) {
+            rrtiming::Scope scope(rrtiming::Stage::CompilerIdentity, local, timing);
+            identity_module = module;
+            if (!rrshadercache::ModuleIdentity(module, identity))
+                identity.clear();
+        }
+        static const std::string none;
+        return module ? identity : none;
+    }
+    rrtiming::Timing &Timer() { return timing ? *timing : rrtiming::Global(); }
+
+  public:
+    static constexpr size_t Capacity = 16;
+    // The disk cache identity of an input's guide.
+    void Identify(const std::array<unsigned char, 32> &digest, size_t size, HMODULE module,
+                  rrshadercache::Identity &id, rrtiming::Local *local = nullptr) {
+        id.role = "sss-guide";
+        id.transform = TransformIdentity();
+        id.compiler = CompilerIdentity(module, local);
+        id.input = digest;
+        id.input_size = size;
+    }
+    explicit RuntimeShaderCache(RecognizedShaders *recognized = nullptr,
+                                rrshadercache::DiskCache *disk = nullptr,
+                                rrtiming::Timing *timing = nullptr)
+        : recognized(recognized), disk(disk), timing(timing) {}
     std::shared_ptr<const std::vector<unsigned char>> Get(const void *native, size_t size,
-                                                         HMODULE module, const char *&status) {
-        if (!SupportedRuntimeShader(native, size)) {
+                                                         HMODULE module, const char *&status,
+                                                         bool *attempted = nullptr,
+                                                         const char **cache = nullptr) {
+        if (attempted)
+            *attempted = false;
+        if (cache)
+            *cache = "not-used";
+        std::array<unsigned char, 32> digest{};
+        if ((!KnownVariant(native, size) && !StructuralCandidate(native, size)) ||
+            !Sha256(native, size, digest)) {
             status = "unsupported-subsurface-scattering-shader";
             return {};
         }
-        std::lock_guard lock(mutex);
-        if (!attempted) {
-            attempted = true;
-            auto prepared = std::make_shared<std::vector<unsigned char>>();
-            if (BuildRuntimeShader(native, size, module, *prepared, result))
-                code = std::move(prepared);
+        auto &t = Timer();
+        std::shared_ptr<Slot> slot;
+        {
+            std::lock_guard lock(mutex);
+            for (const auto &s : slots)
+                if (s->size == size && s->digest == digest)
+                    slot = s;
+            if (!slot) {
+                if (slots.size() >= Capacity) {
+                    status = "too-many-subsurface-scattering-shaders";
+                    return {};
+                }
+                slot = std::make_shared<Slot>();
+                slot->digest = digest;
+                slot->size = size;
+                slot->id = unsigned(slots.size() + 1);
+                slots.push_back(slot);
+            }
         }
-        status = result;
+        // Announced by the first request, before any wait, so that a
+        // preparation that never finishes still has its start record.
+        if (!slot->announced.exchange(true)) {
+            t.preparations_started.fetch_add(1, std::memory_order_relaxed);
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                          "RR shader preparation #%u started: input fnv=%016llx bytes=%zu %s", slot->id,
+                          (unsigned long long)ShaderHash(native, size), size,
+                          KnownVariant(native, size) ? "captured" : "structural-candidate");
+            t.Log(line);
+        }
+        std::string record;
+        std::shared_ptr<const std::vector<unsigned char>> code;
+        {
+            std::unique_lock lock(slot->mutex, std::try_to_lock);
+            if (!lock) {
+                rrtiming::Scope wait(rrtiming::Stage::SlotWait, nullptr, &t);
+                lock.lock();
+            }
+            if (!slot->attempted) {
+                slot->attempted = true;
+                if (attempted)
+                    *attempted = true;
+                rrtiming::Local local;
+                rrshadercache::Outcome outcome;
+                auto prepared = std::make_shared<std::vector<unsigned char>>();
+                bool ready;
+                {
+                    rrtiming::Scope total(rrtiming::Stage::Preparation, &local, &t);
+                    rrshadercache::Identity id;
+                    rrshadercache::Identity *keyed = nullptr;
+                    if (disk) {
+                        Identify(digest, size, module, id, &local);
+                        keyed = &id;
+                    }
+                    ready = rrshadercache::Prepare(
+                        disk, keyed, *prepared, slot->result, outcome,
+                        [&](std::vector<unsigned char> &out, const char *&why) {
+                            return BuildRuntimeShader(native, size, module, out, why, &local);
+                        },
+                        [&](const std::vector<unsigned char> &out, const char *&why) {
+                            return AcceptCachedShader(native, size, module, out, why, &local);
+                        },
+                        [](const char *why) { return CachedRejectionTransient(why); },
+                        &local, &t);
+                }
+                if (ready) {
+                    slot->code = std::move(prepared);
+                    if (recognized)
+                        recognized->Add(ShaderHash(native, size), size);
+                }
+                t.preparations_finished.fetch_add(1, std::memory_order_relaxed);
+                using rrtiming::Ms;
+                using rrtiming::Stage;
+                auto ms = [&](Stage s) { return Ms(local.ns[unsigned(s)]); };
+                char line[512];
+                std::snprintf(
+                    line, sizeof(line),
+                    "RR shader preparation #%u finished in %.1f ms: %s; cache %s%s%s, store %s; "
+                    "compiler-identity %.1f, cache-load %.1f, cache-validate %.1f, disassembly %.1f, "
+                    "structure %.1f, transform %.1f, assembly %.1f, output-check %.1f, "
+                    "cache-store %.1f ms",
+                    slot->id, ms(Stage::Preparation), slot->result, outcome.cache,
+                    outcome.invalid ? ":" : "", outcome.invalid ? outcome.invalid : "",
+                    outcome.store, ms(Stage::CompilerIdentity), ms(Stage::CacheLoad),
+                    ms(Stage::CacheValidate), ms(Stage::Disassemble), ms(Stage::Structure),
+                    ms(Stage::Transform), ms(Stage::Assemble), ms(Stage::OutputCheck),
+                    ms(Stage::CacheStore));
+                record = line;
+                if (cache)
+                    *cache = outcome.cache;
+            }
+            status = slot->result;
+            code = slot->code;
+        }
+        if (!record.empty())
+            t.Log(record.c_str());
         return code;
     }
 };
+inline RecognizedShaders &Recognized() {
+    static RecognizedShaders shaders;
+    return shaders;
+}
+// The SSS composite is also the transparency producer. A bound pipeline's
+// shader hash (bound) and its native bytecode (observed, bytes) must name the
+// same recognized build.
+inline bool CompositeShader(uint64_t bound, uint64_t observed, size_t bytes) {
+    return observed == bound && Recognized().Has(observed, bytes);
+}
 inline RuntimeShaderCache &RuntimeShader() {
-    static RuntimeShaderCache cache;
+    static rrshadercache::DiskCache disk(rrshadercache::DiskCache::DefaultDirectory());
+    static RuntimeShaderCache cache(&Recognized(), &disk);
     return cache;
 }
 } // namespace rrsss

@@ -74,6 +74,66 @@ static bool SparsePair(reshade::api::command_list *list, ID3D12GraphicsCommandLi
     }
     return rrsparsecopy::Shape(out);
 }
+// Edge-aware no-history fill (rr_edge_fill.h): latest outcome for the panel, changes logged.
+static std::atomic<unsigned> edge_fill_state{}, edge_fill_reports{};
+static std::atomic<ULONGLONG> edge_fill_time{};
+static void ReportEdgeFill(rredgefill::State state, const char *detail = nullptr) {
+    edge_fill_time = GetTickCount64();
+    if (edge_fill_state.exchange(unsigned(state)) == unsigned(state) || edge_fill_reports++ >= 16)
+        return;
+    char line[256];
+    snprintf(line, sizeof(line), "Subsurface Scattering edge-aware fill: %s%s%s",
+             rredgefill::Label(state), detail ? "; " : "", detail ? detail : "");
+    WriteLog(line);
+}
+static rredgefill::State EdgeFillState() {
+    return GetTickCount64() - edge_fill_time.load() <= 1000
+               ? rredgefill::State(edge_fill_state.load())
+               : rredgefill::State::Idle;
+}
+// The edge fill's surface: the PackedSurface this native spatial dispatch itself binds at
+// t13 (its same-surface input) must be this frame's prepass surface in the slot, in a
+// tracked readable state on this list; plus that slot's converted guides. Like the
+// dispatch's own t0/t1 (SparsePair), a null-sided aliasing barrier on the list does not
+// disqualify it: the game reads it here. An aliasing barrier naming it does.
+static const char *SparseEdgeInputs(reshade::api::command_list *list,
+                                    ID3D12GraphicsCommandList *native, uint64_t effective,
+                                    rrsparsecopy::EdgeInputs &out, char (&detail)[96]) {
+    auto *state = rrbindings::State(list->get_device());
+    if (!state || !state->tracker.Healthy())
+        return "binding tracker unavailable";
+    if (!LiveRR().EdgeSurface(native, out.surface, out.normal, out.status))
+        return "no converted guides for this frame";
+    auto root = state->tracker.CurrentLayout(list->get_native());
+    auto loc = state->tracker.Find(list->get_native(), {false, 13});
+    if (!loc.known || !ComputeState().TableBound(native, (ID3D12PipelineState *)effective,
+                                                 (ID3D12RootSignature *)root, loc.parameter,
+                                                 loc.table))
+        return "native t13 table unproven";
+    auto slot = rrbindings::Resolve(list->get_device(), {loc.table}, loc.offset);
+    if (!slot.heap)
+        return "native t13 descriptor unresolved";
+    const auto v = state->tracker.Get(slot);
+    if (!v.known || v.buffer || !v.resource ||
+        v.view_type != unsigned(reshade::api::resource_view_type::texture_2d) || v.first_level ||
+        v.levels != 1 || v.first_layer || v.layers > 1 ||
+        v.view_format != unsigned(DXGI_FORMAT_R32G32B32A32_UINT))
+        return "native t13 view unexpected";
+    auto bound = fg::NativeObject<ID3D12Resource>((ID3D12Resource *)v.resource);
+    if (!bound || bound.Get() != out.surface.Get())
+        return "native t13 is not this frame's prepass surface";
+    rrsparsecopy::Layouts::Alias alias{};
+    if (!SparseLayouts().Get(native, bound.Get(), out.surface_state, alias))
+        return "prepass surface state not tracked on this list";
+    if (alias == rrsparsecopy::Layouts::Alias::Named)
+        return "prepass surface named by an aliasing barrier";
+    if (!rrsparsecopy::Readable(out.surface_state)) {
+        snprintf(detail, sizeof(detail), "prepass surface state 0x%x is not read-only",
+                 unsigned(out.surface_state));
+        return detail;
+    }
+    return nullptr;
+}
 static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
     const auto binding = ShaderDispatches().Get(list->get_native());
     if (binding.shader != rrbypass::Temporal && binding.shader != rrbypass::Spatial)
@@ -125,10 +185,14 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
     rrinternal::Scope ignoreCopies;
     rrcompute::Tracker::Internal ignoreState;
     const auto rates = LiveRR().SamplingData(native.Get());
-    // SSS-masked sources read an earlier frame's SSS guide, which only the private
-    // root binds; without the guide or that path they prepare raw lighting.
+    // An admitted guide gates coverage. Only matched, drawn surfaces take native history;
+    // without a usable record, prepare raw lighting.
     unsigned mask_age{};
     const auto mask = LiveRR().SssMask(native.Get(), &mask_age);
+    rrsparsecopy::CoverageInputs coverage;
+    auto coverage_reason = rrssscov::FrameReason::NoStorage;
+    const bool coverage_ready =
+        mask && LiveRR().SssCoverage(native.Get(), coverage, coverage_reason);
     const auto cbvs = ComputeState().RateCBVs(
         native.Get(), (ID3D12PipelineState *)effective,
         (ID3D12RootSignature *)rrbindings::State(device)->tracker.CurrentLayout(
@@ -150,11 +214,19 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         rrbypass::Fail(device, text);
         return false;
     }
-    bool masked = false;
-    bool replaced = mask && privateValid &&
+    // Without proven edge-fill inputs, covered pixels use the group-mean fallback.
+    const bool edge_wanted = mask && privateValid;
+    rrsparsecopy::EdgeInputs edge;
+    char edge_detail[96]{};
+    const char *edge_why =
+        edge_wanted ? SparseEdgeInputs(list, native.Get(), effective, edge, edge_detail) : nullptr;
+    bool masked = false, edged = false, covered = false;
+    bool replaced = mask && privateValid && coverage_ready &&
                     SparsePool().Apply(native.Get(), input, output, scale.Get(),
                                        (ID3D12PipelineState *)effective, x, y, z, &rates, nullptr,
-                                       &privateRestore, lobe, mask.Get(), &masked);
+                                       &privateRestore, lobe, mask.Get(), &masked,
+                                       edge_wanted && !edge_why ? &edge : nullptr, &edged,
+                                       coverage_ready ? &coverage : nullptr, &covered);
     // A rejected attempt records nothing; the usual path then prepares raw lighting.
     if (!replaced)
         replaced = SparsePool().Apply(native.Get(), input, output, scale.Get(),
@@ -162,13 +234,22 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                                       cbvs.valid ? &cbvs : nullptr,
                                       cbvs.valid ? nullptr : &privateRestore, lobe);
     if (replaced && LiveRR().SssEnabled()) {
-        char why[64]{};
+        char why[96]{};
         if (masked)
-            snprintf(why, sizeof(why), "guide %u frame(s) old", mask_age);
-        ReportSssMask(masked  ? rrsssmask::State::Active
+            snprintf(why, sizeof(why), "guide %u frame(s) old%s", mask_age,
+                     covered ? ", coverage record selecting" : "");
+        // Without a usable record the coverage reason; with one, the masked preparation
+        // itself refused (its private snapshot reason below, or the coverage inputs).
+        const bool coverage_why = mask && !masked && privateValid;
+        if (coverage_why)
+            snprintf(why, sizeof(why), "%s",
+                     coverage_ready ? "coverage inputs or shader variant refused (shape, device "
+                                      "or pipeline)"
+                                    : rrssscov::Label(coverage_reason));
+        ReportSssMask(masked ? rrsssmask::State::CoverageActive
                       : !mask ? rrsssmask::State::NoGuide
-                              : rrsssmask::State::Unsupported,
-                      masked                               ? why
+                              : rrsssmask::State::CoverageWaiting,
+                      masked || coverage_why ? why
                       : !mask                              ? nullptr
                       : !privateRestore.valid              ? privateRestore.status
                       : !privateRestore.complete           ? "private snapshot arguments incomplete"
@@ -176,6 +257,11 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                       : !privateValid ? "private snapshot root differs from the bound root"
                                       : "masked preparation rejected (guide, format or shader)");
     }
+    if (replaced && masked)
+        ReportEdgeFill(edged ? rredgefill::State::Active : rredgefill::State::Unavailable,
+                       edged || !edge_wanted ? nullptr
+                       : edge_why            ? edge_why
+                                             : "surface inputs rejected (shape, format or state)");
     if (replaced) {
         rrbypass::Corrected(device);
     }

@@ -21,6 +21,7 @@ struct PipelinePatch {
     std::shared_ptr<const std::vector<unsigned char>> prepared;
     reshade::api::blend_desc blend{};
     reshade::api::depth_stencil_desc inverse{};
+    bool helper_marker{};
     unsigned count{};
     const char *status = "not-prepared";
     PipelinePatch() = default;
@@ -33,7 +34,10 @@ struct PipelinePatch {
             h = (h ^ b[i]) * 1099511628211ull;
         return h;
     }
-    static bool IsTarget(unsigned n, const reshade::api::pipeline_subobject *objects) {
+    // rejected names why a structurally similar build was refused.
+    static bool IsTarget(unsigned n, const reshade::api::pipeline_subobject *objects,
+                         const char *&rejected) {
+        rejected = nullptr;
         if (!objects || !n || n > 64)
             return false;
         for (unsigned i = 0; i < n; ++i) {
@@ -42,9 +46,24 @@ struct PipelinePatch {
                 !o.data)
                 continue;
             const auto &s = *static_cast<const reshade::api::shader_desc *>(o.data);
-            if (s.code && s.code_size == 56388 &&
-                Hash(s.code, s.code_size) == 0x9ee7cea57f70d741ull)
+            if (!s.code || !s.code_size || s.code_size > 4 * 1024 * 1024)
+                continue;
+            // The container check is cheap and skips unrelated shaders.
+            rrtiming::Global().pixel_shaders.fetch_add(1, std::memory_order_relaxed);
+            if (!StructuralCandidate(s.code, s.code_size))
+                continue;
+            rrtiming::Global().candidates.fetch_add(1, std::memory_order_relaxed);
+            if (Recognized().Has(Hash(s.code, s.code_size), s.code_size))
                 return true;
+            // Another build is prepared here, once per input, so that its
+            // identity is known before any of its draws. Its refusal is
+            // reported once, not for every pipeline that uses it.
+            const char *status = nullptr;
+            bool attempted = false;
+            if (RuntimeShader().Get(s.code, s.code_size, ReplayCompiler(), status, &attempted))
+                return true;
+            if (attempted)
+                rejected = status;
         }
         return false;
     }
@@ -81,8 +100,8 @@ struct PipelinePatch {
                 if (o.count != 1)
                     return false;
                 const auto &s = *static_cast<const shader_desc *>(o.data);
-                if (!s.code || s.code_size != 56388 ||
-                    Hash(s.code, s.code_size) != 0x9ee7cea57f70d741ull) {
+                if (!s.code || !s.code_size || s.code_size > 4 * 1024 * 1024 ||
+                    !Recognized().Has(Hash(s.code, s.code_size), s.code_size)) {
                     status = "unsupported-sss-shader";
                     return false;
                 }
@@ -225,13 +244,17 @@ struct PipelinePatch {
         return true;
     }
 
-    bool PrepareHelper(unsigned n, const reshade::api::pipeline_subobject *source) {
+    // marker: the Subsurface Scattering coverage initializer (RRSSSStencilMarkerPS), which
+    // differs from the baseline initializer only in its pixel shader.
+    bool PrepareHelper(unsigned n, const reshade::api::pipeline_subobject *source,
+                       bool marker = false) {
         using namespace reshade::api;
         using T = pipeline_subobject_type;
         if (!Prepare(n, source))
             return false;
-        shader.code = RRSSSStencilPS;
-        shader.code_size = sizeof(RRSSSStencilPS);
+        helper_marker = marker;
+        shader.code = marker ? RRSSSStencilMarkerPS : RRSSSStencilPS;
+        shader.code_size = marker ? sizeof(RRSSSStencilMarkerPS) : sizeof(RRSSSStencilPS);
         formats[0] = format::r16_float;
         for (unsigned i = 0; i < count; ++i) {
             auto &o = objects[i];
@@ -266,9 +289,12 @@ struct PipelinePatch {
     NativePipelineObservation Expected(const NativePipelineObservation &original,
                                        bool helper) const {
         auto o = original;
-        const void *code = helper ? static_cast<const void *>(RRSSSStencilPS)
-                                  : static_cast<const void *>(prepared->data());
-        const size_t bytes = helper ? sizeof(RRSSSStencilPS) : prepared->size();
+        const void *code = !helper        ? static_cast<const void *>(prepared->data())
+                           : helper_marker ? static_cast<const void *>(RRSSSStencilMarkerPS)
+                                           : static_cast<const void *>(RRSSSStencilPS);
+        const size_t bytes = !helper        ? prepared->size()
+                             : helper_marker ? sizeof(RRSSSStencilMarkerPS)
+                                             : sizeof(RRSSSStencilPS);
         o.shaders[1] = {bytes, true, PipelineProof::ByteHash(code, bytes)};
         o.cached_bytes = 0;
         o.cached_present = false;
@@ -296,6 +322,8 @@ inline constexpr GUID SssAlternateId = {
     0x933aa612, 0x6469, 0x4303, {0xa1, 0x51, 0xc6, 0x8a, 0x54, 0x37, 0xe5, 0x92}};
 inline constexpr GUID SssStencilId = {
     0x813aa482, 0x9392, 0x42f2, {0x95, 0x94, 0x84, 0x63, 0x25, 0xea, 0x64, 0x17}};
+inline constexpr GUID SssStencilMarkerId = {
+    0x2c6f1d0e, 0x7a43, 0x4b8e, {0x9f, 0x21, 0x5d, 0x3a, 0xc8, 0x61, 0x0b, 0xe4}};
 class PipelineRegistry {
     struct Entry {
         reshade::api::device *device{};
@@ -323,8 +351,12 @@ class PipelineRegistry {
         if (creating || !device || device->get_api() != reshade::api::device_api::d3d12)
             return;
         try {
-            if (!PipelinePatch::IsTarget(n, objects))
+            const char *rejected = nullptr;
+            if (!PipelinePatch::IsTarget(n, objects, rejected)) {
+                if (rejected)
+                    Report((std::string("RR SSS shader build not supported: ") + rejected).c_str());
                 return;
+            }
             if (!original.handle || !layout.handle) {
                 Report("RR exact SSS shader rejected: missing pipeline or layout handle; baseline "
                        "RR retained");
@@ -371,9 +403,13 @@ class PipelineRegistry {
                 const auto expected = description.Expected(observed, helper);
                 PipelineProof::QualityScope quality(native_device.Get(), expected);
                 reshade::api::pipeline made{};
-                if (!device->create_pipeline(layout, description.count, description.objects.data(),
-                                             &made) ||
-                    !made.handle)
+                bool created;
+                {
+                    rrtiming::Scope scope(rrtiming::Stage::AlternateCreate);
+                    created = device->create_pipeline(layout, description.count,
+                                                      description.objects.data(), &made);
+                }
+                if (!created || !made.handle)
                     return false;
                 out = fg::NativeObject<ID3D12PipelineState>(
                     reinterpret_cast<ID3D12PipelineState *>(made.handle));
@@ -424,6 +460,15 @@ class PipelineRegistry {
                 stencil.required = true;
                 stencil.read_mask = depth.desc.FrontFace.StencilReadMask;
                 stencil.replay_geometry = true;
+                // Optional: without it the Subsurface Scattering coverage selection records
+                // no coverage; the guide is unaffected.
+                PipelinePatch marker;
+                if (!marker.PrepareHelper(n, objects, true) ||
+                    !create(marker, true, stencil.marker)) {
+                    stencil.marker.Reset();
+                    Report("Subsurface Scattering coverage initializer unavailable; the "
+                           "coverage selection records no coverage");
+                }
             }
             Microsoft::WRL::ComPtr<ID3D12PipelineState> alternate;
             if (!create(patch, false, alternate)) {
@@ -433,6 +478,8 @@ class PipelineRegistry {
             const bool retained =
                 (!stencil.required || SUCCEEDED(alternate->SetPrivateDataInterface(
                                           SssStencilId, stencil.pipeline.Get()))) &&
+                (!stencil.marker || SUCCEEDED(alternate->SetPrivateDataInterface(
+                                        SssStencilMarkerId, stencil.marker.Get()))) &&
                 SUCCEEDED(native->SetPrivateDataInterface(SssAlternateId, alternate.Get()));
             if (!retained) {
                 Report("RR SSS alternate/helper lifetime attachment failed; baseline RR retained");

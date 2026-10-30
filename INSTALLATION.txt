@@ -1,4 +1,4 @@
-MW4 RAY RECONSTRUCTION - BETA 2
+MW4 RAY RECONSTRUCTION - BETA 3
 By Fever308
 
 ReShade addon for the MW4 campaign executable sp26-cod.exe.
@@ -6,10 +6,11 @@ Ray Reconstruction, the Transparency Guide, and the Subsurface Scattering
 Guide are enabled by default. The initial Ray Reconstruction preset is F.
 Your choices are saved between sessions.
 
-Beta 2 is a beta mostly in name. In my own playtesting, roughly 98% of the
-noise I was seeing is gone, but there may be issues I haven't caught yet.
-That is my personal experience in gameplay, not a measurement; results can
-vary by scene, hardware, and settings.
+Beta 3 adds broader shader compatibility, a local shader cache, weapon depth
+for Frame Generation, and improved Subsurface Scattering history selection
+and filling of missing lighting samples. These lighting and Frame Generation
+improvements apply automatically when their required inputs are available.
+Results can vary by scene, hardware, and settings.
 
 CAMPAIGN ONLY - ANTI-CHEAT WARNING
 
@@ -186,6 +187,8 @@ UNINSTALL / ROLLBACK
 Close the campaign and COD HQ. Remove mw4-rr.addon64 and mw4-rr-dxcompiler.dll
 from the campaign folder. Restore your own backups if rolling back, including
 your game configuration if desired. Leave unrelated addon files intact.
+To also remove the locally prepared shader cache, delete the folder
+%LOCALAPPDATA%\MW4-RR\ShaderCache (paste it into the Explorer address bar).
 
 SUPPORT DEVELOPMENT
 

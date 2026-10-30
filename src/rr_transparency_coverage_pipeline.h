@@ -14,6 +14,7 @@
 #include "rr_sss_vertex_proof.h"
 #include "rr_transparency_blend_policy.h"
 #include "rr_transparency_pixel_proof.h"
+#include "rr_transparency_classifier.h"
 // Variant PSOs of the transparency composites (rrblend::Targets). A variant is
 // the native PSO (same shaders, root signature, raster, depth-stencil and sample
 // state) whose only target is the owned R10G10B10A2_UNORM coverage target and
@@ -44,6 +45,30 @@ inline const Target *PixelTarget(unsigned n, const reshade::api::pipeline_subobj
                 hash = h;
                 return &target;
             }
+    }
+    return nullptr;
+}
+
+// Another build of a composite, accepted by the classifier's structural match
+// (or found in its registry). hash is written only on a match.
+inline const Target *ClassifiedTarget(unsigned n, const reshade::api::pipeline_subobject *objects,
+                                      uint64_t &hash, Classifier &classifier) {
+    if (!objects || !n || n > 64)
+        return nullptr;
+    for (unsigned i = 0; i < n; ++i) {
+        const auto &o = objects[i];
+        if (o.type != reshade::api::pipeline_subobject_type::pixel_shader || o.count != 1 ||
+            !o.data)
+            continue;
+        const auto &s = *static_cast<const reshade::api::shader_desc *>(o.data);
+        if (!s.code || !s.code_size)
+            continue;
+        // The DXC companion is loaded only for a shader that passes the part filter.
+        const auto v = classifier.Classify(s.code, s.code_size);
+        if (v.target) {
+            hash = v.target->hash;
+            return v.target;
+        }
     }
     return nullptr;
 }
@@ -411,6 +436,8 @@ class CoveragePipelineRegistry {
         std::shared_ptr<const Entry> entry;
     };
     std::span<const Target> targets;
+    Classifier *classifier;
+    RecognizedTargets *recognized;
     std::mutex mutex;
     std::unordered_map<uint64_t, std::shared_ptr<const Entry>> entries;
     std::unordered_map<reshade::api::device *, bool> signature_hooks;
@@ -535,8 +562,12 @@ class CoveragePipelineRegistry {
         {
             PipelineProof::QualityScope quality(native_device.Get(), expected);
             reshade::api::pipeline made{};
-            if (!device->create_pipeline(layout, patch.count, patch.objects.data(), &made) ||
-                !made.handle)
+            bool created;
+            {
+                rrtiming::Scope scope(rrtiming::Stage::AlternateCreate);
+                created = device->create_pipeline(layout, patch.count, patch.objects.data(), &made);
+            }
+            if (!created || !made.handle)
                 return "variant-creation-failed";
             out.variant = fg::NativeObject<ID3D12PipelineState>(
                 reinterpret_cast<ID3D12PipelineState *>(made.handle));
@@ -567,8 +598,13 @@ class CoveragePipelineRegistry {
   public:
     void (*logger)(const char *){};
     // targets: the pixel shaders to build variants for (a test passes its own).
-    explicit CoveragePipelineRegistry(std::span<const Target> targets = Targets)
-        : targets(targets) {}
+    // classifier: other builds of the composites, recognized structurally;
+    // nullptr: the exact targets only. recognized: where creation records that
+    // a composite pipeline exists.
+    explicit CoveragePipelineRegistry(std::span<const Target> targets = Targets,
+                                      Classifier *classifier = &Classification(),
+                                      RecognizedTargets *recognized = &Recognized())
+        : targets(targets), classifier(classifier), recognized(recognized) {}
     void Initialize(reshade::api::device *device, reshade::api::pipeline_layout layout, unsigned n,
                     const reshade::api::pipeline_subobject *objects,
                     reshade::api::pipeline original) noexcept {
@@ -581,8 +617,13 @@ class CoveragePipelineRegistry {
             if (original.handle)
                 Forget(original.handle);
             pixel = PixelTarget(n, objects, hash, targets);
+            if (!pixel && classifier)
+                pixel = ClassifiedTarget(n, objects, hash, *classifier);
             if (!pixel)
                 return;
+            // Before the variant is made: the guide's anchor needs only the identity.
+            if (recognized)
+                recognized->Seen(pixel->kind);
             Outcome outcome;
             if (const char *why = Create(device, layout, n, objects, original, *pixel, outcome))
                 Refused(device, pixel->kind, hash, why, outcome);

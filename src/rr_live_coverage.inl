@@ -19,7 +19,7 @@ ULONGLONG blend_last_ran = 0;
 unsigned blend_logged = 0; // one-time log lines: 1 Oit, 2 Refraction, 4 typed, 8 memory
 
 void BlendFailed(const char *what) noexcept {
-    blend_counters.last = rrblend::Reason::Failed;
+    blend_counters.Refuse(rrblend::Reason::Failed);
     if (blend_failed)
         return;
     blend_failed = true;
@@ -34,7 +34,7 @@ void BlendFailed(const char *what) noexcept {
 }
 rrblend::Reason CoverageRefused(rrblend::Reason why) {
     if (blend_enabled)
-        blend_counters.last = why;
+        blend_counters.Refuse(why);
     return why;
 }
 // The coverage ticket keeps the slot like the glass tickets do: the slot-retire
@@ -138,25 +138,30 @@ void CoverageReportLocked(ULONGLONG now) {
         state = "failed";
         window = 3;
         k.last = rrblend::Reason::Failed;
+        k.last_stale = false; // the window's own state, not a remembered refusal
     } else if (blend_unavailable != rrblend::Reason::None) {
         state = "unavailable";
         window = 4;
         k.last = blend_unavailable;
+        k.last_stale = false;
     }
     if (k.covered != blend_mark)
         window |= 8;
     blend_mark = k.covered;
     if (blend_enabled && window == blend_logged_state && now - blend_logged_at < 300000)
         return;
-    char line[400];
+    char line[640];
     if (!blend_enabled) {
         snprintf(line, sizeof(line), "Transparency albedo blend: off");
         blend_off_logged = true;
     } else {
         const int n = rrblend::Report(k, line, sizeof(line), (now - blend_logged_at) / 1000);
-        if (n > 0 && size_t(n) < sizeof(line))
-            snprintf(line + n, sizeof(line) - size_t(n), " changed=%llu state=%s",
-                     static_cast<unsigned long long>(k.covered), state);
+        if (n > 0 && size_t(n) < sizeof(line)) {
+            const int m = snprintf(line + n, sizeof(line) - size_t(n), " changed=%llu state=%s",
+                                   static_cast<unsigned long long>(k.covered), state);
+            if (m > 0 && size_t(n + m) < sizeof(line))
+                rrblend::Detail(k, line + n + m, sizeof(line) - size_t(n + m));
+        }
     }
     Log(line);
     k = {};
@@ -176,6 +181,7 @@ void CoverageHarvest(Slot &s, ULONGLONG now) {
     k.eligible += stats.eligible;
     k.covered += stats.covered;
     k.opacity64 += stats.opacity64;
+    k.touched += stats.touched;
     blend_last_ran = now;
 }
 // AfterSR, on the SR list after GateBegin (guides in NON_PIXEL_SHADER_RESOURCE)
@@ -221,7 +227,7 @@ void SealCoverage(Slot &s, int pre, int capture, int consumer, bool baseline) no
         return;
     ++blend_counters.frames;
     if (admitted)
-        ++blend_counters.admitted;
+        blend_counters.Admitted();
     else
         CoverageRefused(rrblend::Reason::Order);
 }

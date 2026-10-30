@@ -4,6 +4,10 @@
 namespace rrsss {
 struct StencilSetup {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    // The same initializer writing rrssscov::Marker instead of 0 (Subsurface Scattering
+    // coverage record); null when it could not be created, which only keeps the
+    // pass from recording coverage.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> marker;
     UINT read_mask = 255;
     bool required{};
     DXGI_SAMPLE_DESC samples{4, 0};

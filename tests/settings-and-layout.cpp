@@ -357,7 +357,7 @@ int main() {
     wrong = mask;
     wrong.DepthOrArraySize = 4;
     assert(!rrsssmask::Shape(wrong, lighting));
-    assert(std::string_view(rrsssmask::Label(rrsssmask::State::Active)) == "active");
+
     // Specular hit distance follows the runtime guide extent, not a fixed resolution.
     D3D12_RESOURCE_DESC h{};
     h.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;

@@ -26,7 +26,7 @@ uint PixelCode(uint2 p){
 // native temporal output (t0, the native spatial input) instead of raw
 // current-frame lighting. The game's SSS blur spreads sparse, boosted raw
 // diffuse samples into blotches. Its weight bits come along too, matching the
-// temporal-only passthrough comparison.
+// native temporal output.
 // RR_NATIVE_FILL keeps a lobe's fresh sample, without the inverse-probability
 // boost, wherever a ray landed this frame; only unsampled pixels take native.
 #ifndef RR_NATIVE_LOBE
@@ -35,14 +35,80 @@ uint PixelCode(uint2 p){
 #ifndef RR_NATIVE_FILL
 #define RR_NATIVE_FILL 0
 #endif
-// RR_SSS_MASK applies that selection only where the previous frame's SSS guide
-// (t2) is nonzero; every other pixel keeps raw boosted lighting. The game's
-// guide is exactly 0 off SSS pixels. Only the private root binds t2.
+// RR_SSS_MASK applies native lobe selection only where the reprojected SSS coverage
+// record identifies the same drawn surface; all other pixels keep raw boosted lighting.
 #ifndef RR_SSS_MASK
 #define RR_SSS_MASK 0
 #endif
-#if RR_SSS_MASK
-Texture2D<float> sssGuide:register(t2);
+// Coverage (t10) is reprojected with this pixel's depth and both frames' cameras (b4),
+// then accepted only where the stored surface (t9) matches this frame's surface (t8).
+#ifndef RR_SSS_COVERAGE
+#define RR_SSS_COVERAGE 0
+#endif
+#if RR_SSS_COVERAGE!=RR_SSS_MASK
+#error SSS-masked selection requires reprojected coverage
+#endif
+#if RR_SSS_COVERAGE
+#include "rr_guide_math.hlsli"
+cbuffer CoverageControl:register(b4){
+ uint CoverageWidth,CoverageHeight,CoverageReserved,CoverageAge;
+ float CoverageAX,CoverageBX,CoverageAY,CoverageBY;
+ float CurrentScale,CurrentOffset,PreviousScale,PreviousOffset;
+ float4 Reproject0,Reproject1,Reproject2,Reproject3; // current view position -> previous clip
+ float DepthTolerance,NormalCos,WeaponJitterX,WeaponJitterY;
+}
+Texture2D<uint> currentKey:register(t8);
+Texture2D<uint> previousKey:register(t9);
+Texture2D<uint> previousCoverage:register(t10);
+// rrssscov::Pixel
+static const uint PixelCovered=0,PixelNotCovered=1,PixelSky=2,PixelOffScreen=3,
+ PixelDisoccluded=4,PixelNormal=5,PixelUnknown=6;
+struct CoverageSurface{bool present,weapon;float depth;float3 normal;};
+CoverageSurface DecodeKey(uint key){
+ CoverageSurface s;uint high=key>>16;
+ s.present=(high&0x7fffu)!=0;s.weapon=(high&0x8000u)!=0;
+ s.depth=f16tof32(high&0x7fffu);s.normal=RRDecodeSurfaceNormal(key&0xffffu);
+ return s;
+}
+// rrssscov::Decide, same operations in the same order.
+uint CoverageDecide(uint2 p){
+ CoverageSurface s=DecodeKey(currentKey.Load(int3(p,0)));
+ if(!s.present)return PixelSky;
+ float3 q;
+ if(s.weapon)q=float3(float2(p)+0.5+float2(WeaponJitterX,WeaponJitterY),s.depth);
+ else{
+  float z=CurrentScale/(s.depth+CurrentOffset);
+  float nx=(p.x+0.5)/float(CoverageWidth)*2-1,ny=1-(p.y+0.5)/float(CoverageHeight)*2;
+  float3 v=float3(z*(nx*CoverageAX+CoverageBX),z*(ny*CoverageAY+CoverageBY),z);
+  float4 c=v.x*Reproject0+v.y*Reproject1+v.z*Reproject2+Reproject3;
+  if(!(c.w>0))return PixelOffScreen;
+  q=float3((c.x/c.w*0.5+0.5)*CoverageWidth,(0.5-c.y/c.w*0.5)*CoverageHeight,c.w);
+ }
+ if(!(q.x>=0&&q.y>=0&&q.x<float(CoverageWidth)&&q.y<float(CoverageHeight)))return PixelOffScreen;
+ // Coverage only from the footprint texel nearest q that is the same surface on its own.
+ int2 b=int2(floor(q.xy-0.5)),sel=0;
+ bool depthMatch=false;float nearest=1e38;
+ [unroll]for(int dy=0;dy<2;++dy)[unroll]for(int dx=0;dx<2;++dx){
+  int2 t=b+int2(dx,dy);
+  if(any(t<0)||t.x>=int(CoverageWidth)||t.y>=int(CoverageHeight))continue;
+  CoverageSurface u=DecodeKey(previousKey.Load(int3(t,0)));
+  if(!u.present||u.weapon!=s.weapon)continue;
+  float d=u.weapon?u.depth:PreviousScale/(u.depth+PreviousOffset);
+  if(!(q.z>=d*(1-DepthTolerance)&&q.z<=d*(1+DepthTolerance)))continue;
+  depthMatch=true;
+  if(dot(s.normal,u.normal)<NormalCos)continue;
+  float2 e=float2(t)+0.5-q.xy;float n=dot(e,e);
+  if(n<nearest){nearest=n;sel=t;}
+ }
+ if(!depthMatch)return PixelDisoccluded;
+ if(!(nearest<1e38))return PixelNormal;
+ uint v=previousCoverage.Load(int3(sel,0));
+ return v==1?PixelCovered:v==0?PixelNotCovered:PixelUnknown;
+}
+// Native history is used only for matched, drawn surfaces (rrssscov::Native).
+bool CoverageSelect(uint2 p){
+ return CoverageDecide(p)==PixelCovered;
+}
 #endif
 float4 UnpackLobe(uint2 packed){
  return float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
@@ -89,6 +155,59 @@ uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
 #endif
 #if RR_FILL_PREFER_NATIVE&&!RR_FILL_SPATIAL
 #error RR_FILL_PREFER_NATIVE needs RR_FILL_SPATIAL
+#endif
+// RR_FILL_EDGE (as RR_FILL_SPATIAL): the no-history fill weights samples by surface
+// (src/rr_edge_fill.h) instead of the group mean. Neighbours come from the immutable raw
+// snapshot the output was copied from (t3/t4), so support crosses group and strip
+// boundaries without racing the in-place output. Surface inputs are this frame's: the
+// prepass PackedSurface the native spatial denoiser binds (t5) and the guide conversion's
+// normals (t6) and Status (t7), all at the lighting extent. Only the private root binds them.
+#ifndef RR_FILL_EDGE
+#define RR_FILL_EDGE 0
+#endif
+#if RR_FILL_EDGE&&!RR_FILL_SPATIAL
+#error RR_FILL_EDGE needs RR_FILL_SPATIAL
+#endif
+#if RR_FILL_EDGE
+#include "../src/rr_edge_fill.h"
+#ifdef RR_PACKED_FLOAT
+Texture2D<float4> rawLighting:register(t3);
+Texture2D<float> rawWeights:register(t4);
+#else
+Texture2D<uint4> rawLighting:register(t3);
+Texture2D<uint> rawWeights:register(t4);
+#endif
+Texture2D<uint4> packedSurface:register(t5);
+Texture2D<float4> surfaceNormal:register(t6);
+Texture2D<uint> surfaceStatus:register(t7);
+EdgeSurface LoadSurface(uint2 q){
+ const uint4 s=packedSurface.Load(int3(q,0));const float3 n=surfaceNormal.Load(int3(q,0)).xyz;
+ EdgeSurface r;r.depth=asfloat(s.x);r.word=s.w;r.nx=n.x;r.ny=n.y;r.nz=n.z;
+ r.status=surfaceStatus.Load(int3(q,0));return r;
+}
+uint2 EdgeFill(uint2 p,uint w,uint h,out uint outcome){
+ const EdgeSurface c=LoadSurface(p);
+ outcome=RR_EDGE_OUTCOME_UNCLASSIFIED;
+ if(!EdgeClassified(c))return 0;
+ float4 sum=0;float total=0;
+ [unroll]for(int dy=-RR_EDGE_RADIUS;dy<=RR_EDGE_RADIUS;++dy)
+ [unroll]for(int dx=-RR_EDGE_RADIUS;dx<=RR_EDGE_RADIUS;++dx){
+  const int2 q=int2(p)+int2(dx,dy);
+  if((dx==0&&dy==0)||!EdgeInside(q.x,q.y,w,h))continue;
+#ifdef RR_PACKED_FLOAT
+  const uint2 raw=asuint(rawLighting.Load(int3(q,0))).zw;const uint rw=asuint(rawWeights.Load(int3(q,0)));
+#else
+  const uint2 raw=rawLighting.Load(int3(q,0)).zw;const uint rw=rawWeights.Load(int3(q,0));
+#endif
+  const float4 v=UnpackLobe(raw);
+  if(!EdgeFresh(rw,v))continue;
+  EdgeAccumulate(sum,total,v,EdgeWeight(c,LoadSurface(uint2(q)),dx,dy));
+ }
+ float4 mean=0;
+ if(!EdgeResolve(sum,total,mean)){outcome=RR_EDGE_OUTCOME_NO_NEIGHBOUR;return 0;}
+ outcome=RR_EDGE_OUTCOME_EDGE;
+ const uint4 m=f32tof16(mean);return uint2(m.x|(m.y<<16),m.z|(m.w<<16));
+}
 #endif
 #if RR_FILL_SPATIAL
 groupshared uint3 fillTile[256]; // packed lobe 2, fresh flag
@@ -162,7 +281,14 @@ void main(uint3 id:SV_DispatchThreadID){
  outWeights=(outWeights&~0x000fff00u)|((fb?wt:nw)&0x000fff00u);
 #if RR_FILL_SPATIAL
  uint found=1;
- if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY)cb=GroupMean(gt.xy,found);
+ if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY){
+#if RR_FILL_EDGE
+  uint outcome;const uint2 e=EdgeFill(p,w,h,outcome);
+  cb=outcome==RR_EDGE_OUTCOME_EDGE?e:outcome==RR_EDGE_OUTCOME_NO_NEIGHBOUR?uint2(0,0):GroupMean(gt.xy,found);
+#else
+  cb=GroupMean(gt.xy,found);
+#endif
+ }
 #if RR_FILL_PREFER_NATIVE
  if(fb&&((nw>>8)&4095)>=RR_FILL_HISTORY){
   cb=nc.zw;outWeights=(outWeights&~0x000fff00u)|(nw&0x000fff00u);}
@@ -170,8 +296,8 @@ void main(uint3 id:SV_DispatchThreadID){
 #endif
 #endif
 #if RR_SSS_MASK
- // An out-of-range load returns 0, so a mismatched guide leaves raw lighting.
- if(sssGuide.Load(int3(p,0))==0){ca=rawA;cb=rawB;outWeights=rawWeights;}
+ bool sssNative=CoverageSelect(p);
+ if(!sssNative){ca=rawA;cb=rawB;outWeights=rawWeights;}
 #endif
 #ifdef RR_PACKED_FLOAT
  color[p]=asfloat(uint4(ca,cb));

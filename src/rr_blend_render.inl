@@ -76,10 +76,9 @@ static bool CoverageProven(reshade::api::command_list *list, bool indirect,
     }
     // The hash table holds no shader size: the registry entry, which proved
     // hash and size at creation, completes the identity.
-    const rrblend::Target *target{};
-    for (const auto &t : rrblend::Targets)
-        if (t.hash == g.pipeline.shader && (!indirect || t.kind == rrblend::Kind::Oit))
-            target = &t;
+    const rrblend::Target *target = rrblend::Recognized().FindHash(g.pipeline.shader);
+    if (target && indirect && target->kind != rrblend::Kind::Oit)
+        target = nullptr;
     if (!target || !g.pipeline.pipeline || !LiveRR().TransparencyBlendEnabled())
         return false;
     const auto path = indirect                             ? CoveragePath::Resolve

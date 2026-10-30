@@ -12,7 +12,7 @@ static void TransparencyProducerDraw(reshade::api::command_list *list, uint32_t 
                 return;
             g = i->second;
         }
-        if (g.pipeline.shader != 0x9ee7cea57f70d741ull)
+        if (!rrsss::Recognized().HasHash(g.pipeline.shader))
             return;
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
             reinterpret_cast<ID3D12GraphicsCommandList *>(list->get_native()));
@@ -27,8 +27,8 @@ static void TransparencyProducerDraw(reshade::api::command_list *list, uint32_t 
             !rrsss::PipelineProof::NativeObservation(out.pipeline.Get(), observed) ||
             !observed.complete || observed.malformed || observed.unknown ||
             observed.shader_malformed || !observed.shaders[1].code ||
-            observed.shaders[1].hash != 0x9ee7cea57f70d741ull ||
-            observed.shaders[1].bytes != 56388 ||
+            !rrsss::CompositeShader(g.pipeline.shader, observed.shaders[1].hash,
+                                    observed.shaders[1].bytes) ||
             observed.root_identity !=
                 UINT64(ComputeState().TransparencyGraphicsRoot(native.Get()).Get())) {
             return;
@@ -73,17 +73,18 @@ static void OitSceneDraw(reshade::api::command_list *list) noexcept {
                 return;
             graphics = i->second;
         }
-        if (graphics.pipeline.shader != 0xa36d02f6245a4129ull)
+        // Any build the pinned table or the structural match recognized at creation.
+        if (!rrblend::Recognized().IsOit(graphics.pipeline.shader))
             return;
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
             reinterpret_cast<ID3D12GraphicsCommandList *>(list->get_native()));
-        auto reject = [&](const char *why) {
+        auto reject = [&](rrtrans::Note why) {
             if (live)
                 LiveRR().TransparencyUnsupported(why);
         };
         if (!native || !AlbedoInspector().SafeCopies(native.Get()) ||
             !AlbedoInspector().StateCoverage(native.Get())) {
-            reject("RR OIT anchor unsafe or uncovered context");
+            reject(rrtrans::Note::Context);
             return;
         }
         const auto output = ComputeState().CaptureGraphicsOutputs(
@@ -92,7 +93,7 @@ static void OitSceneDraw(reshade::api::command_list *list) noexcept {
             !graphics.targets[0].known ||
             !ComputeState().GraphicsTargetBound(native.Get(), graphics.target_handle,
                                                 graphics.target_serial)) {
-            reject("RR OIT anchor native target/pipeline not proven");
+            reject(rrtrans::Note::Target);
             return;
         }
         const auto &view = graphics.targets[0];
@@ -101,13 +102,13 @@ static void OitSceneDraw(reshade::api::command_list *list) noexcept {
             view.view_type == unsigned(reshade::api::resource_view_type::texture_2d);
         if (view.view_format != unsigned(DXGI_FORMAT_R11G11B10_FLOAT) || !view_type ||
             view.first_level || view.first_layer) {
-            reject("RR OIT anchor target view unsupported");
+            reject(rrtrans::Note::View);
             return;
         }
         auto source =
             fg::NativeObject<ID3D12Resource>(reinterpret_cast<ID3D12Resource *>(view.resource));
         if (!source) {
-            reject("RR glass OIT anchor source identity unavailable");
+            reject(rrtrans::Note::Source);
             return;
         }
         if (live) {

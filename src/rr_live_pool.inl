@@ -59,10 +59,11 @@ bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
         }
     }
     UINT64 required{};
-    if (extra_persistent > UINT64_MAX - persistent.bytes || output > UINT64_MAX - base ||
+    const UINT64 kept = Kept();
+    if (extra_persistent > UINT64_MAX - kept || output > UINT64_MAX - base ||
         // Water storage (rr_water.h) takes the otherwise unused hit term.
         !rrtrans::RequiredSlots(count, base + output, depth, sss, glass, water,
-                                persistent.bytes + extra_persistent, required))
+                                kept + extra_persistent, required))
         return false;
     return budget.Reserve(pipelines.device.Get(), required);
 }
