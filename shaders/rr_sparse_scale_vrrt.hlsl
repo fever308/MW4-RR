@@ -94,19 +94,24 @@ uint CoverageDecide(uint2 p){
   q=float3((c.x/c.w*0.5+0.5)*CoverageWidth,(0.5-c.y/c.w*0.5)*CoverageHeight,c.w);
  }
  if(!(q.x>=0&&q.y>=0&&q.x<float(CoverageWidth)&&q.y<float(CoverageHeight)))return PixelOffScreen;
- int2 b=int2(floor(q.xy-0.5));
- float lo=1e38,hi=0,best=-2;bool matched=false;
+ // Coverage only from the footprint texel nearest q that is the same surface on its own.
+ int2 b=int2(floor(q.xy-0.5)),sel=0;
+ bool depthMatch=false;float nearest=1e38;
  [unroll]for(int dy=0;dy<2;++dy)[unroll]for(int dx=0;dx<2;++dx){
   int2 t=b+int2(dx,dy);
   if(any(t<0)||t.x>=int(CoverageWidth)||t.y>=int(CoverageHeight))continue;
   CoverageSurface u=DecodeKey(previousKey.Load(int3(t,0)));
   if(!u.present||u.weapon!=s.weapon)continue;
   float d=u.weapon?u.depth:PreviousScale/(u.depth+PreviousOffset);
-  lo=min(lo,d);hi=max(hi,d);best=max(best,dot(s.normal,u.normal));matched=true;
+  if(!(q.z>=d*(1-DepthTolerance)&&q.z<=d*(1+DepthTolerance)))continue;
+  depthMatch=true;
+  if(dot(s.normal,u.normal)<NormalCos)continue;
+  float2 e=float2(t)+0.5-q.xy;float n=dot(e,e);
+  if(n<nearest){nearest=n;sel=t;}
  }
- if(!matched||!(q.z>=lo*(1-DepthTolerance)&&q.z<=hi*(1+DepthTolerance)))return PixelDisoccluded;
- if(best<NormalCos)return PixelNormal;
- uint v=previousCoverage.Load(int3(uint2(q.xy),0));
+ if(!depthMatch)return PixelDisoccluded;
+ if(!(nearest<1e38))return PixelNormal;
+ uint v=previousCoverage.Load(int3(sel,0));
  return v==1?PixelCovered:v==0?PixelNotCovered:PixelUnknown;
 }
 void CoverageCount(uint slot,bool value){

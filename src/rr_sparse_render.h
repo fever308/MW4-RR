@@ -250,14 +250,20 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                      covered ? (coverage_apply ? ", coverage record selecting"
                                                : ", coverage record compared")
                              : "");
-        if (mask && coverage_apply && !masked)
-            snprintf(why, sizeof(why), "%s", rrssscov::Label(coverage_reason));
+        // Without a usable record the coverage reason; with one, the masked preparation
+        // itself refused (its private snapshot reason below, or the coverage inputs).
+        const bool coverage_why = mask && coverage_apply && !masked && privateValid;
+        if (coverage_why)
+            snprintf(why, sizeof(why), "%s",
+                     coverage_ready ? "coverage inputs or shader variant refused (shape, device "
+                                      "or pipeline)"
+                                    : rrssscov::Label(coverage_reason));
         ReportSssMask(masked && coverage_apply   ? rrsssmask::State::CoverageActive
                       : masked                   ? rrsssmask::State::Active
                       : !mask                    ? rrsssmask::State::NoGuide
                       : coverage_apply           ? rrsssmask::State::CoverageWaiting
                                                  : rrsssmask::State::Unsupported,
-                      masked || (mask && coverage_apply) ? why
+                      masked || coverage_why ? why
                       : !mask                              ? nullptr
                       : !privateRestore.valid              ? privateRestore.status
                       : !privateRestore.complete           ? "private snapshot arguments incomplete"

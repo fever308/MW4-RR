@@ -247,6 +247,9 @@ static void DrawSssCoverage(bool &changed) {
                         r.waiting ? "waiting for GPU memory" : "waiting for RR");
         else
             ImGui::Text("Coverage record: %s", rrssscov::Label(r.reason));
+        if (r.key_skips)
+            ImGui::Text("Frames without a surface key (GPU %u or more frames behind): %llu",
+                        rrssscov::Ring, (unsigned long long)r.key_skips);
         const auto &t = r.totals;
         const double pixels = double(t.value[rrssscov::Pixels]);
         if (t.frames && pixels > 0) {

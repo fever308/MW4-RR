@@ -244,7 +244,7 @@ struct Constants {
 };
 static_assert(sizeof(Constants) == 128);
 inline constexpr unsigned ConstantWords = sizeof(Constants) / 4;
-// Relative view-depth tolerance against the 2x2 footprint's range, and the minimum cosine
+// Relative view-depth tolerance against each 2x2 footprint texel, and the minimum cosine
 // between the current and stored normals (8-bit octahedral, so loose).
 inline constexpr float DepthTolerance = 0.03f, NormalCos = 0.5f;
 
@@ -420,10 +420,14 @@ Pixel Decide(const Constants &c, uint32_t x, uint32_t y, uint32_t current_key, K
     const auto q = Reproject(c, x, y, s);
     if (!q.ok || q.x < 0 || q.y < 0 || q.x >= float(c.width) || q.y >= float(c.height))
         return Pixel::OffScreen;
-    // 2x2 bilinear footprint around q, inside the record.
+    // 2x2 footprint around q, inside the record. Coverage is read only from a texel that is
+    // the same surface on its own (its depth within tolerance of q's, and its normal), the
+    // one nearest q: at a silhouette the footprint holds both surfaces, and the texel under
+    // q may be the other one.
     const int bx = int(std::floor(q.x - 0.5f)), by = int(std::floor(q.y - 0.5f));
-    float lo = INFINITY, hi = 0, best = -2;
-    bool any = false;
+    bool depth_match = false;
+    float nearest = INFINITY;
+    int sx = 0, sy = 0;
     for (int dy = 0; dy < 2; ++dy)
         for (int dx = 0; dx < 2; ++dx) {
             const int tx = bx + dx, ty = by + dy;
@@ -433,17 +437,26 @@ Pixel Decide(const Constants &c, uint32_t x, uint32_t y, uint32_t current_key, K
             if (!t.present || t.weapon != s.weapon)
                 continue;
             const float d = StoredDepth(c, t);
-            lo = std::fmin(lo, d);
-            hi = std::fmax(hi, d);
-            best = std::fmax(best, s.normal[0] * t.normal[0] + s.normal[1] * t.normal[1] +
-                                       s.normal[2] * t.normal[2]);
-            any = true;
+            if (!(q.z >= d * (1 - c.depth_tolerance) && q.z <= d * (1 + c.depth_tolerance)))
+                continue;
+            depth_match = true;
+            if (s.normal[0] * t.normal[0] + s.normal[1] * t.normal[1] +
+                    s.normal[2] * t.normal[2] <
+                c.normal_cos)
+                continue;
+            const float ex = float(tx) + 0.5f - q.x, ey = float(ty) + 0.5f - q.y;
+            const float e = ex * ex + ey * ey;
+            if (e < nearest) {
+                nearest = e;
+                sx = tx;
+                sy = ty;
+            }
         }
-    if (!any || !(q.z >= lo * (1 - c.depth_tolerance) && q.z <= hi * (1 + c.depth_tolerance)))
+    if (!depth_match)
         return Pixel::Disoccluded;
-    if (best < c.normal_cos)
+    if (nearest == INFINITY)
         return Pixel::Normal;
-    const uint32_t v = previous_coverage(uint32_t(q.x), uint32_t(q.y));
+    const uint32_t v = previous_coverage(uint32_t(sx), uint32_t(sy));
     return v == Drawn ? Pixel::Covered : v == NotDrawn ? Pixel::NotCovered : Pixel::Unknown;
 }
 // Whether the SSS-masked source takes native temporal lobe 2 at a pixel. The baseline takes

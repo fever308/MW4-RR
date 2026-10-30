@@ -70,8 +70,8 @@ def main():
                                *extra)), False)
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))],
         # The same with the panel experiments: the edge-aware no-history fill (src/rr_edge_fill.h,
-        # VariantIndex bit 1) and the "SSS pixel" decision from reprojected Subsurface Scattering
-        # pass coverage (src/rr_sss_coverage.h, bit 2), alone and together.
+        # variant bit 0, EdgeBit) and the "SSS pixel" decision from reprojected Subsurface
+        # Scattering pass coverage (src/rr_sss_coverage.h, bit 1, CoverageBit), alone and together.
         *[(f'RRVrrtScaleSssHistory2{name}{suffix}',
            compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_ssshistory2{tag}',
                         flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',

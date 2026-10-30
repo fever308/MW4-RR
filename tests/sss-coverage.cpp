@@ -275,8 +275,8 @@ void Rejections() {
         for (uint32_t x = 8; x < 16; ++x)
             s.previous[y * w + x] = Key(0.25f, Up);
     assert(s.At(c, 11, 11) == Pixel::Disoccluded);
-    // Only the 2x2 footprint is compared: its far side still matches at the edge.
-    assert(s.At(c, 7, 11) == Pixel::Covered || s.At(c, 7, 11) == Pixel::Disoccluded);
+    // Only the 2x2 footprint is compared, and coverage comes from the texel that matches.
+    assert(s.At(c, 7, 11) == Pixel::Covered);
     assert(s.At(c, 5, 11) == Pixel::Covered);
     // A depth change within tolerance is the same surface; beyond it is not.
     s.previous[20 * w + 20] = s.previous[20 * w + 21] = s.previous[21 * w + 20] =
@@ -313,6 +313,43 @@ void Rejections() {
     assert(Accepted(Pixel::Covered) && Accepted(Pixel::NotCovered) && Accepted(Pixel::Sky));
     assert(!Accepted(Pixel::OffScreen) && !Accepted(Pixel::Disoccluded) &&
            !Accepted(Pixel::Normal) && !Accepted(Pixel::Unknown));
+}
+
+// At a silhouette the footprint holds two surfaces: coverage must come from the texel that is
+// the current surface, never from the texel under q. The camera strafes over background
+// (z 10, not Subsurface Scattering); the record holds a near character (z 2, drawn) from
+// x 32. Every current pixel is background.
+void Silhouette() {
+    const uint32_t w = 64, h = 16;
+    const float dx = 0.5f; // 1.6 px per frame at z 10
+    Scene s(w, h);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            s.current[y * w + x] = Key(0.1f, Up);
+            s.previous[y * w + x] = Key(x >= 32 ? 0.5f : 0.1f, Up);
+            s.coverage[y * w + x] = x >= 32 ? Drawn : NotDrawn;
+        }
+    Constants c{};
+    assert(Make(At(1, dx, 0, 0), At(0, 0, 0, 0), w, h, 1, true, c));
+    const auto q = Reproject(c, 30, 8, Decode(s.current[8 * w + 30]));
+    assert(q.ok && uint32_t(q.x) == 32 && uint32_t(std::floor(q.x - 0.5f)) == 31);
+    assert(s.At(c, 30, 8) == Pixel::NotCovered); // texel 31, not the character's 32
+    for (uint32_t x = 0; x < w; ++x)
+        assert(s.At(c, x, 8) != Pixel::Covered);
+    // The mirror: the record's character is now the current surface at those pixels, the
+    // texel under q is background: never NotCovered from the background.
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            s.previous[y * w + x] = Key(x <= 31 ? 0.1f : 0.5f, Up);
+            s.coverage[y * w + x] = x <= 31 ? Drawn : NotDrawn;
+            s.current[y * w + x] = Key(0.1f, Up);
+        }
+    for (uint32_t x = 0; x < w; ++x) {
+        const auto d = s.At(c, x, 8);
+        const auto r = Reproject(c, x, 8, Decode(s.current[8 * w + x]));
+        if (r.ok && r.x < w && uint32_t(r.x) >= 32) // under q is the near surface
+            assert(d == Pixel::Covered || d == Pixel::Disoccluded || d == Pixel::OffScreen);
+    }
 }
 
 // A character moves right 3 px over a still background while the camera does not move. The
@@ -401,6 +438,7 @@ int main() {
     Strafe();
     Rejections();
     MovingObject();
+    Silhouette();
     Weapon();
     Selections();
     std::puts("sss-coverage: OK");

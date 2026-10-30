@@ -217,6 +217,7 @@ class Controller {
     UINT64 coverage_retry_after{};
     rrssscov::Totals coverage_window, coverage_last;
     UINT64 coverage_window_start{};
+    UINT64 coverage_key_skips{}; // surface keys skipped because the entry was still in flight
     rrssscov::FrameReason coverage_reason = rrssscov::FrameReason::NoRecord;
     bool hit_enabled{};
     unsigned hit_reports{};
@@ -759,8 +760,10 @@ class Controller {
         }
         SealSssCoverage(s, accepted);
     }
-    // The coverage record follows the guide: sealed with an admitted guide whose frame
-    // recorded both its surface key and its coverage, dropped with a rejected one.
+    // The coverage record follows the guide: replaced by an admitted guide whose frame
+    // recorded both its surface key and its coverage, dropped with a rejected one. An
+    // admitted frame without coverage keeps the older record: Check still limits its age,
+    // generation and extent, and with MaxAge < Ring its entry is not rewritten while usable.
     void SealSssCoverage(const Slot &s, bool accepted) {
         if (!accepted) {
             if (coverage_record.valid && coverage_record.frame == s.frame)
@@ -768,7 +771,6 @@ class Controller {
             return;
         }
         const auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
-        coverage_record = {};
         if (!coverage_history.Matches(s.gpu.w, s.gpu.h) || !s.sss.marked ||
             e.key_frame != s.frame || e.coverage_frame != s.frame || e.generation != s.generation)
             return;
@@ -837,8 +839,10 @@ class Controller {
             return;
         for (const auto &o : slots)
             if (&o != &s && o.busy && o.frame != UINT_MAX &&
-                rrssscov::Entry(o.frame) == rrssscov::Entry(s.frame))
+                rrssscov::Entry(o.frame) == rrssscov::Entry(s.frame)) {
+                ++coverage_key_skips; // the GPU is Ring frames behind: shown in the panel
                 return;
+            }
         coverage_history.Key(cl, pipelines, s.gpu.sources[3].Get(), s.frame, s.generation);
     }
     // The Subsurface Scattering pass of slot s records coverage (marker initializer).
@@ -851,8 +855,10 @@ class Controller {
         auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
         if (!s.sss.marked)
             return nullptr;
-        // A marked producer gives 65504 where the baseline gives 0: its resolve must take the
-        // coverage variant even when no record can be kept.
+        // A marked producer gives 65504 where the baseline gives 0, so its resolve takes the
+        // coverage variant even when no record can be kept (the stamps below). Marking needs
+        // a matching ring and Reconfigure retires every slot before releasing it, so this
+        // test does not fail for a marked recording.
         if (!coverage_history.Matches(s.gpu.w, s.gpu.h))
             return nullptr;
         if (e.key_frame == s.frame && e.generation == s.generation)
@@ -1452,7 +1458,8 @@ class Controller {
                      rrssscov::FrameReason &reason) {
         std::lock_guard lock(mutex);
         out = {};
-        reason = rrssscov::FrameReason::NoStorage;
+        // Every return leaves its reason for the panel.
+        reason = coverage_reason = rrssscov::FrameReason::NoStorage;
         if (!sss_enabled || sss_failed || !coverage_history.ready)
             return false;
         const Slot *match{};
@@ -1508,11 +1515,12 @@ class Controller {
         bool allocated{}, failed{}, waiting{};
         rrssscov::FrameReason reason{};
         rrssscov::Totals totals;
+        UINT64 key_skips{};
     };
     SssCoverageState SssCoverageReport() {
         std::lock_guard lock(mutex);
         return {coverage_history.ready, coverage_failed, coverage_retry_after != 0,
-                coverage_reason, coverage_last};
+                coverage_reason, coverage_last, coverage_key_skips};
     }
     bool SpecularHitEnabled() {
         std::lock_guard lock(mutex);
