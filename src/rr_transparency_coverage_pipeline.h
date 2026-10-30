@@ -63,7 +63,8 @@ inline const Target *ClassifiedTarget(unsigned n, const reshade::api::pipeline_s
         const auto &s = *static_cast<const reshade::api::shader_desc *>(o.data);
         if (!s.code || !s.code_size)
             continue;
-        const auto v = classifier.Classify(s.code, s.code_size, rrsss::ReplayCompiler());
+        // The DXC companion is loaded only for a shader that passes the part filter.
+        const auto v = classifier.Classify(s.code, s.code_size);
         if (v.target) {
             hash = v.target->hash;
             return v.target;
