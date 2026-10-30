@@ -3,9 +3,9 @@
 #include <cstdint>
 #include <cstdio>
 namespace rrfgdepth {
-// Weapon depth for Frame Generation (experimental, off by default; the saved setting is
-// rrsettings::Preferences::fg_weapon_depth). DLSS Frame Generation gets a depth in which the
-// weapon slice is remapped as RR's weapon depth remaps it (rrweapondepth::Hardware): world
+// Weapon depth for Frame Generation (always on in Beta 3, with no saved setting or panel
+// toggle). DLSS Frame Generation gets a depth in which the weapon slice is remapped as
+// RR's weapon depth remaps it (rrweapondepth::Hardware): world
 // depth is the game's own, bit for bit, and the weapon and hands keep their own depth order in
 // front of the near plane (reverse-Z depth above 1). Whether Frame Generation reads that as
 // intended is what the experiment tests: nothing here assumes it does.
@@ -33,15 +33,15 @@ namespace rrfgdepth {
 // with this build showed (2026-10-30, every frame), on another list: then only once the SR list
 // has been submitted, so the GPU runs RR's write before Streamline's copy (same queue in order;
 // another queue waits on RR's fence, Controller::Before). The slot then also tracks the
-// tagging list and is not reused until that list has been submitted and its GPU work is done.
+// tagging recording until Reset and is not reused until every execution has completed.
 
 // The setting as applied (rr_settings.inl ApplyEnabled). Read once per frame by AfterSR,
 // so a change applies from the next frame RR records; the frame's tag follows that frame.
 // Always on (Beta 3), with no panel control.
 inline std::atomic<bool> enabled{true};
-// FgWeaponDepthObserve=1 in ReShade.ini (no panel control): with the setting off, still match
-// each Frame Generation depth tag to RR's frame and log its metadata (Controller::FgDiagnose),
-// replacing nothing. For establishing the path before trying the replacement.
+// Developer observation path retained for diagnostics; Beta 3 does not read an ini value
+// or expose a panel control for it. When enabled internally, it also observes disabled
+// replacement frames and permits the bounded content probe below.
 inline std::atomic<bool> observe{};
 // Bumped on every change of the setting (rr_settings.inl ApplyEnabled): clears a pause and the
 // reason counts at the next frame (Controller::FgSettingChanged).
@@ -234,9 +234,10 @@ struct Status {
 };
 inline Status status;
 
-// The content check (Controller::FgProbe; only with FgWeaponDepthObserve=1 and the replacement
-// on, since it allocates a readback on the render thread): the 2026-10-30 sessions showed that
-// the game tags Frame Generation with its own persistent depth texture (same size and format),
+// The developer content check (Controller::FgProbe; only with observe and the replacement
+// enabled internally, since it allocates a readback on the render thread): the 2026-10-30
+// sessions showed that the game tags Frame Generation with its own persistent depth texture
+// (same size and format),
 // never one of SR's rotating depths, so a pointer cannot tell what it holds. One frame of both
 // depth planes is read back and compared here, world and weapon (SR depth above `slice`)
 // separately: a plain copy matches everywhere; a weapon-corrected copy differs in the weapon.

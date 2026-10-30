@@ -216,6 +216,64 @@ void StillCamera() {
     }
 }
 
+// Streamline jitter is the raster shift in render pixels (x right, y down), separate
+// from its unjittered matrices. With a stationary camera, previous-current jitter is
+// therefore the displacement between stored sample grids, even for an older record.
+void JitteredCamera() {
+    const uint32_t w = 64, h = 48;
+    for (unsigned age : {1u, 3u}) {
+        auto current = Still(10), previous = Still(10 - age);
+        current.jitter = {0.375f, -0.375f};
+        previous.jitter = {-0.375f, 0.375f};
+        Constants c{};
+        assert(Make(current, previous, w, h, age, true, c));
+        const auto world = Reproject(c, 20, 12, Decode(Key(0.125f, Up)));
+        assert(world.ok && Near(world.x, 19.75, 1e-5) && Near(world.y, 13.25, 1e-5));
+        // Both axes and the weapon camera use the same pixel-space raster shift.
+        const auto weapon = Reproject(c, 20, 12, Decode(Key(0.99f, Up)));
+        assert(weapon.ok && Near(weapon.x, 19.75, 1e-5) && Near(weapon.y, 13.25, 1e-5));
+
+        Scene s(w, h);
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x) {
+                s.current[y * w + x] = s.previous[y * w + x] = Key(0.125f, Up);
+                s.coverage[y * w + x] = x < 20 && y >= 13 ? Drawn : NotDrawn;
+            }
+        // Same-pixel lookup picks NotDrawn; the previous sample at (19,13) is Drawn.
+        assert(s.At(c, 20, 12) == Pixel::Covered);
+        // Jitter can move a border pixel outside the older record.
+        assert(s.At(c, 0, 12) == Pixel::OffScreen);
+        // Depth rejection still wins over coverage at the reprojected location.
+        for (auto &key : s.previous)
+            key = Key(0.5f, Up);
+        assert(s.At(c, 20, 12) == Pixel::Disoccluded);
+
+        std::swap(current.jitter, previous.jitter);
+        assert(Make(current, previous, w, h, age, true, c));
+        const auto reverse = Reproject(c, 20, 12, Decode(Key(0.125f, Up)));
+        assert(reverse.ok && Near(reverse.x, 21.25, 1e-5) && Near(reverse.y, 11.75, 1e-5));
+    }
+    // Different FOVs require removing current jitter before reprojection, not merely
+    // applying previous-current jitter to the final pixel position.
+    auto current = Still(2), previous = Still(1);
+    current.projection[0] = 2;
+    current.jitter = {0.375f, -0.375f};
+    previous.jitter = {-0.375f, 0.375f};
+    Constants c{};
+    assert(Make(current, previous, w, h, 1, true, c));
+    const auto zoom = Reproject(c, 20, 12, Decode(Key(0.125f, Up)));
+    assert(zoom.ok && Near(zoom.x, 25.6875, 1e-5) && Near(zoom.y, 13.25, 1e-5));
+    // Bad jitter cannot turn into invalid shader reprojection constants.
+    for (float invalid : {std::numeric_limits<float>::quiet_NaN(),
+                          std::numeric_limits<float>::infinity(), 2.0f})
+        for (unsigned axis = 0; axis < 2; ++axis) {
+            auto bad = Still(2);
+            bad.jitter[axis] = invalid;
+            assert(!Make(bad, previous, w, h, 1, true, c));
+            assert(!Make(current, bad, w, h, 1, true, c));
+        }
+}
+
 // Camera strafes right by dx world units per frame over a plane at view depth z = 10.
 // A point that is now at pixel x was at x + shift in the record (scene moves left).
 void Strafe() {
@@ -438,6 +496,7 @@ int main() {
     Cameras();
     RealMotion();
     StillCamera();
+    JitteredCamera();
     Strafe();
     Rejections();
     MovingObject();

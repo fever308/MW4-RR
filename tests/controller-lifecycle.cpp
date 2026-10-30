@@ -2,6 +2,8 @@
 #include "../src/rr_live.h"
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 
@@ -56,8 +58,14 @@ struct CpuResource final : ID3D12Resource {
     ULONG refs = 1;
     void *mapped{};
     D3D12_RANGE read{};
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **) override {
-        return E_NOINTERFACE;
+    D3D12_RESOURCE_DESC description{};
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+        *out = nullptr;
+        if (id != __uuidof(IUnknown) && id != __uuidof(ID3D12Resource))
+            return E_NOINTERFACE;
+        *out = this;
+        AddRef();
+        return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override {
         return ++refs;
@@ -94,7 +102,7 @@ struct CpuResource final : ID3D12Resource {
     unsigned descs{}; // GetDesc calls
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
         ++descs;
-        return {};
+        return description;
     }
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
         return 0;
@@ -110,6 +118,78 @@ struct CpuResource final : ID3D12Resource {
     HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES *,
                                                 D3D12_HEAP_FLAGS *) override {
         return E_NOTIMPL;
+    }
+};
+// Narrow ABI doubles for native FG recording and submission. All unused methods trap;
+// no D3D12 device, queue or command list is created. As in release-hooks-cpu.cpp,
+// calls go through the SDK interfaces and use their real COM vtable layout.
+struct FgCpuObject {
+    void **vtable{};
+    const IID *iid{};
+    ULONG refs = 1;
+    FgCpuObject *device{};
+    D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    UINT barriers{}, bad_barriers{}, signals{}, waits{};
+    UINT64 signaled{}, waited{};
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    void *table[64]{};
+    explicit FgCpuObject(const IID &id) : vtable(table), iid(&id) {
+        for (auto &entry : table)
+            entry = reinterpret_cast<void *>(&Trap);
+        table[0] = reinterpret_cast<void *>(&Query);
+        table[1] = reinterpret_cast<void *>(&AddRef);
+        table[2] = reinterpret_cast<void *>(&Release);
+        table[7] = reinterpret_cast<void *>(&GetDevice);
+        if (id == __uuidof(ID3D12GraphicsCommandList)) {
+            table[8] = reinterpret_cast<void *>(&GetType);
+            table[26] = reinterpret_cast<void *>(&Barrier);
+        } else if (id == __uuidof(ID3D12CommandQueue)) {
+            table[14] = reinterpret_cast<void *>(&Signal);
+            table[15] = reinterpret_cast<void *>(&Wait);
+            table[18] = reinterpret_cast<void *>(&QueueDesc);
+        }
+    }
+    template <class T> T *As() { return reinterpret_cast<T *>(this); }
+    static void Trap() { std::abort(); }
+    static HRESULT STDMETHODCALLTYPE Query(FgCpuObject *s, REFIID id, void **out) {
+        *out = nullptr;
+        if (id != __uuidof(IUnknown) && id != *s->iid)
+            return E_NOINTERFACE;
+        *out = s;
+        ++s->refs;
+        return S_OK;
+    }
+    static ULONG STDMETHODCALLTYPE AddRef(FgCpuObject *s) { return ++s->refs; }
+    static ULONG STDMETHODCALLTYPE Release(FgCpuObject *s) { return --s->refs; }
+    static HRESULT STDMETHODCALLTYPE GetDevice(FgCpuObject *s, REFIID id, void **out) {
+        return Query(s->device, id, out);
+    }
+    static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType(FgCpuObject *s) { return s->type; }
+    static void STDMETHODCALLTYPE Barrier(FgCpuObject *s, UINT n,
+                                           const D3D12_RESOURCE_BARRIER *barriers) {
+        for (UINT i = 0; i < n; ++i) {
+            assert(barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION);
+            const auto &b = barriers[i].Transition;
+            ++s->barriers;
+            s->bad_barriers += b.StateBefore != s->state;
+            s->state = b.StateAfter;
+        }
+    }
+    static HRESULT STDMETHODCALLTYPE Signal(FgCpuObject *s, ID3D12Fence *, UINT64 value) {
+        ++s->signals;
+        s->signaled = value;
+        return S_OK;
+    }
+    static HRESULT STDMETHODCALLTYPE Wait(FgCpuObject *s, ID3D12Fence *, UINT64 value) {
+        ++s->waits;
+        s->waited = value;
+        return S_OK;
+    }
+    // The x64 COM method returns this struct through its second (hidden) argument.
+    static D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE
+    QueueDesc(FgCpuObject *s, D3D12_COMMAND_QUEUE_DESC *out) {
+        *out = {s->type};
+        return out;
     }
 };
 static unsigned releases{}, destroys{};
@@ -319,7 +399,89 @@ struct ControllerCpuTest {
         c.weapon_linear = false;
         c.feature = nullptr;
     }
+    // Regression: a second tag on one open recording must not claim COMMON again.
+    // Streamline restores the declared NPSR state after each volatile depth copy.
+    static void FgRepeatedTags() {
+        FgCpuObject list(__uuidof(ID3D12GraphicsCommandList));
+        Microsoft::WRL::ComPtr<CpuResource> depth, replacement;
+        depth.Attach(new CpuResource);
+        replacement.Attach(new CpuResource);
+        depth->description = replacement->description =
+            TextureDesc(8, 4, DXGI_FORMAT_R32_FLOAT);
+        Controller c;
+        c.enabled = true;
+        auto &s = c.slots[0];
+        s.busy = s.recorded = s.sealed = s.fg_prepared = true;
+        s.frame = 41;
+        s.viewport = 0;
+        s.gpu.sr[1] = depth.Get();
+        s.gpu.fg_depth = replacement.Get();
+        rrfgdepth::enabled = true;
+        rrfgdepth::observe = false;
+        rrtrace::FgTag tag;
+        tag.frame = 41;
+        tag.viewport = 0;
+        tag.command = list.As<sl::CommandBuffer>();
+        tag.native = depth.Get();
+        tag.lifecycle = rrfgdepth::OnlyValidNow;
+        sl::Resource out(sl::ResourceType::eTex2d, nullptr);
+        assert(c.FgTag(tag, out) && out.native == replacement.Get());
+        assert(list.barriers == 1 && list.bad_barriers == 0);
+        assert(list.state == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        assert(c.FgTag(tag, out) && out.native == replacement.Get());
+        assert(list.bad_barriers == 0 && "repeat tag must preserve the recording's NPSR state");
+        assert(list.barriers == 1);
+    }
+    // Regression: an FG recording can execute again before Reset. Every execution
+    // must advance its completion fence, including on a different queue; Reset
+    // retires the recording but must still wait for the final execution to finish.
+    static void FgRecordingLifetime() {
+        FgCpuObject device(__uuidof(ID3D12Device));
+        FgCpuObject list(__uuidof(ID3D12GraphicsCommandList));
+        FgCpuObject first(__uuidof(ID3D12CommandQueue)), second(__uuidof(ID3D12CommandQueue));
+        first.device = second.device = &device;
+        Microsoft::WRL::ComPtr<CpuFence> f;
+        f.Attach(new CpuFence);
+        Controller c;
+        c.pipelines.device = device.As<ID3D12Device>();
+        c.fence = f;
+        auto &s = c.slots[0];
+        s.busy = s.fg_list_live = true;
+        s.fg_list = list.As<ID3D12GraphicsCommandList>();
+        s.gpu.fg_depth.Attach(new CpuResource);
+        // Keep the texture cached while the slot is idle, until reconfiguration.
+        rrfgdepth::enabled = true;
+        rrfgdepth::status.fg_seen_at = GetTickCount64();
+        ID3D12CommandList *lists[] = {list.As<ID3D12CommandList>()};
+        c.Before(first.As<ID3D12CommandQueue>(), 1, lists);
+        c.After(first.As<ID3D12CommandQueue>());
+        assert(first.signaled == 1 && s.fence_value == 1);
+        f->completed = 1;
+        c.PollLocked();
+        assert(s.busy && s.gpu.fg_depth && "a live FG recording still owns its texture");
+        c.QueueReconfigure();
+        assert(!c.Reconfigure());
+        c.Before(second.As<ID3D12CommandQueue>(), 1, lists);
+        c.After(second.As<ID3D12CommandQueue>());
+        assert(second.waits == 1 && second.waited == 1);
+        assert(second.signaled == 2 && s.fence_value == 2);
+        c.Reset(list.As<ID3D12GraphicsCommandList>());
+        assert(s.busy && !s.fg_list_live && !c.Reconfigure());
+        f->completed = 2;
+        c.PollLocked();
+        assert(!s.busy && s.gpu.fg_depth);
+        assert(c.Reconfigure() && !s.gpu.fg_depth);
+        // A discarded recording has no GPU submission and must retire on Reset.
+        Controller discarded;
+        auto &d = discarded.slots[0];
+        d.busy = d.fg_list_live = true;
+        d.fg_list = list.As<ID3D12GraphicsCommandList>();
+        discarded.Reset(list.As<ID3D12GraphicsCommandList>());
+        assert(!d.busy && !d.fg_list_live);
+    }
     static void Run() {
+        FgRepeatedTags();
+        FgRecordingLifetime();
         DevTests();
         RetirementFailure();
         FailureRecovers();
@@ -575,6 +737,11 @@ struct ControllerCpuTest {
     }
 };
 } // namespace rrlive
-int main() {
-    rrlive::ControllerCpuTest::Run();
+int main(int argc, char **argv) {
+    if (argc > 1 && std::strcmp(argv[1], "fg-tags") == 0)
+        rrlive::ControllerCpuTest::FgRepeatedTags();
+    else if (argc > 1 && std::strcmp(argv[1], "fg-lifetime") == 0)
+        rrlive::ControllerCpuTest::FgRecordingLifetime();
+    else
+        rrlive::ControllerCpuTest::Run();
 }

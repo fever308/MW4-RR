@@ -63,7 +63,7 @@ cbuffer CoverageControl:register(b4){
  float CoverageAX,CoverageBX,CoverageAY,CoverageBY;
  float CurrentScale,CurrentOffset,PreviousScale,PreviousOffset;
  float4 Reproject0,Reproject1,Reproject2,Reproject3; // current view position -> previous clip
- float DepthTolerance,NormalCos,CoveragePad0,CoveragePad1;
+ float DepthTolerance,NormalCos,WeaponJitterX,WeaponJitterY;
 }
 Texture2D<uint> currentKey:register(t8);
 Texture2D<uint> previousKey:register(t9);
@@ -84,7 +84,7 @@ uint CoverageDecide(uint2 p){
  CoverageSurface s=DecodeKey(currentKey.Load(int3(p,0)));
  if(!s.present)return PixelSky;
  float3 q;
- if(s.weapon)q=float3(float2(p)+0.5,s.depth);
+ if(s.weapon)q=float3(float2(p)+0.5+float2(WeaponJitterX,WeaponJitterY),s.depth);
  else{
   float z=CurrentScale/(s.depth+CurrentOffset);
   float nx=(p.x+0.5)/float(CoverageWidth)*2-1,ny=1-(p.y+0.5)/float(CoverageHeight)*2;

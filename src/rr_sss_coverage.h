@@ -6,7 +6,7 @@
 #include <cstring>
 #include <utility>
 #include "rr_weapon_depth.h"
-// Subsurface Scattering coverage experiment (development, a panel checkbox, off by default).
+// Subsurface Scattering coverage selection (always on in Beta 3).
 //
 // The SSS-masked lighting source (rrlighting::SssHistory2) takes native temporal lobe 2 on
 // Subsurface Scattering pixels. Its baseline decides "SSS pixel" from an earlier frame's RR
@@ -162,10 +162,12 @@ inline Surface Decode(uint32_t key) {
 // ---- Cameras and the reprojection constants ----
 // A frame's camera as RR is given it (Slot::view/projection): world-to-view and view-to-clip,
 // row-vector (clip = [x y z 1] * view * projection), infinite reverse-Z with clip w = view z.
-// The projection carries the frame's jitter in its x/y columns, so reprojecting a pixel
-// center with both projections maps between the two frames' jittered sample positions.
+// Streamline matrices exclude temporal jitter (sl_consts.h). jitter is its separate
+// pixel-space raster shift, x right/y down; unproject at pixel-current jitter, then
+// project into the previous frame and add its jitter.
 struct Camera {
     std::array<float, 16> view{}, projection{};
+    std::array<float, 2> jitter{};
     unsigned frame{}, viewport{};
     bool valid{}, reset{};
 };
@@ -241,7 +243,7 @@ struct Constants {
     float ax, bx, ay, by;                                       // current view position
     float current_scale, current_offset, previous_scale, previous_offset; // depth to view z
     float reproject[16]; // current view position -> previous clip, row-vector
-    float depth_tolerance, normal_cos, pad0, pad1;
+    float depth_tolerance, normal_cos, weapon_jitter_x, weapon_jitter_y;
 };
 static_assert(sizeof(Constants) == 128);
 inline constexpr unsigned ConstantWords = sizeof(Constants) / 4;
@@ -341,11 +343,20 @@ inline bool Make(const Camera &current, const Camera &previous, uint32_t width, 
     if (!width || !height || !current.valid || !previous.valid ||
         !Projectable(current.projection) || !Projectable(previous.projection))
         return false;
+    for (unsigned i = 0; i < 2; ++i)
+        if (!std::isfinite(current.jitter[i]) || !std::isfinite(previous.jitter[i]) ||
+            std::abs(current.jitter[i]) > 1 || std::abs(previous.jitter[i]) > 1)
+            return false;
     Matrix inverse{};
     if (!InvertRigid(Widen(current.view), inverse))
         return false;
-    const auto m =
-        Multiply(Multiply(inverse, Widen(previous.view)), Widen(previous.projection));
+    // Match Streamline Sample/Donut's pixel offset: clip translation (+2*jx/w,-2*jy/h).
+    // Keep the current and previous offsets on their own sides of camera reprojection;
+    // just adding their difference afterwards is wrong when the camera or FOV changes.
+    auto previous_projection = Widen(previous.projection);
+    previous_projection[8] += 2.0 * previous.jitter[0] / width;
+    previous_projection[9] -= 2.0 * previous.jitter[1] / height;
+    const auto m = Multiply(Multiply(inverse, Widen(previous.view)), previous_projection);
     for (unsigned i = 0; i < 16; ++i) {
         c.reproject[i] = float(m[i]);
         if (!std::isfinite(c.reproject[i]))
@@ -353,9 +364,11 @@ inline bool Make(const Camera &current, const Camera &previous, uint32_t width, 
     }
     const auto &p = current.projection;
     c.ax = 1 / p[0];
-    c.bx = -p[8] / p[0];
+    c.bx = -(p[8] + 2 * current.jitter[0] / float(width)) / p[0];
     c.ay = 1 / p[5];
-    c.by = -p[9] / p[5];
+    c.by = -(p[9] - 2 * current.jitter[1] / float(height)) / p[5];
+    c.weapon_jitter_x = previous.jitter[0] - current.jitter[0];
+    c.weapon_jitter_y = previous.jitter[1] - current.jitter[1];
     rrweapondepth::Mapping a, b;
     rrweapondepth::Map(current.projection, a);
     rrweapondepth::Map(previous.projection, b);
@@ -388,8 +401,9 @@ struct Position {
 inline Position Reproject(const Constants &c, uint32_t x, uint32_t y, const Surface &s) {
     Position r;
     if (s.weapon) {
-        // The weapon is drawn with its own camera that follows the view: same pixel.
-        r = {float(x) + 0.5f, float(y) + 0.5f, s.depth, true};
+        // The weapon camera follows the view; only the raster jitter moves its sample grid.
+        r = {float(x) + 0.5f + c.weapon_jitter_x, float(y) + 0.5f + c.weapon_jitter_y,
+             s.depth, true};
         return r;
     }
     const float z = c.current_scale / (s.depth + c.current_offset);

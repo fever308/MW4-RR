@@ -23,7 +23,7 @@
 #include <sstream>
 extern "C" __declspec(dllexport) const char *NAME = "MW4 Ray Reconstruction";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Beta 2: Ray Reconstruction with Subsurface Scattering and transparency guides.";
+    "Beta 3: Ray Reconstruction with Subsurface Scattering and transparency guides.";
 static void WriteLog(const char *text) {
     rrtrace::LastError preserve;
     reshade::log::message(reshade::log::level::warning, text);

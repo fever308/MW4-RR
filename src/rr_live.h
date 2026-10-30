@@ -61,8 +61,8 @@ class Controller {
         bool fg_prepared{};
         rrfgdepth::Reason fg_prepare{rrfgdepth::Reason::NotRecorded};
         // The list Frame Generation's depth was tagged on, when not the SR list: its copy reads
-        // gpu.fg_depth, so the slot waits for it (fg_list_live until submitted or reset, then
-        // the slot's fence covers that submission).
+        // gpu.fg_depth. Keep the recording live until Reset and fence every execution,
+        // including replays; after Reset, the last submission must still complete.
         ComPtr<ID3D12GraphicsCommandList> fg_list;
         bool fg_list_live{};
         // The content check (FgProbe) was recorded on fg_list for this frame, and submitted.
@@ -148,7 +148,7 @@ class Controller {
     unsigned weapon_hold_changes{};
     rrweapondepth::Mapping weapon_logged{}; // The mapping last written to the log.
     // Weapon depth for Frame Generation (rr_fg_depth.h). fg_paused: Streamline refused the
-    // replacement RefusalLimit times in a row; cleared when the setting is off. Textures live
+    // replacement RefusalLimit times in a row; retained for the session in Beta 3. Textures live
     // in the slots (GpuFrame::fg_depth); their reserve growth is part of test_reserve.
     bool fg_paused{}, fg_memory_logged{}, fg_supplied_logged{};
     unsigned fg_refusals{}, fg_diagnostics{}, fg_changes{}, fg_pairs{};
@@ -164,7 +164,7 @@ class Controller {
         static constexpr int NoMatch = INT_MIN;
         bool operator==(const FgSignature &) const = default;
     } fg_logged{};
-    // The content check (rrfgdepth::Compare; FgWeaponDepthObserve=1 only): a readback of the game's
+    // The developer-only content check (rrfgdepth::Compare; no Beta 3 configuration): the game's
     // Frame Generation depth plane (first half) and this frame's SR depth plane (second half, from
     // GpuFrame::depth_buffer), both copied on Frame Generation's list at its tag. armed: recorded,
     // waiting for the slot, which waits for that list, to retire; ready: its GPU work is done.
@@ -585,7 +585,7 @@ class Controller {
         if (foreign_call)
             return false;
         for (const auto &s : slots)
-            if (s.fg_list_live) // Frame Generation's copy of a slot texture is not submitted yet
+            if (s.fg_list_live) // an executable FG recording still refers to the slot texture
                 return false;
         for (const auto &s : slots)
             if (!rrpreset::CanRetire(
@@ -786,6 +786,7 @@ class Controller {
         rrssscov::Camera c;
         c.view = s.view;
         c.projection = s.projection;
+        c.jitter = {s.camera.jitter[0], s.camera.jitter[1]};
         c.frame = s.frame;
         c.viewport = s.viewport;
         c.valid = s.camera.readable && s.camera.basis_valid && s.camera.projection_valid;
@@ -1289,6 +1290,9 @@ class Controller {
         FgProbeRecording probe;
         const bool probing = m.game_copy && rrfgdepth::observe.load(std::memory_order_relaxed) &&
                              FgProbeArm(t, *s, tagged, now, probe);
+        // A second tag on the same recording already has the declared state: Streamline
+        // restores NPSR after its copy, and decay waits until submission completes.
+        const bool transition = !s->fg_list_live;
         s->fg_list = list;
         s->fg_list_live = true;
         if (probing) { // a second tag on the same list keeps the check it armed
@@ -1301,8 +1305,9 @@ class Controller {
         // and copies, so no binding the game set is changed.
         rrinternal::Scope copy_guard;
         rrcompute::Tracker::Internal state_guard;
-        Change(list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COMMON,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (transition)
+            Change(list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (probing)
             FgProbeRecord(list.Get(), depth.Get(), D3D12_RESOURCE_STATES(t.state), probe);
         return true;
@@ -2674,7 +2679,7 @@ class Controller {
             if (rrsss::Present(cover[k]))
                 s.coverage.submitted = true;
             if (rrsss::Present(fg_copy[k])) {
-                s.fg_list_live = false; // the fence signaled after this call covers it
+                // Keep ownership until Reset: a replay needs another completion fence.
                 s.fg_probe_submitted = s.fg_probe;
             }
         }
