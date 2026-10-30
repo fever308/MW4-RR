@@ -615,7 +615,7 @@ static bool SssOwnedDraw(reshade::api::command_list *list,
                 return false;
             graphics = i->second;
         }
-        if (graphics.pipeline.shader != 0x9ee7cea57f70d741ull)
+        if (!rrsss::Recognized().HasHash(graphics.pipeline.shader))
             return false;
         auto variant = SssPipelines().Find(list->get_device(), graphics.pipeline.pipeline);
         if (!variant)

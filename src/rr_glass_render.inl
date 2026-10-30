@@ -12,7 +12,7 @@ static void TransparencyProducerDraw(reshade::api::command_list *list, uint32_t 
                 return;
             g = i->second;
         }
-        if (g.pipeline.shader != 0x9ee7cea57f70d741ull)
+        if (!rrsss::Recognized().HasHash(g.pipeline.shader))
             return;
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
             reinterpret_cast<ID3D12GraphicsCommandList *>(list->get_native()));
@@ -27,8 +27,8 @@ static void TransparencyProducerDraw(reshade::api::command_list *list, uint32_t 
             !rrsss::PipelineProof::NativeObservation(out.pipeline.Get(), observed) ||
             !observed.complete || observed.malformed || observed.unknown ||
             observed.shader_malformed || !observed.shaders[1].code ||
-            observed.shaders[1].hash != 0x9ee7cea57f70d741ull ||
-            observed.shaders[1].bytes != 56388 ||
+            !rrsss::CompositeShader(g.pipeline.shader, observed.shaders[1].hash,
+                                    observed.shaders[1].bytes) ||
             observed.root_identity !=
                 UINT64(ComputeState().TransparencyGraphicsRoot(native.Get()).Get())) {
             return;

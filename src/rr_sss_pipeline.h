@@ -33,7 +33,10 @@ struct PipelinePatch {
             h = (h ^ b[i]) * 1099511628211ull;
         return h;
     }
-    static bool IsTarget(unsigned n, const reshade::api::pipeline_subobject *objects) {
+    // rejected names why a structurally similar build was refused.
+    static bool IsTarget(unsigned n, const reshade::api::pipeline_subobject *objects,
+                         const char *&rejected) {
+        rejected = nullptr;
         if (!objects || !n || n > 64)
             return false;
         for (unsigned i = 0; i < n; ++i) {
@@ -42,9 +45,18 @@ struct PipelinePatch {
                 !o.data)
                 continue;
             const auto &s = *static_cast<const reshade::api::shader_desc *>(o.data);
-            if (s.code && s.code_size == 56388 &&
-                Hash(s.code, s.code_size) == 0x9ee7cea57f70d741ull)
+            if (!s.code || !s.code_size || s.code_size > 4 * 1024 * 1024)
+                continue;
+            if (Recognized().Has(Hash(s.code, s.code_size), s.code_size))
                 return true;
+            // Another build is prepared here, once per input, so that its
+            // identity is known before any of its draws.
+            if (StructuralCandidate(s.code, s.code_size)) {
+                const char *status = nullptr;
+                if (RuntimeShader().Get(s.code, s.code_size, ReplayCompiler(), status))
+                    return true;
+                rejected = status;
+            }
         }
         return false;
     }
@@ -81,8 +93,8 @@ struct PipelinePatch {
                 if (o.count != 1)
                     return false;
                 const auto &s = *static_cast<const shader_desc *>(o.data);
-                if (!s.code || s.code_size != 56388 ||
-                    Hash(s.code, s.code_size) != 0x9ee7cea57f70d741ull) {
+                if (!s.code || !s.code_size || s.code_size > 4 * 1024 * 1024 ||
+                    !Recognized().Has(Hash(s.code, s.code_size), s.code_size)) {
                     status = "unsupported-sss-shader";
                     return false;
                 }
@@ -323,8 +335,12 @@ class PipelineRegistry {
         if (creating || !device || device->get_api() != reshade::api::device_api::d3d12)
             return;
         try {
-            if (!PipelinePatch::IsTarget(n, objects))
+            const char *rejected = nullptr;
+            if (!PipelinePatch::IsTarget(n, objects, rejected)) {
+                if (rejected)
+                    Report((std::string("RR SSS shader build not supported: ") + rejected).c_str());
                 return;
+            }
             if (!original.handle || !layout.handle) {
                 Report("RR exact SSS shader rejected: missing pipeline or layout handle; baseline "
                        "RR retained");
