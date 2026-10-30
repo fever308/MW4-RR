@@ -685,11 +685,11 @@ class Controller {
             sss_mask = {};
             sss_mask_guide.Reset();
         }
-        SealCoverage(s, accepted);
+        SealSssCoverage(s, accepted);
     }
     // The coverage record follows the guide: sealed with an admitted guide whose frame
     // recorded both its surface key and its coverage, dropped with a rejected one.
-    void SealCoverage(const Slot &s, bool accepted) {
+    void SealSssCoverage(const Slot &s, bool accepted) {
         if (!accepted) {
             if (coverage_record.valid && coverage_record.frame == s.frame)
                 coverage_record = {};
@@ -715,7 +715,7 @@ class Controller {
     // Allocates the coverage history once it is wanted and a mandatory RR slot exists; a
     // budget or memory shortage retries a second later, any other failure turns the
     // experiment off for the session. Never fails RR.
-    bool PrepareCoverage(UINT w, UINT h) {
+    bool PrepareSssCoverage(UINT w, UINT h) {
         if (coverage_history.ready)
             return coverage_history.Matches(w, h);
         const UINT64 now = GetTickCount64();
@@ -761,7 +761,7 @@ class Controller {
     // record) while an earlier frame sharing the entry still has GPU work, since the
     // entry's descriptors would be rewritten under it.
     void CoverageKey(Slot &s, ID3D12GraphicsCommandList *cl) {
-        if (!rrssscov::Wanted() || !sss_enabled || sss_failed || !PrepareCoverage(s.gpu.w, s.gpu.h))
+        if (!rrssscov::Wanted() || !sss_enabled || sss_failed || !PrepareSssCoverage(s.gpu.w, s.gpu.h))
             return;
         for (const auto &o : slots)
             if (&o != &s && o.busy && o.frame != UINT_MAX &&
@@ -969,12 +969,12 @@ class Controller {
                     e.counted = true;
             }
     }
-    struct CoverageReport {
+    struct SssCoverageState {
         bool allocated{}, failed{}, waiting{};
         rrssscov::FrameReason reason{};
         rrssscov::Totals totals;
     };
-    CoverageReport SssCoverageReport() {
+    SssCoverageState SssCoverageReport() {
         std::lock_guard lock(mutex);
         return {coverage_history.ready, coverage_failed, coverage_retry_after != 0,
                 coverage_reason, coverage_last};

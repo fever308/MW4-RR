@@ -6,7 +6,7 @@
 #include <cstring>
 #include <utility>
 #include "rr_weapon_depth.h"
-// Subsurface Scattering coverage experiment (development, session-only, off by default).
+// Subsurface Scattering coverage experiment (development, a panel checkbox, off by default).
 //
 // The SSS-masked lighting source (rrlighting::SssHistory2) takes native temporal lobe 2 on
 // Subsurface Scattering pixels. Its baseline decides "SSS pixel" from an earlier frame's RR
