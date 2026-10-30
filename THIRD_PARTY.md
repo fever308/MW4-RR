@@ -11,7 +11,7 @@
 
 The DXC release's license mapping assigns `LICENSE-MIT.txt` to `d3d12shader.h` and `LICENSE-LLVM.txt` to its other files. The included licenses preserve the vendor's full notices. `dxil.dll` and `dxc.exe` are build tools and are not required beside the addon. Runtime reflection uses only the renamed `dxcompiler.dll`, SHA256 `5888d3e590f5bfd8743484e7f31313996734adec5741506271a5c6368cbe8ba9`.
 
-The addon does not distribute native game shader bytecode. It recognizes a supported shader supplied by the running game and applies its guide transformation in memory. The generated variant is retained only for that session. The project license does not grant rights over game assets or the game-supplied shader.
+The addon does not distribute native game shader bytecode. It recognizes a supported shader supplied by the running game and applies its guide transformation in memory. Successfully validated variants may be stored in the per-user local shader cache described in README.md. Cache files are not included in distributed packages. The project license does not grant rights over game assets or the game-supplied shader.
 
 Inherited helper portions retain DLSS5-Feeder's MIT notice (Jean-Laurent ROUZIES) and its attribution to dlss5-dx11-bridge (NIGos). The project license does not override any third-party terms.
 
