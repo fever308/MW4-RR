@@ -119,7 +119,16 @@ From the repository root:
 build.cmd "path\to\NGX\include" "path\to\dxc\bin\x64"
 ```
 
-Outputs are written under `build/`. The companion DLL is the unmodified x64 DXC `dxcompiler.dll`, renamed `mw4-rr-dxcompiler.dll`. Generated shader headers contain only the project-owned HLSL compiled by the build. Runtime-generated game shader variants remain in memory and are not written to disk.
+Outputs are written under `build/`. The companion DLL is the unmodified x64 DXC `dxcompiler.dll`, renamed `mw4-rr-dxcompiler.dll`. Generated shader headers contain only the project-owned HLSL compiled by the build. Runtime-generated game shader variants are never shipped. Each PC prepares them from its own game's shaders and keeps the accepted bytecode in a local cache (see below).
+
+### Local shader cache
+
+The Subsurface Scattering guide shader is prepared from the game's own composite shader the first time the game creates it. The accepted bytecode is stored per user in `%LOCALAPPDATA%\MW4-RR\ShaderCache\v1\` as `<key>.rrsc` files and reused in later sessions. Nothing is uploaded or read from anywhere else.
+
+- The key covers the cache format, the shader role, the transformation version and its shipped fingerprints, the SHA-256 and size of the companion `mw4-rr-dxcompiler.dll`, and the SHA-256 and size of the game's shader. A game update, a new addon transformation or another compiler uses new entries.
+- An entry is used only when its header repeats that key, its size is exact and its content matches its recorded SHA-256, and only after the same output checks a fresh preparation ends with: a captured build's guide must equal its pinned output byte for byte; another build must pass the input structure check, DXC validation, the output structure check and declare the input's scene buffer size. Anything else is deleted and prepared again.
+- Only accepted results are written, through a temporary file renamed into place. Failures are never stored. At most 32 entries and 32 MB are kept, oldest removed first. A cache that cannot be read or written only means normal preparation.
+- To clear it, close the game and delete the `%LOCALAPPDATA%\MW4-RR\ShaderCache` folder.
 
 ## Tests and validation
 

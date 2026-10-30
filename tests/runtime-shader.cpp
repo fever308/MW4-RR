@@ -163,6 +163,100 @@ static bool ChangedInstruction(std::string &t) {
     t.replace(at + 3, 4, "fadd");
     return true;
 }
+// The disk cache with the real compiler and captured builds, in a fresh
+// directory under %TEMP%: a cold request prepares and stores, a new cache
+// instance accepts the stored guide again without transforming, and an
+// intact entry holding the wrong guide is refused and replaced.
+static void CacheEvidence(const std::vector<unsigned char> &supported,
+                          const std::vector<unsigned char> &variant, HMODULE module) {
+    wchar_t temp[MAX_PATH + 1]{};
+    CHECK(GetTempPathW(MAX_PATH, temp));
+    const std::wstring dir = std::wstring(temp) + L"mw4-rr-runtime-cache-" + std::to_wstring(GetCurrentProcessId());
+    auto clear = [&] {
+        WIN32_FIND_DATAW d;
+        HANDLE f = FindFirstFileW((dir + L"\\*").c_str(), &d);
+        if (f != INVALID_HANDLE_VALUE) {
+            do DeleteFileW((dir + L"\\" + d.cFileName).c_str()); while (FindNextFileW(f, &d));
+            FindClose(f);
+        }
+        RemoveDirectoryW(dir.c_str());
+    };
+    clear();
+    std::vector<unsigned char> a, b, out;
+    const char *status = "", *outcome = "";
+    CHECK(rrsss::BuildRuntimeShader(supported.data(), supported.size(), module, a, status));
+    CHECK(rrsss::BuildRuntimeShader(variant.data(), variant.size(), module, b, status));
+    auto unseen = Rebuild(module, supported, OneCodec);
+    std::vector<unsigned char> u;
+    CHECK(rrsss::BuildRuntimeShader(unseen.data(), unseen.size(), module, u, status));
+    const std::vector<unsigned char> *inputs[] = {&supported, &variant, &unseen}, *guides[] = {&a, &b, &u};
+    {
+        rrtiming::Timing t;
+        rrshadercache::DiskCache disk(dir);
+        rrsss::RecognizedShaders registry;
+        rrsss::RuntimeShaderCache cold(&registry, &disk, &t);
+        for (int i = 0; i < 3; ++i) {
+            auto got = cold.Get(inputs[i]->data(), inputs[i]->size(), module, status, nullptr, &outcome);
+            CHECK(got && *got == *guides[i] && !std::strcmp(outcome, "miss"));
+        }
+        CHECK(t.cache_stores == 3);
+        std::cout << "cold preparation of 3 builds: "
+                  << rrtiming::Ms(t.stages[unsigned(rrtiming::Stage::Preparation)].total) << " ms\n";
+    }
+    {
+        rrtiming::Timing t;
+        rrshadercache::DiskCache disk(dir);
+        rrsss::RecognizedShaders registry;
+        rrsss::RuntimeShaderCache warm(&registry, &disk, &t);
+        for (int i = 0; i < 3; ++i) {
+            auto got = warm.Get(inputs[i]->data(), inputs[i]->size(), module, status, nullptr, &outcome);
+            if (!got || std::strcmp(outcome, "hit")) {
+                std::cerr << "FAIL: cached guide " << i << " not reused: " << outcome << " " << status << '\n';
+                std::exit(1);
+            }
+            CHECK(*got == *guides[i]);
+            CHECK(registry.Has(rrsss::ShaderHash(inputs[i]->data(), inputs[i]->size()), inputs[i]->size()));
+        }
+        // A hit skips transformation and assembly.
+        CHECK(t.stages[unsigned(rrtiming::Stage::Transform)].count == 0);
+        CHECK(t.stages[unsigned(rrtiming::Stage::Assemble)].count == 0);
+        CHECK(t.cache_hits == 3);
+        std::cout << "warm reuse of 3 builds: "
+                  << rrtiming::Ms(t.stages[unsigned(rrtiming::Stage::Preparation)].total) << " ms\n";
+    }
+    // Intact entries with another build's guide, the native input, or a guide
+    // for another scene buffer size are refused by the guide's own checks.
+    struct Forgery { int input; const std::vector<unsigned char> *payload; };
+    const Forgery forged[] = {{0, &b}, {1, &a}, {0, &supported}, {2, &a}, {2, &unseen}};
+    for (const auto &f : forged) {
+        rrtiming::Timing t;
+        rrshadercache::DiskCache disk(dir);
+        rrsss::RuntimeShaderCache cache(nullptr, &disk, &t);
+        const auto &input = *inputs[f.input];
+        std::array<unsigned char, 32> digest{};
+        CHECK(rrsss::Sha256(input.data(), input.size(), digest));
+        rrshadercache::Identity id;
+        cache.Identify(digest, input.size(), module, id);
+        rrshadercache::Digest key{};
+        const char *why = "";
+        CHECK(rrshadercache::Key(id, key) && disk.Put(key, id, *f.payload, why));
+        auto got = cache.Get(input.data(), input.size(), module, status, nullptr, &outcome);
+        if (!got || std::strcmp(outcome, "rejected")) {
+            std::cerr << "FAIL: forged entry for input " << f.input << " not refused: " << outcome << '\n';
+            std::exit(1);
+        }
+        CHECK(*got == *guides[f.input] && t.cache_stores == 1);
+    }
+    // Without a compiler there is no key; nothing is read or written.
+    {
+        rrtiming::Timing t;
+        rrshadercache::DiskCache disk(dir);
+        rrsss::RuntimeShaderCache cache(nullptr, &disk, &t);
+        CHECK(!cache.Get(supported.data(), supported.size(), nullptr, status, nullptr, &outcome));
+        CHECK(!std::strcmp(outcome, "unavailable") && t.cache_hits == 0);
+    }
+    clear();
+}
 int wmain(int argc, wchar_t **argv) {
     if (!CapTestMemory())
         return 1;
@@ -171,6 +265,14 @@ int wmain(int argc, wchar_t **argv) {
     SyntheticStructure();
     if (argc == 4 && std::wstring(argv[1]) == L"--fingerprint")
         return Fingerprint(argv[2], argv[3]);
+    if (argc == 5 && std::wstring(argv[1]) == L"--cache") {
+        auto module = LoadLibraryExW(argv[4], nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        CHECK(module);
+        CacheEvidence(Read(argv[2]), Read(argv[3]), module);
+        std::cout << "PASS: local cache with captured builds: cold preparation stored, warm reuse without "
+                     "transformation, forged entries refused and replaced; no GPU work\n";
+        return 0;
+    }
     if (argc != 5) { std::cout << "PASS: invalid shader and synthetic structure checks; private fixtures not supplied\n"; return 0; }
     auto supported = Read(argv[1]), expected = Read(argv[2]), variant = Read(argv[3]);
     auto module = LoadLibraryExW(argv[4], nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -288,7 +390,8 @@ int wmain(int argc, wchar_t **argv) {
     }
     out = {1};
     CHECK(!rrsss::BuildRuntimeShader(supported.data(), supported.size(), nullptr, out, status) && out.empty());
+    CacheEvidence(supported, variant, module);
     FreeLibrary(module);
     std::cout << "PASS: both captured builds produce their pinned guides; mixed concurrent cache reuse, per-input failure isolation, "
-                 "structural acceptance of an equivalent build and refusal of altered builds verified; no GPU work\n";
+                 "structural acceptance of an equivalent build, refusal of altered builds and the local cache verified; no GPU work\n";
 }

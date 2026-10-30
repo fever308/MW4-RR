@@ -5,6 +5,7 @@
 #include <d3d12shader.h>
 #include <wrl/client.h>
 #include <dxcapi.h>
+#include "rr_startup_timing.h"
 namespace rrsss {
 inline bool ReplayBinding(D3D_SHADER_INPUT_TYPE type) noexcept {
     switch (type) {
@@ -21,6 +22,7 @@ inline bool ReplayBinding(D3D_SHADER_INPUT_TYPE type) noexcept {
 }
 inline HMODULE ReplayCompiler() noexcept {
     static HMODULE module = []() -> HMODULE {
+        rrtiming::Scope scope(rrtiming::Stage::CompilerLoad);
         HMODULE self{};
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,

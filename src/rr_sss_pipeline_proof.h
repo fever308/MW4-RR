@@ -2,6 +2,7 @@
 #include "feed_fg_identity.h"
 #include <d3d12.h>
 #include <MinHook.h>
+#include "rr_startup_timing.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -198,6 +199,18 @@ class PipelineProof {
         } catch (...) {
         }
     }
+    // Times the driver's own creation apart from this hook's inspection, which
+    // began at inspect. Counters only: nothing here logs or waits.
+    template <class F> static HRESULT Native(rrtiming::Stage stage, uint64_t inspect, F &&f) {
+        auto &t = rrtiming::Global();
+        const auto begin = rrtiming::Now();
+        t.Add(rrtiming::Stage::ProofHook, begin - inspect);
+        t.NativeBegin();
+        const auto hr = f();
+        t.NativeEnd();
+        t.Add(stage, rrtiming::Now() - begin);
+        return hr;
+    }
     template <Method M, size_t N, class O, class... A> static HRESULT Forward(O *object, A... a) {
         using Fn = HRESULT(STDMETHODCALLTYPE *)(O *, A...);
         return reinterpret_cast<Fn>(hooks[M][N].original.load(std::memory_order_acquire))(object,
@@ -212,11 +225,13 @@ class PipelineProof {
             desc = &local;
         Status status;
         NativeDepthStencilState depth;
+        const auto inspect = rrtiming::Now();
         const bool proof = LegacyProven(desc, &status, &depth);
         const auto observation = ObserveLegacy(desc);
-        const auto hr =
-            Forward<Graphics, N, ID3D12Device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID,
-                    void **>(d, desc, iid, out);
+        const auto hr = Native(rrtiming::Stage::NativeCreate, inspect, [&] {
+            return Forward<Graphics, N, ID3D12Device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *,
+                           REFIID, void **>(d, desc, iid, out);
+        });
         Stamp(hr, out, proof, status, depth, observation);
         return hr;
     }
@@ -226,10 +241,13 @@ class PipelineProof {
                                               REFIID iid, void **out) {
         Status status;
         NativeDepthStencilState depth;
+        const auto inspect = rrtiming::Now();
         const bool proof = StreamProven(desc, &status, &depth);
         const auto observation = ObserveStream(desc);
-        const auto hr = Forward<Stream, N, ID3D12Device2, const D3D12_PIPELINE_STATE_STREAM_DESC *,
-                                REFIID, void **>(d, desc, iid, out);
+        const auto hr = Native(rrtiming::Stage::NativeCreate, inspect, [&] {
+            return Forward<Stream, N, ID3D12Device2, const D3D12_PIPELINE_STATE_STREAM_DESC *,
+                           REFIID, void **>(d, desc, iid, out);
+        });
         Stamp(hr, out, proof, status, depth, observation);
         return hr;
     }
@@ -253,11 +271,14 @@ class PipelineProof {
                                                     REFIID iid, void **out) {
         Status status;
         NativeDepthStencilState depth;
+        const auto inspect = rrtiming::Now();
         const bool proof = LegacyProven(desc, &status, &depth);
         const auto observation = ObserveLegacy(desc);
-        const auto hr = Forward<LoadGraphics, N, ID3D12PipelineLibrary, LPCWSTR,
-                                const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID, void **>(
-            library, name, desc, iid, out);
+        const auto hr = Native(rrtiming::Stage::LibraryLoad, inspect, [&] {
+            return Forward<LoadGraphics, N, ID3D12PipelineLibrary, LPCWSTR,
+                           const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID, void **>(
+                library, name, desc, iid, out);
+        });
         Stamp(hr, out, proof, status, depth, observation);
         return hr;
     }
@@ -267,11 +288,14 @@ class PipelineProof {
                                                   REFIID iid, void **out) {
         Status status;
         NativeDepthStencilState depth;
+        const auto inspect = rrtiming::Now();
         const bool proof = StreamProven(desc, &status, &depth);
         const auto observation = ObserveStream(desc);
-        const auto hr = Forward<LoadStream, N, ID3D12PipelineLibrary1, LPCWSTR,
-                                const D3D12_PIPELINE_STATE_STREAM_DESC *, REFIID, void **>(
-            library, name, desc, iid, out);
+        const auto hr = Native(rrtiming::Stage::LibraryLoad, inspect, [&] {
+            return Forward<LoadStream, N, ID3D12PipelineLibrary1, LPCWSTR,
+                           const D3D12_PIPELINE_STATE_STREAM_DESC *, REFIID, void **>(
+                library, name, desc, iid, out);
+        });
         Stamp(hr, out, proof, status, depth, observation);
         return hr;
     }
