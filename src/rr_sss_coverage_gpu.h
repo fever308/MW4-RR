@@ -20,13 +20,12 @@ struct CoverageHistory {
         bool counted{};
     };
     std::array<Entry, rrssscov::Ring> entries;
-    // The key pass's descriptors (0: PackedSurface SRV, 1: key UAV), one set per frame
-    // modulo Sets. More sets than RR has slots, so a set is not rewritten while a frame that
-    // used it is still in flight, even when the GPU is more than Ring frames behind (the
-    // entry's textures are ordered by submission; only descriptors need this).
-    static constexpr unsigned Sets = 8;
+    // The key pass's descriptors (0: PackedSurface SRV, 1: key UAV). The caller picks a set
+    // no slot with GPU work in flight holds (Slot::coverage_set), so a set is never rewritten
+    // under the GPU however far behind it runs or however frames are numbered (the entry's
+    // textures are ordered by submission; only descriptors need this).
+    static constexpr unsigned Sets = 16;
     std::array<ComPtr<ID3D12DescriptorHeap>, Sets> heaps;
-    static constexpr unsigned Set(unsigned frame) { return frame % Sets; }
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
     UINT w{}, h{};
@@ -99,18 +98,18 @@ struct CoverageHistory {
     }
     // Records this frame's surface key from the prepass PackedSurface (UNORDERED_ACCESS, as
     // the prepass leaves it) and zeroes the frame's counters. The caller holds a proven
-    // prepass recording; the descriptors (set Set(frame)) are written for this recording
-    // only, while no frame in flight uses that set.
+    // prepass recording; the descriptors of set (< Sets) are written for this recording
+    // only, and no frame in flight uses that set.
     bool Key(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *surface, UINT frame,
-             UINT generation) {
-        if (!ready || !cl || !surface)
+             UINT generation, unsigned set) {
+        if (!ready || !cl || !surface || set >= Sets)
             return false;
         const auto d = surface->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width != w || d.Height != h ||
             d.Format != DXGI_FORMAT_R32G32B32A32_UINT || d.SampleDesc.Count != 1)
             return false;
         auto &e = entries[rrssscov::Entry(frame)];
-        auto &heap = heaps[Set(frame)];
+        auto &heap = heaps[set];
         D3D12_SHADER_RESOURCE_VIEW_DESC v{};
         v.Format = d.Format;
         v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;

@@ -35,6 +35,8 @@ class Controller {
     };
     struct Slot {
         rrsss::Producer sss;
+        // The coverage key pass's descriptor set this frame used (CoverageHistory::Sets: none).
+        unsigned coverage_set = CoverageHistory::Sets;
         bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
@@ -835,23 +837,29 @@ class Controller {
             budget.limit = (std::max)(old_limit, budget.bytes);
         }
     }
-    // Right after a prepass: this frame's surface key. Skipped (the frame then has no
-    // record) while an earlier frame using the same descriptor set still has GPU work,
-    // since those descriptors would be rewritten under it. With more sets than slots this
-    // only happens if slots hold frames Sets or more apart.
+    // Right after a prepass: this frame's surface key, with a descriptor set no busy slot
+    // holds. Skipped (the frame then has no record) only if every set is held, which needs
+    // more busy slots than Sets.
     void CoverageKey(Slot &s, ID3D12GraphicsCommandList *cl) {
         if (!rrssscov::Wanted() || !sss_enabled || sss_failed || !PrepareSssCoverage(s.gpu.w, s.gpu.h))
             return;
+        std::array<bool, CoverageHistory::Sets> held{};
         for (const auto &o : slots)
-            if (&o != &s && o.busy && o.frame != UINT_MAX &&
-                CoverageHistory::Set(o.frame) == CoverageHistory::Set(s.frame)) {
-                // Shown in the panel; logged at 1, 2, 4, 8, ...
-                if (!(++coverage_key_skips & (coverage_key_skips - 1)))
-                    Log("Subsurface Scattering coverage: surface key skipped, its descriptors "
-                        "are still in flight (raw lighting this frame)");
-                return;
-            }
-        coverage_history.Key(cl, pipelines, s.gpu.sources[3].Get(), s.frame, s.generation);
+            if (&o != &s && o.busy && o.coverage_set < CoverageHistory::Sets)
+                held[o.coverage_set] = true;
+        unsigned set = 0;
+        while (set < CoverageHistory::Sets && held[set])
+            ++set;
+        if (set == CoverageHistory::Sets) {
+            // Logged at 1, 2, 4, 8, ...
+            if (!(++coverage_key_skips & (coverage_key_skips - 1)))
+                Log("Subsurface Scattering coverage: surface key skipped, every descriptor set "
+                    "is still in flight (raw lighting this frame)");
+            return;
+        }
+        if (coverage_history.Key(cl, pipelines, s.gpu.sources[3].Get(), s.frame, s.generation,
+                                 set))
+            s.coverage_set = set;
     }
     // The Subsurface Scattering pass of slot s records coverage (marker initializer).
     bool CoverageMarking(const Slot &s, const rrsss::StencilSetup &stencil) const {
