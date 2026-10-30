@@ -23,6 +23,22 @@ preparation and acceptance and temporary directories; it uses no game shader.
 prints the fingerprints used to pin a newly captured variant. These private
 fixture files are not distributed.
 
+The transparency-classifier test always checks the shared composite registry,
+the container filter, the structural rule on synthetic text and the
+classifier's filtering, retry and once-per-shader verdicts. For the optional
+checks on actual shader evidence, pass the privately supplied OIT resolve
+(`a36d02f6245a4129`), both refraction builds (`b72393e05df90a78`,
+`5a24807dc07ce595`), the other OIT resolve found locally (`534109c37ffd13fe`)
+and the pinned DXC DLL, in that order, to `build/tests/transparency-classifier.exe`.
+This verifies the shipped fingerprints on the captured builds, that both
+refraction builds share one structure, refusal of the other OIT resolve,
+structural acceptance of an in-memory 12416-byte rebuild of the OIT resolve
+(the tester's likely build) by concurrent classifications with one verdict,
+and refusal of changed instructions and altered bitcode.
+`--fingerprint <shader> <dll>` prints the values used to pin a profile.
+The transparency-admission test covers the diagnostic classification of
+frames the transparency guide did not admit.
+
 Coverage includes default settings, variable resource extents, configuration
 validation, preset selection and retirement, unfinished command recordings,
 fence completion, exactly-once hook forwarding, private transition lock

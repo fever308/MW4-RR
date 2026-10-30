@@ -3,15 +3,22 @@
 // binding a target alone never proves a safe source state.
 private:
 rrtrans::CompositionLatch transparency_composition;
+// Why used frames were not admitted: the frame's first composition outcome and bounded window
+// totals, logged as one line at most every 10 s while frames fail (TransparencyAdmissionLocked).
+rrtrans::CompositionNote transparency_note;
+rrtrans::AdmissionCounters transparency_counters;
+ULONGLONG transparency_window{}, transparency_logged_at{};
+bool transparency_failing{}; // the last logged window had a frame that was not admitted
 bool transparency_producer_suspended{};
 // A suspension ends after a pause instead of lasting until the guide is toggled: one frame that
 // was not admitted (or found no GPU memory) no longer drops the guide for the session. Repeated
 // non-admission backs off (5, 10, 20, 40, 60 s) until a producer frame is admitted again.
 ULONGLONG transparency_resume_at{};
 unsigned transparency_suspensions{}, transparency_backoff{};
-// why: nullptr for a frame not admitted, else the reason. Memory waits 1 s; anything else backs
-// off from 5 s.
-void SuspendTransparencyProducer(const char *why, bool memory = false) {
+// why: nullptr for a frame not admitted (misses and note then say why), else the reason. Memory
+// waits 1 s; anything else backs off from 5 s.
+void SuspendTransparencyProducer(const char *why, bool memory = false, uint32_t misses = 0,
+                                 rrtrans::Note note = rrtrans::Note::None) {
     ULONGLONG pause = 1000;
     if (!memory) {
         pause = (std::min)(5000ull << (std::min)(transparency_backoff, 4u), 60000ull);
@@ -21,11 +28,46 @@ void SuspendTransparencyProducer(const char *why, bool memory = false) {
     transparency_resume_at = GetTickCount64() + pause;
     if (++transparency_suspensions > 3)
         return;
-    char line[192];
-    snprintf(line, sizeof(line), "Transparency guide paused (%s); retrying in %llus%s",
-             why ? why : "frame not admitted", pause / 1000,
-             transparency_suspensions == 3 ? " (further pauses not logged)" : "");
+    char reasons[256], line[384];
+    snprintf(line, sizeof(line), "Transparency guide paused (%s%s%s); retrying in %llus%s",
+             why ? why : "frame not admitted", why || !misses ? "" : ": ",
+             why || !misses ? "" : rrtrans::MissSummary(misses, note, reasons, sizeof(reasons)),
+             pause / 1000, transparency_suspensions == 3 ? " (further pauses not logged)" : "");
     Log(line);
+}
+// Counts one used frame at its seal. A line is logged for a 10 s window in which a frame was not
+// admitted, at most once a minute while the same failures continue, and once when frames are
+// admitted again; it counts everything since the last line.
+void TransparencyAdmissionLocked(bool accepted, uint32_t misses, rrtrans::Note note,
+                                 ULONGLONG now) {
+    if (!transparency_window)
+        transparency_window = transparency_logged_at = now;
+    transparency_counters.Frame(accepted, misses, note);
+    if (now - transparency_window < 10000)
+        return;
+    transparency_window = now;
+    const auto &k = transparency_counters;
+    const bool failing = k.Refused() != 0;
+    if (!failing && !transparency_failing) {
+        transparency_counters = {};
+        transparency_logged_at = now;
+        return;
+    }
+    if (failing && transparency_failing && now - transparency_logged_at < 60000)
+        return;
+    char line[640];
+    if (rrtrans::AdmissionReport(k, (now - transparency_logged_at) / 1000, line, sizeof(line)) > 0)
+        Log(line);
+    transparency_failing = failing;
+    transparency_counters = {};
+    transparency_logged_at = now;
+}
+void TransparencyNote(rrtrans::Note note) {
+    transparency_note.Set(camera_frame, note);
+}
+// A pipeline with an OIT composition shader (pinned or structurally matched) exists.
+static bool CompositionRecognized() {
+    return rrblend::Recognized().WasSeen(rrblend::Kind::Oit);
 }
 void ResumeTransparencyProducer() {
     if (transparency_producer_suspended && GetTickCount64() >= transparency_resume_at)
@@ -273,10 +315,11 @@ void ToggleTransparency() {
     std::lock_guard lock(mutex);
     SetTransparencyEnabled(!transparency_enabled);
 }
-void TransparencyUnsupported(const char *) {
+void TransparencyUnsupported(rrtrans::Note why) {
     std::lock_guard lock(mutex);
-    if (enabled && transparency_enabled && !failed && !retired)
-        transparency_composition.Claim(camera_frame, camera_view);
+    if (enabled && transparency_enabled && !failed && !retired &&
+        transparency_composition.Claim(camera_frame, camera_view))
+        TransparencyNote(why);
 }
 void TransparencyAnchor(ID3D12GraphicsCommandList *cl, ID3D12Resource *source) {
     std::lock_guard lock(mutex);
@@ -327,49 +370,59 @@ bool TransparencyAtDraw(ID3D12GraphicsCommandList *cl, ID3D12Resource *source,
     // cannot let a later composition snapshot color already containing glass.
     if (!transparency_composition.Claim(camera_frame, camera_view))
         return false;
+    using rrtrans::Note;
+    auto note = [&](Note n) {
+        TransparencyNote(n);
+        return false;
+    };
     if (auto *s = TransparencySlot(source, true); s && s->transparency.producer_copy) {
         auto &t = s->transparency;
-        if (t.source.Get() != source || !t.prep_live || t.prep_submitted || t.anchor_submitted ||
-            t.anchor || transparency_producer_suspended)
-            return false;
+        if (transparency_producer_suspended)
+            return note(Note::Suspended);
+        if (t.source.Get() != source)
+            return note(Note::Mismatch);
+        if (!t.prep_live || t.prep_submitted || t.anchor_submitted || t.anchor)
+            return note(Note::Reused);
         if (t.preparation.Get() == cl && !t.written) {
             t.producer_pending = false;
             t.producer_ready = false;
-            return false;
+            return note(Note::ProducerOpen);
         }
         t.anchor = cl;
         t.anchor_live = true;
         t.anchored = true;
+        TransparencyNote(Note::Anchored);
         return t.written;
     }
-    if (!render_target_proven || cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        return false;
-    }
+    if (!render_target_proven)
+        return note(Note::NotRenderTarget);
+    if (cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return note(Note::Context);
     const auto d = source->GetDesc();
     if (d.Width > UINT_MAX / 2 || d.Height > UINT_MAX / 2 ||
         !rrtrans::Shape(d, UINT(d.Width * 2), d.Height * 2) ||
         !rrsparsecopy::SameDevice(pipelines.device.Get(), source)) {
-        return false;
+        return note(Note::Shape);
     }
     auto *s = TransparencySlot(source);
     if (!s) {
-        return false;
+        return note(Note::NoSlot);
     }
     auto &t = s->transparency;
     if (t.source && t.source.Get() != source || t.anchor && t.anchor.Get() != cl) {
         t.written = false;
         t.anchored = false;
-        return false;
+        return note(Note::Mismatch);
     }
     if (t.at_draw || t.prep_submitted || t.anchor_submitted || t.preparation && !t.prep_live) {
-        return false;
+        return note(Note::Reused);
     }
     if (!s->gpu.rr_output || !s->gpu.transparency.Matches(d, s->gpu.w, s->gpu.h)) {
-        return false;
+        return note(Note::Shape);
     }
     try {
         if (!s->gpu.transparency.snapshot && !TransparencyBudget(d, s->gpu.w, s->gpu.h)) {
-            return false;
+            return note(Note::Budget);
         }
         transparency_pipeline.Initialize(pipelines.device.Get());
         s->gpu.transparency.Prepare(s->gpu, pipelines, budget, d, s->gpu.w, s->gpu.h);
@@ -389,13 +442,14 @@ bool TransparencyAtDraw(ID3D12GraphicsCommandList *cl, ID3D12Resource *source,
         t.anchored = true;
         t.at_draw = true;
         transparency_source = source;
+        TransparencyNote(Note::Anchored);
         return true;
     } catch (const std::exception &e) {
         transparency_failed = true;
         t.written = false;
         policy.Reject();
         Log(e.what());
-        return false;
+        return note(Note::Failed);
     }
 }
 bool TransparencyPreparation(ID3D12GraphicsCommandList *cl, ID3D12Resource *source) {

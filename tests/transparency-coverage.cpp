@@ -1406,7 +1406,7 @@ static void TestControlZero() {
     Slot s;
     auto &memory = s.Get("control").memory;
     auto c = Make(Tuning{}, 1920, 1080);
-    for (unsigned i = 0; i < 4; ++i)
+    for (unsigned i = 0; i < 8; ++i)
         c.zero[i] = 0x11111111u * (i + 1);
     c.reserved[3] = 6;
     c.padding[0] = 5;
@@ -1491,7 +1491,7 @@ static void TestRecord() {
         Transition("diffuse", read, uav),
         Transition("specular", read, uav),
         Transition("stats", common, dest),
-        "copy stats+0 <- control+64 n=16",
+        "copy stats+0 <- control+64 n=32",
         Transition("stats", dest, uav),
         "descriptor-heaps n=1 heap",
         "compute-root blend-root",
@@ -1506,7 +1506,7 @@ static void TestRecord() {
         Transition("specular", uav, read),
         Transition("coverage", read, common),
         Transition("stats", uav, source),
-        "copy readback+0 <- stats+0 n=16",
+        "copy readback+0 <- stats+0 n=32",
         Transition("stats", source, common)};
     assert(events == expected);
     static_assert(noexcept(s.gpu.Record(&list, pipeline, g.resources, 1, 1)));
@@ -1529,12 +1529,12 @@ static void TestHarvest() {
     memcpy(memory, values, sizeof(values)); // the recorded copy lands on the GPU
     stats = s.gpu.Harvest();
     assert(stats.ran == 1 && stats.eligible == 2000 && stats.covered == 300 &&
-           stats.opacity64 == 9600);
+           stats.opacity64 == 9600 && stats.touched == 77);
     // Each recording is harvested once.
     stats = s.gpu.Harvest();
     assert(!stats.ran && !stats.eligible && !stats.covered && !stats.opacity64);
     assert(!Gpu{}.Harvest().ran);
-    static_assert(sizeof(PassStats) == 16 && noexcept(s.gpu.Harvest()));
+    static_assert(sizeof(PassStats) == 32 && noexcept(s.gpu.Harvest()));
 }
 
 // A recorded SR list that never executes leaves no stale stats: Record clears
@@ -1558,7 +1558,7 @@ static void TestHarvestUnexecuted() {
     s.gpu.Record(&list, pipeline, g.resources, 1920, 1080);
     stats = s.gpu.Harvest();
     assert(!stats.ran && !stats.eligible && !stats.covered && !stats.opacity64);
-    // Only the 16 stats bytes are cleared.
+    // Only the 32 stats bytes are cleared.
     for (size_t i = sizeof(PassStats); i < sizeof(memory); ++i)
         assert(memory[i] == 0xcd);
 }

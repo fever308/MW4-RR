@@ -88,11 +88,12 @@ struct Pipeline {
     }
 };
 
-// The blend shader's Stats words: [0] ran, [4] eligible, [8] covered, [12] opacity*64.
+// The blend shader's Stats words: [0] ran, [4] eligible, [8] covered, [12] opacity*64,
+// [16] touched (eligible with any opacity before the noise floor); [20..31] unused, zero.
 struct PassStats {
-    uint32_t ran, eligible, covered, opacity64;
+    uint32_t ran, eligible, covered, opacity64, touched, unused[3];
 };
-static_assert(sizeof(PassStats) == 16);
+static_assert(sizeof(PassStats) == 32 && sizeof(PassStats) <= sizeof(Control::zero));
 
 // Per slot. Caller owns synchronization. Resources and descriptors are
 // immutable from recording until BOTH recording retirement and GPU completion

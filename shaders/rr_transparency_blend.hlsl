@@ -8,15 +8,17 @@ cbuffer Control : register(b0) {
     float4 Diffuse;                      // rgb = diffuse target
     float4 Params;                       // x specular target, y roughness target, z strength, w floor
     uint4 Reserved;                      // unused
-    uint4 Zero;                          // always 0: source for clearing Stats
+    uint4 Zero[2];                       // always 0: source for clearing Stats
 };
 Texture2DMS<float4, 4> Coverage : register(t0);
 Texture2D<uint> Status : register(t1);
 RWTexture2D<float4> NormalRoughness : register(u0);
 RWTexture2D<float4> DiffuseAlbedo : register(u1);
 RWTexture2D<float4> SpecularAlbedo : register(u2);
-RWByteAddressBuffer Stats : register(u3); // [0] ran [4] eligible [8] covered [12] opacity*64
-groupshared uint g_eligible, g_covered, g_opacity;
+// [0] ran [4] eligible [8] covered [12] opacity*64 [16] touched: eligible with any opacity before
+// the noise floor and strength, which tells a clear coverage target from one below the floor.
+RWByteAddressBuffer Stats : register(u3);
+groupshared uint g_eligible, g_covered, g_opacity, g_touched;
 static const float3 kLuma = float3(0.299, 0.587, 0.114);
 // Opacity of render pixel q. Saturated per tap: NaN reads as clear, and a value
 // outside [0, 1] cannot leak through the weighted sum. The subtraction is precise
@@ -35,12 +37,14 @@ float3 Opacity(int2 q) {
         g_eligible = 0;
         g_covered = 0;
         g_opacity = 0;
+        g_touched = 0;
     }
     GroupMemoryBarrierWithGroupSync();
     const bool inside = admitted && id.x < Width && id.y < Height;
     const uint status = inside ? Status[id.xy] : 0u;
     const bool eligible = status == 1u || status == 3u || (status == 2u && (Flags & 1u));
     float3 c = 0;
+    bool touched = false;
     if (eligible) {
         const int2 p = int2(id.xy);
         float3 o;
@@ -60,6 +64,7 @@ float3 Opacity(int2 q) {
         } else {
             o = Opacity(p);
         }
+        touched = max(o.r, max(o.g, o.b)) > 0.0;
         c = saturate(saturate((o - Params.w) / (1.0 - Params.w)) * Params.z);
     }
     const bool covered = eligible && max(c.r, max(c.g, c.b)) > 0.0;
@@ -78,6 +83,8 @@ float3 Opacity(int2 q) {
     }
     if (eligible)
         InterlockedAdd(g_eligible, 1u);
+    if (touched)
+        InterlockedAdd(g_touched, 1u);
     if (covered) {
         InterlockedAdd(g_covered, 1u);
         // At most 64 per pixel: the uint32 sum is exact up to 2^26 covered pixels (8192x8192),
@@ -91,5 +98,6 @@ float3 Opacity(int2 q) {
         if (g_eligible) Stats.InterlockedAdd(4, g_eligible);
         if (g_covered) Stats.InterlockedAdd(8, g_covered);
         if (g_opacity) Stats.InterlockedAdd(12, g_opacity);
+        if (g_touched) Stats.InterlockedAdd(16, g_touched);
     }
 }
