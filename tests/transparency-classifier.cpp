@@ -8,6 +8,7 @@
 // on in-memory rebuilds of them. --fingerprint <shader> <dll> prints the
 // values used to pin a profile. The private files are never distributed.
 #include "../src/rr_transparency_coverage_pipeline.h"
+#include "memory-cap.h"
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -382,6 +383,8 @@ static int Private(wchar_t **argv) {
 }
 
 int wmain(int argc, wchar_t **argv) {
+    if (!CapTestMemory())
+        return 1;
     TestRegistry();
     TestContainerParts();
     TestStructureVerdict();
