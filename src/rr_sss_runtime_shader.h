@@ -70,8 +70,8 @@ inline constexpr ShaderVariant Variants[] = {
      "3632196273fba431d92b8ae659cb9dac09444c43c6244205ba4b4fefab02e591", 63128,
      "bfa44f35ca4c29500ff5f629ba3504c86eb30d7ea38c92067cb8a788780aac8b"},
     {56352, 0xc6c858a6310ca6a2ull,
-     "7fb2e21d444b0ece2629b4caa97743c2acfdc09d1ae463dd9e362c8b1b5e7173", 0,
-     "0000000000000000000000000000000000000000000000000000000000000000"},
+     "7fb2e21d444b0ece2629b4caa97743c2acfdc09d1ae463dd9e362c8b1b5e7173", 63056,
+     "73291469f0018187c5028edf1c3012118753083b071294e37a57f7119a7810d8"},
 };
 inline const ShaderVariant *KnownVariant(uint64_t hash, size_t bytes) noexcept {
     for (const auto &v : Variants)
@@ -90,8 +90,10 @@ inline const ShaderVariant *KnownVariant(const void *data, size_t size) noexcept
 // Another build is accepted only when its disassembly, normalized by
 // StructuralText, matches the captured builds': the same instructions,
 // bindings, signatures and metadata. Only fingerprints are shipped.
-inline constexpr const char *InputStructure = "0000000000000000000000000000000000000000000000000000000000000000";
-inline constexpr const char *OutputStructure = "0000000000000000000000000000000000000000000000000000000000000000";
+inline constexpr const char *InputStructure =
+    "83e3d50d5cffcd501eb51873a68c8bd30f8157d780ab919bf8b911978777df7f";
+inline constexpr const char *OutputStructure =
+    "15ab971c5d61c21c30b4d1b7c4e5653fc1fbfa145e1cf2fca2749eda11e5065a";
 // Highest scene constant-buffer byte the shader (and so the guide) reads.
 inline constexpr size_t SceneReadBytes = 12112;
 // Cheap filter before disassembly: the container's signature, runtime-info
