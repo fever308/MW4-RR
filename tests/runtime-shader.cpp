@@ -246,11 +246,22 @@ int wmain(int argc, wchar_t **argv) {
     CHECK(std::string(status) == "unsupported-subsurface-scattering-structure");
     CHECK(!registry.HasHash(rrsss::ShaderHash(changed.data(), changed.size())));
     for (auto *p : {&supported, &variant}) {
-        auto altered = *p;
-        altered.back() ^= 1;
-        CHECK(!cache.Get(altered.data(), altered.size(), module, status));
-        CHECK(!rrsss::BuildRuntimeShader(altered.data(), altered.size(), module, out, status) && out.empty());
-        CHECK(!registry.Has(rrsss::ShaderHash(altered.data(), altered.size()), altered.size()));
+        // Flipped bits inside the DXIL bitcode.
+        for (size_t at : {p->size() / 3, p->size() / 2, p->size() * 2 / 3}) {
+            auto altered = *p;
+            altered[at] ^= 0x10;
+            CHECK(!cache.Get(altered.data(), altered.size(), module, status));
+            CHECK(!rrsss::BuildRuntimeShader(altered.data(), altered.size(), module, out, status) && out.empty());
+            CHECK(!registry.Has(rrsss::ShaderHash(altered.data(), altered.size()), altered.size()));
+        }
+        // The bitcode's trailing zero padding does not change the program: it
+        // loses the exact pin but is still the same shader structurally.
+        auto padded = *p;
+        CHECK(padded.back() == 0);
+        padded.back() ^= 1;
+        CHECK(!rrsss::KnownVariant(padded.data(), padded.size()));
+        auto same = cache.Get(padded.data(), padded.size(), module, status);
+        CHECK(same && *same == (p == &supported ? a : b));
         auto truncated = *p;
         truncated.resize(truncated.size() - 4);
         CHECK(!cache.Get(truncated.data(), truncated.size(), module, status));
