@@ -62,6 +62,8 @@ class Controller {
         // the slot's fence covers that submission).
         ComPtr<ID3D12GraphicsCommandList> fg_list;
         bool fg_list_live{};
+        // The content check (FgProbe) was recorded on fg_list for this frame, and submitted.
+        bool fg_probe{}, fg_probe_submitted{};
         std::array<Observed, 4> states{};
         rreval::Options options;
     };
@@ -159,6 +161,20 @@ class Controller {
         static constexpr int NoMatch = INT_MIN;
         bool operator==(const FgSignature &) const = default;
     } fg_logged{};
+    // The content check (rrfgdepth::Compare, observe-only): a readback of the game's Frame
+    // Generation depth plane (first half) and this frame's SR depth plane (second half, from
+    // GpuFrame::depth_buffer), both copied on Frame Generation's list at its tag. armed: recorded,
+    // waiting for the slot, which waits for that list, to retire; ready: its GPU work is done.
+    struct FgProbe {
+        ComPtr<ID3D12Resource> readback;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 half{}, armed_at{};
+        UINT frame{};
+        bool armed{}, ready{};
+    } fg_probe;
+    unsigned fg_probes{};
+    UINT64 fg_probe_at{};
+    bool fg_probe_stuck{}; // never completed: no more checks this session (the readback stays)
     // Water responsivity mask (rr_water.h).
     rrwater::Settings water;
     rrwater::Status water_status;
@@ -679,6 +695,11 @@ class Controller {
             if (s.busy && !s.pre_live && !s.sr_live && !s.sss.live && !s.transparency.Live() &&
                 !s.fg_list_live &&
                 !s.pending_sr && Complete(s, done)) {
+                // The content check's copies ran in a submission this slot's fence covers.
+                if (s.fg_probe && s.fg_probe_submitted && fg_probe.armed) {
+                    fg_probe.armed = false;
+                    fg_probe.ready = true;
+                }
                 auto cache = std::move(s.gpu);
                 cache.Retire();
                 // Weapon depth for Frame Generation turned off, or Frame Generation tags no
@@ -905,6 +926,111 @@ class Controller {
             }
         }
     }
+    // The content check's commands, prepared under the lock by FgProbeArm and recorded by
+    // FgProbeRecord outside it.
+    struct FgProbeRecording {
+        ComPtr<ID3D12Resource> readback, source;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 half{}, bytes{};
+    };
+    // Under the lock: whether this replacement frame also gets the content check (at most
+    // ProbeLimit a session, ProbeInterval apart, one in flight). The caller marks the slot.
+    bool FgProbeArm(const rrtrace::FgTag &t, const Slot &s, const D3D12_RESOURCE_DESC &tagged,
+                    UINT64 now, FgProbeRecording &r) {
+        if (fg_probe.armed || fg_probe.ready || fg_probe_stuck ||
+            fg_probes >= rrfgdepth::ProbeLimit ||
+            (fg_probe_at && now - fg_probe_at < rrfgdepth::ProbeInterval) || !s.gpu.use_depth ||
+            !s.gpu.depth_buffer || !pipelines.device || tagged.MipLevels != 1 ||
+            tagged.DepthOrArraySize != 1)
+            return false;
+        fg_probe_at = now;
+        ++fg_probes;
+        FgProbe p;
+        p.fp = s.gpu.depth_fp;
+        r.bytes = s.gpu.depth_buffer->GetDesc().Width;
+        p.half = (r.bytes + 511) & ~UINT64(511);
+        p.frame = t.frame;
+        p.armed_at = now;
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+        const auto desc = rrprivate::Buffer(2 * p.half);
+        if (FAILED(pipelines.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST,
+                                                             nullptr, IID_PPV_ARGS(&p.readback)))) {
+            Log("Weapon depth for Frame Generation: no memory for the depth content check");
+            return false;
+        }
+        p.armed = true;
+        fg_probe = p;
+        r.readback = p.readback;
+        r.source = s.gpu.depth_buffer;
+        r.fp = p.fp;
+        r.half = p.half;
+        return true;
+    }
+    // Outside the lock, with RR's hooks quiet: copies only, so no binding the game set is
+    // changed, and the game's depth returns to the state its tag declares.
+    static void FgProbeRecord(ID3D12GraphicsCommandList *list, ID3D12Resource *depth,
+                              D3D12_RESOURCE_STATES declared, const FgProbeRecording &r) {
+        Change(list, depth, declared, D3D12_RESOURCE_STATE_COPY_SOURCE, 0);
+        D3D12_TEXTURE_COPY_LOCATION to{};
+        to.pResource = r.readback.Get();
+        to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint = r.fp;
+        to.PlacedFootprint.Offset = 0;
+        D3D12_TEXTURE_COPY_LOCATION from{};
+        from.pResource = depth;
+        from.SubresourceIndex = 0; // the depth plane
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        Change(list, depth, D3D12_RESOURCE_STATE_COPY_SOURCE, declared, 0);
+        // RR's copy of SR's depth plane is a buffer in COMMON: promoted to a copy source.
+        list->CopyBufferRegion(r.readback.Get(), r.half, r.source.Get(), 0, r.bytes);
+    }
+    // A completed content check, read and logged outside the lock.
+    void FgProbeCollect(UINT64 now) {
+        FgProbe p;
+        {
+            std::lock_guard lock(mutex);
+            if (fg_probe.ready) {
+                p = std::move(fg_probe);
+                fg_probe = {};
+            } else if (fg_probe.armed && !fg_probe_stuck && now - fg_probe.armed_at > 10000) {
+                fg_probe_stuck = true;
+                Log("Weapon depth for Frame Generation: the depth content check did not complete; "
+                    "no further checks this session");
+            }
+        }
+        if (!p.readback)
+            return;
+        const auto &f = p.fp.Footprint;
+        void *data{};
+        const D3D12_RANGE range{0, SIZE_T(2 * p.half)};
+        if (FAILED(p.readback->Map(0, &range, &data)) || !data) {
+            Log("Weapon depth for Frame Generation: the depth content check could not be read");
+            return;
+        }
+        const auto *base = static_cast<const unsigned char *>(data);
+        const auto c = rrfgdepth::Compare(reinterpret_cast<const float *>(base),
+                                          reinterpret_cast<const float *>(base + p.half), f.Width,
+                                          f.Height, f.RowPitch / 4, rrweapondepth::Slice);
+        const D3D12_RANGE none{};
+        p.readback->Unmap(0, &none);
+        const char *verdict = c.world_equal != c.world
+                                  ? "the world differs: not this frame's SR depth"
+                              : !c.weapon ? "a copy of SR's depth (no weapon in this frame)"
+                              : c.weapon_equal == c.weapon
+                                  ? "a plain copy of SR's depth, weapon included"
+                                  : "the world matches and the weapon differs: the game changes "
+                                    "the weapon in Frame Generation's depth";
+        char line[512];
+        snprintf(line, sizeof(line),
+                 "FG depth content (frame %u): world %llu px, %llu equal, max diff %g; weapon %llu "
+                 "px, %llu equal, SR [%g, %g] FG [%g, %g]; FG above 1: %llu px -> %s",
+                 p.frame, (unsigned long long)c.world, (unsigned long long)c.world_equal,
+                 c.world_max_diff, (unsigned long long)c.weapon, (unsigned long long)c.weapon_equal,
+                 c.weapon_sr_min, c.weapon_sr_max, c.weapon_fg_min, c.weapon_fg_max,
+                 (unsigned long long)c.fg_above_one, verdict);
+        Log(line);
+    }
 #include "rr_live_pool.inl"
   public:
     explicit Controller(rreval::Api (*loader)(HMODULE) = &rreval::Api::Load) : resolve(loader) {}
@@ -938,6 +1064,7 @@ class Controller {
         D3D12_RESOURCE_DESC tagged{};
         if (depth)
             tagged = depth->GetDesc();
+        FgProbeCollect(now);
         std::unique_lock lock(mutex);
         FgSettingChanged();
         m.paused = fg_paused;
@@ -964,9 +1091,16 @@ class Controller {
             m.other_list = list && !same_list;
             m.unsubmitted = !s->sealed;
             m.same_depth = same_depth;
+            if (depth && s->gpu.sr[1] && !same_depth) {
+                const auto sr = s->gpu.sr[1]->GetDesc();
+                m.game_copy = tagged.Dimension == sr.Dimension && tagged.Width == sr.Width &&
+                              tagged.Height == sr.Height && tagged.Format == sr.Format &&
+                              tagged.MipLevels == sr.MipLevels &&
+                              tagged.DepthOrArraySize == sr.DepthOrArraySize;
+            }
         }
         const auto why = rrfgdepth::Decide(m);
-        FgDiagnose(t, s, same_list, same_depth, depth.Get(), tagged, why, now);
+        FgDiagnose(t, s, same_list, same_depth || m.game_copy, depth.Get(), tagged, why, now);
         if (why != rrfgdepth::Reason::Supplied) {
             status.Note(why);
             return false;
@@ -986,17 +1120,24 @@ class Controller {
             return true;
         // Another list: the SR list ended with the texture a shader resource and has been
         // submitted, so it is back in COMMON (simultaneous-access); make it the state the tag
-        // declares before Streamline's copy. The slot now waits for this list.
+        // declares before Streamline's copy. The slot now waits for this list. With the game's
+        // own copy, a few frames also get the content check (FgProbe): what that copy holds.
+        FgProbeRecording probe;
+        const bool probing = m.game_copy && FgProbeArm(t, *s, tagged, now, probe);
         s->fg_list = list;
         s->fg_list_live = true;
+        s->fg_probe = probing;
+        s->fg_probe_submitted = false;
         ComPtr<ID3D12Resource> texture = s->gpu.fg_depth;
         lock.unlock();
-        // A barrier only, recorded on the native list with RR's own hooks quiet, outside the
-        // lock: no binding the game set is changed.
+        // Recorded on the native list with RR's own hooks quiet, outside the lock: a barrier
+        // and copies, so no binding the game set is changed.
         rrinternal::Scope copy_guard;
         rrcompute::Tracker::Internal state_guard;
         Change(list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (probing)
+            FgProbeRecord(list.Get(), depth.Get(), D3D12_RESOURCE_STATES(t.state), probe);
         return true;
     }
     // Streamline's result for a replacement FgTag supplied. A refusal already re-sent the
@@ -2139,8 +2280,14 @@ class Controller {
                 s.sr_live = false;
                 s.pending_sr = false;
             }
-            if (s.fg_list.Get() == cl)
+            if (s.fg_list.Get() == cl) {
+                // Reset before submission: the check's copies never run.
+                if (s.fg_probe && !s.fg_probe_submitted) {
+                    s.fg_probe = false;
+                    fg_probe = {};
+                }
                 s.fg_list_live = false;
+            }
             if (!s.recorded && (s.pre.Get() == cl || s.sr.Get() == cl))
                 policy.Reject();
         }
@@ -2262,8 +2409,10 @@ class Controller {
                 s.transparency.anchor_submitted = true;
             if (rrsss::Present(cover[k]))
                 s.coverage.submitted = true;
-            if (rrsss::Present(fg_copy[k]))
+            if (rrsss::Present(fg_copy[k])) {
                 s.fg_list_live = false; // the fence signaled after this call covers it
+                s.fg_probe_submitted = s.fg_probe;
+            }
         }
     }
     void After(ID3D12CommandQueue *q) {

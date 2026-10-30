@@ -15,7 +15,9 @@ namespace rrfgdepth {
 //      depth alone (eValidUntilEvaluate): Super Resolution's inputs.
 //   2. slEvaluateFeature(DLSS, frame N) on the game's SR command list: RR's AfterSR records here.
 //   3. slSetTagForFrame(frame N): HUD-less color, depth, motion, all eOnlyValidNow, extent 0x0
-//      (the whole resource): Frame Generation's inputs. Same depth resource as step 1.
+//      (the whole resource): Frame Generation's inputs. Same depth resource as step 1 in that
+//      trace; in the 2026-10-30 sessions a persistent texture of the same size and format,
+//      the game's own copy (Match::game_copy), while SR's depth rotates among three.
 //   4. slSetTagForFrame(frame N): back buffer and UI (eValidUntilPresent).
 //   5. At present, sl.dlss_g evaluates NGX Frame Generation on its own command list.
 // Streamline keeps one tag per buffer type and viewport, so step 3 replaces step 1's depth
@@ -54,7 +56,7 @@ enum class Reason : unsigned {
     NotRecorded, // RR's SR recording for this frame did not write the replacement
     Lifecycle,   // the depth tag is not eOnlyValidNow: Streamline would read it later
     Order,       // tagged on another list while this frame's SR list was not yet submitted
-    Depth,       // the tagged depth is not the depth this frame's SR used
+    Depth,       // the tagged depth is neither SR's depth nor a texture like it
     Submitted,   // the frame's SR list was already submitted
     Format,      // the depth is neither D32_FLOAT_S8X24_UINT nor R32_FLOAT
     Projection,  // the frame's projection is not the game's reverse-Z (rrweapondepth::Map)
@@ -83,7 +85,7 @@ inline const char *Label(Reason r) {
     case Reason::Order:
         return "unavailable: Frame Generation's depth was tagged before RR's frame was submitted";
     case Reason::Depth:
-        return "unavailable: Frame Generation is given another depth than RR";
+        return "unavailable: Frame Generation's depth differs in size or format from RR's";
     case Reason::Submitted:
         return "unavailable: the frame was already submitted";
     case Reason::Format:
@@ -138,9 +140,13 @@ inline unsigned FgDepthIndex(const uint32_t *types, unsigned count) {
 // reason names the first thing that is missing.
 struct Match {
     // same_list: tagged on this frame's SR list. other_list: on another known list.
-    // unsubmitted: the SR list has not been submitted yet.
+    // unsubmitted: the SR list has not been submitted yet. same_depth: the tag's depth is the
+    // texture SR read. game_copy: another texture with that texture's dimensions and format,
+    // the game's own copy for Frame Generation (every frame since 2026-10-30: one persistent
+    // texture, while SR's depth rotates among three). Its contents are not compared: it is
+    // taken to hold this frame's depth, as Frame Generation is told it does.
     bool enabled{}, paused{}, lifecycle_now{}, rr_running{}, slot{}, prepared{}, same_list{},
-        other_list{}, unsubmitted{}, same_depth{};
+        other_list{}, unsubmitted{}, same_depth{}, game_copy{};
     Reason prepare{}; // why AfterSR did not prepare it (when !prepared)
 };
 inline constexpr Reason Decide(const Match &m) {
@@ -163,7 +169,7 @@ inline constexpr Reason Decide(const Match &m) {
             return Reason::Submitted;
     } else if (!m.other_list || m.unsubmitted)
         return Reason::Order;
-    if (!m.same_depth)
+    if (!m.same_depth && !m.game_copy)
         return Reason::Depth;
     return Reason::Supplied;
 }
@@ -220,4 +226,49 @@ struct Status {
     }
 };
 inline Status status;
+
+// The content check (Controller::FgProbe, observe-only): the 2026-10-30 sessions showed that
+// the game tags Frame Generation with its own persistent depth texture (same size and format),
+// never one of SR's rotating depths, so a pointer cannot tell what it holds. One frame of both
+// depth planes is read back and compared here, world and weapon (SR depth above `slice`)
+// separately: a plain copy matches everywhere; a weapon-corrected copy differs in the weapon.
+struct Comparison {
+    uint64_t world{}, world_equal{}, weapon{}, weapon_equal{}, fg_above_one{};
+    float world_max_diff{}, weapon_sr_min{}, weapon_sr_max{}, weapon_fg_min{}, weapon_fg_max{};
+};
+// fg and sr: rows of `width` floats, `pitch` floats apart.
+inline Comparison Compare(const float *fg, const float *sr, unsigned width, unsigned height,
+                          size_t pitch, float slice) {
+    Comparison c;
+    bool first = true;
+    for (unsigned y = 0; y < height; ++y)
+        for (unsigned x = 0; x < width; ++x) {
+            const float f = fg[y * pitch + x], d = sr[y * pitch + x];
+            c.fg_above_one += f > 1;
+            if (!(d > slice)) {
+                ++c.world;
+                const float diff = f > d ? f - d : d - f;
+                if (f == d)
+                    ++c.world_equal;
+                else if (!(diff <= c.world_max_diff))
+                    c.world_max_diff = diff; // NaN wins: it is worth seeing
+                continue;
+            }
+            ++c.weapon;
+            c.weapon_equal += f == d;
+            if (first) {
+                c.weapon_sr_min = c.weapon_sr_max = d;
+                c.weapon_fg_min = c.weapon_fg_max = f;
+                first = false;
+            }
+            c.weapon_sr_min = d < c.weapon_sr_min ? d : c.weapon_sr_min;
+            c.weapon_sr_max = d > c.weapon_sr_max ? d : c.weapon_sr_max;
+            c.weapon_fg_min = f < c.weapon_fg_min ? f : c.weapon_fg_min;
+            c.weapon_fg_max = f > c.weapon_fg_max ? f : c.weapon_fg_max;
+        }
+    return c;
+}
+// At most one check in flight, at least 10 s apart, 6 a session.
+inline constexpr unsigned ProbeLimit = 6;
+inline constexpr uint64_t ProbeInterval = 10000;
 } // namespace rrfgdepth

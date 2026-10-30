@@ -78,6 +78,15 @@ static void Decisions() {
     m = Ready();
     m.same_depth = false;
     assert(Decide(m) == Reason::Depth);
+    // The game's own copy for Frame Generation (a texture like SR's depth, not SR's).
+    m.game_copy = true;
+    assert(Decide(m) == Reason::Supplied);
+    m.same_list = false;
+    m.other_list = true;
+    m.unsubmitted = false;
+    assert(Decide(m) == Reason::Supplied);
+    m.unsubmitted = true;
+    assert(Decide(m) == Reason::Order);
 
     using rrfgdepth::Prepare;
     assert(Prepare(true, false, true, true, true, false) == Reason::Supplied);
@@ -149,6 +158,26 @@ static void Tags() {
     assert(!rrtrace::ReadFgTag(nullptr, 3, t));
 }
 
+// The content check: world and weapon (SR depth above the slice) compared separately.
+static void Content() {
+    const float slice = 0.75f;
+    // 3x2 in rows 4 floats apart; the last column is padding and never read.
+    const float sr[] = {0.1f, 0.9f, 0.2f, 99, 0.95f, 0.3f, 0.8f, 99};
+    float fg[8];
+    std::memcpy(fg, sr, sizeof(fg));
+    auto c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
+    assert(c.world == 4 && c.world_equal == 4 && c.weapon == 2 && c.weapon_equal == 2);
+    assert(c.world_max_diff == 0 && c.weapon_sr_min == 0.8f && c.weapon_sr_max == 0.95f);
+    assert(c.fg_above_one == 0);
+    fg[1] = 1.5f; // a weapon pixel moved in front of the near plane
+    c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
+    assert(c.world_equal == 4 && c.weapon_equal == 1 && c.fg_above_one == 1);
+    assert(c.weapon_fg_min == 0.8f && c.weapon_fg_max == 1.5f);
+    fg[0] = 0.15f; // a world pixel differs
+    c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
+    assert(c.world_equal == 3 && c.world_max_diff > 0.049f && c.world_max_diff < 0.051f);
+}
+
 // The replacement is the weapon depth RR gets: world depth unchanged, the weapon slice in
 // front of the near plane (the shader is rrweapondepth::Hardware's twin).
 static void Remap() {
@@ -169,6 +198,7 @@ int main() {
     Decisions();
     StatusAndLabels();
     Tags();
+    Content();
     Remap();
     std::puts("fg-weapon-depth: passed");
     return 0;
