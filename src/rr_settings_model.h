@@ -10,6 +10,10 @@ struct Preferences {
     bool weapon_depth = true; // the weapon kept in front with its own depth (rr_weapon_depth.h)
     bool water = true;        // water responsivity mask (rr_water.h), preset F only
     bool replace_sr = true;   // RR takes the place of the game's SR when it can
+    // Subsurface Scattering coverage selection (rr_sss_coverage.h) and its comparison
+    // counters: panel experiments, off (the baseline guide test) until visually validated.
+    bool sss_coverage = false;
+    bool sss_coverage_compare = false;
     unsigned preset = 6;
     bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame
 };

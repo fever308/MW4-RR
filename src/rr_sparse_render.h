@@ -129,6 +129,17 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
     // root binds; without the guide or that path they prepare raw lighting.
     unsigned mask_age{};
     const auto mask = LiveRR().SssMask(native.Get(), &mask_age);
+    // Subsurface Scattering coverage experiment (rr_sss_coverage.h): selected, the masked
+    // source takes native history only where reprojected coverage says so, and a frame
+    // without usable coverage prepares raw lighting; compared only, the baseline is applied
+    // unchanged and the coverage choice is counted.
+    const bool coverage_apply = rrssscov::selection.load(std::memory_order_relaxed) ==
+                                unsigned(rrssscov::Selection::Coverage);
+    rrsparsecopy::CoverageInputs coverage;
+    auto coverage_reason = rrssscov::FrameReason::NoStorage;
+    const bool coverage_ready =
+        mask && rrssscov::Wanted() &&
+        LiveRR().SssCoverage(native.Get(), coverage_apply, coverage, coverage_reason);
     const auto cbvs = ComputeState().RateCBVs(
         native.Get(), (ID3D12PipelineState *)effective,
         (ID3D12RootSignature *)rrbindings::State(device)->tracker.CurrentLayout(
@@ -150,11 +161,14 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         rrbypass::Fail(device, text);
         return false;
     }
-    bool masked = false;
-    bool replaced = mask && privateValid &&
+    bool masked = false, covered = false;
+    bool replaced = mask && privateValid && (!coverage_apply || coverage_ready) &&
                     SparsePool().Apply(native.Get(), input, output, scale.Get(),
                                        (ID3D12PipelineState *)effective, x, y, z, &rates, nullptr,
-                                       &privateRestore, lobe, mask.Get(), &masked);
+                                       &privateRestore, lobe, mask.Get(), &masked,
+                                       coverage_ready ? &coverage : nullptr, &covered);
+    if (covered)
+        LiveRR().SssCoverageRecorded(native.Get());
     // A rejected attempt records nothing; the usual path then prepares raw lighting.
     if (!replaced)
         replaced = SparsePool().Apply(native.Get(), input, output, scale.Get(),
@@ -162,13 +176,20 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                                       cbvs.valid ? &cbvs : nullptr,
                                       cbvs.valid ? nullptr : &privateRestore, lobe);
     if (replaced && LiveRR().SssEnabled()) {
-        char why[64]{};
+        char why[96]{};
         if (masked)
-            snprintf(why, sizeof(why), "guide %u frame(s) old", mask_age);
-        ReportSssMask(masked  ? rrsssmask::State::Active
-                      : !mask ? rrsssmask::State::NoGuide
-                              : rrsssmask::State::Unsupported,
-                      masked                               ? why
+            snprintf(why, sizeof(why), "guide %u frame(s) old%s", mask_age,
+                     covered ? (coverage_apply ? ", coverage record selecting"
+                                               : ", coverage record compared")
+                             : "");
+        if (mask && coverage_apply && !masked)
+            snprintf(why, sizeof(why), "%s", rrssscov::Label(coverage_reason));
+        ReportSssMask(masked && coverage_apply   ? rrsssmask::State::CoverageActive
+                      : masked                   ? rrsssmask::State::Active
+                      : !mask                    ? rrsssmask::State::NoGuide
+                      : coverage_apply           ? rrsssmask::State::CoverageWaiting
+                                                 : rrsssmask::State::Unsupported,
+                      masked || (mask && coverage_apply) ? why
                       : !mask                              ? nullptr
                       : !privateRestore.valid              ? privateRestore.status
                       : !privateRestore.complete           ? "private snapshot arguments incomplete"

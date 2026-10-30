@@ -1,6 +1,7 @@
 #pragma once
 #include "rr_settings_model.h"
 #include "rr_sss_mask.h"
+#include "rr_sss_coverage.h"
 #include "rr_water.h"
 #include "rr_weapon_depth.h"
 // CPU settings and UI only. Rendering threads service preset changes.
@@ -17,6 +18,8 @@ static bool &requested_hit = preferences.hit;
 static bool &requested_weapon_depth = preferences.weapon_depth;
 static bool &requested_water = preferences.water;
 static bool &requested_replace_sr = preferences.replace_sr;
+static bool &requested_sss_coverage = preferences.sss_coverage;
+static bool &requested_sss_coverage_compare = preferences.sss_coverage_compare;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
@@ -29,6 +32,10 @@ static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
     reshade::set_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
     reshade::set_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
+    reshade::set_config_value(nullptr, SettingsSection, "SubsurfaceScatteringCoverageSelection",
+                              requested_sss_coverage);
+    reshade::set_config_value(nullptr, SettingsSection, "SubsurfaceScatteringCoverageCompare",
+                              requested_sss_coverage_compare);
 }
 static void ApplyEnabled(bool allowed) {
     config_allowed = allowed;
@@ -38,6 +45,10 @@ static void ApplyEnabled(bool allowed) {
         ++rrweapondepth::changes;
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
+    // A shader variant and predicate choice only: no history reset or RR restart.
+    rrssscov::selection = unsigned(requested_sss_coverage ? rrssscov::Selection::Coverage
+                                                          : rrssscov::Selection::Baseline);
+    rrssscov::compare = requested_sss_coverage_compare;
     LiveRR().SetTransparencyEnabled(requested_glass);
     LiveRR().SetTransparencyBlendEnabled(requested_blend);
     LiveRR().SetSpecularHitEnabled(requested_hit);
@@ -67,6 +78,10 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
     reshade::get_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
     reshade::get_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
+    reshade::get_config_value(nullptr, SettingsSection, "SubsurfaceScatteringCoverageSelection",
+                              requested_sss_coverage);
+    reshade::get_config_value(nullptr, SettingsSection, "SubsurfaceScatteringCoverageCompare",
+                              requested_sss_coverage_compare);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -197,6 +212,51 @@ static void OnSwapchain(reshade::api::swapchain *, bool resize) {
 static void StatusRow(const char *name, rrstatus::State value) {
     ImGui::Text("%s: %s", name, rrstatus::Label(value));
 }
+// Subsurface Scattering coverage experiment (rr_sss_coverage.h).
+static void DrawSssCoverage(bool &changed) {
+    ImGui::Indent();
+    changed |= ImGui::Checkbox("Subsurface Scattering coverage selection (experiment)",
+                               &requested_sss_coverage);
+    changed |= ImGui::Checkbox("Compare Subsurface Scattering selections (counters)",
+                               &requested_sss_coverage_compare);
+    if (LiveRR().Running() && (requested_sss_coverage || requested_sss_coverage_compare)) {
+        const auto r = LiveRR().SssCoverageReport();
+        if (r.failed)
+            ImGui::TextUnformatted("Coverage history: unavailable (see ReShade.log)");
+        else if (!r.allocated)
+            ImGui::Text("Coverage history: %s",
+                        r.waiting ? "waiting for GPU memory" : "waiting for RR");
+        else
+            ImGui::Text("Coverage record: %s", rrssscov::Label(r.reason));
+        const auto &t = r.totals;
+        const double pixels = double(t.value[rrssscov::Pixels]);
+        if (t.frames && pixels > 0) {
+            auto pct = [&](unsigned i) { return 100.0 * double(t.value[i]) / pixels; };
+            ImGui::Text("Last second: %llu frames, record %.1f frames old on average",
+                        (unsigned long long)t.frames, double(t.age_sum) / double(t.frames));
+            ImGui::Text("Native history by the previous guide at the same pixel: %.2f%%",
+                        pct(rrssscov::BaselineNative));
+            ImGui::Text("Native history by reprojected Subsurface Scattering coverage: %.2f%%",
+                        pct(rrssscov::CoverageNative));
+            ImGui::Text("Pixels where the two differ: %.2f%%  (applied: %.2f%%)",
+                        pct(rrssscov::Differ), pct(rrssscov::Applied));
+            ImGui::Text("Coverage not usable: off-screen %.2f%%, disoccluded %.2f%%, "
+                        "normal %.2f%%, unknown %.2f%%",
+                        pct(rrssscov::CountOffScreen), pct(rrssscov::CountDisoccluded),
+                        pct(rrssscov::CountNormal), pct(rrssscov::CountUnknown));
+            ImGui::Text("Sky %.2f%%, first-person weapon %.2f%%", pct(rrssscov::CountSky),
+                        pct(rrssscov::CountWeapon));
+        }
+    }
+    ImGui::TextWrapped(
+        "Off is the baseline: Subsurface Scattering pixels are found from an earlier frame's "
+        "Subsurface Scattering guide at the same screen position. On, they are found from "
+        "where the game's Subsurface Scattering pass drew in that frame, followed to this "
+        "frame with the camera and each pixel's depth; pixels whose surface does not match "
+        "get raw lighting. The guide RR receives is unchanged. Compare counts both choices "
+        "without changing the picture. Switching either does not reset history.");
+    ImGui::Unindent();
+}
 static void DrawSettings(reshade::api::effect_runtime *) {
     std::lock_guard lock(settings_mutex);
     LoadSettings();
@@ -206,6 +266,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
     if (requested_sss && LiveRR().Running())
         ImGui::Text("SSS lighting: %s", rrsssmask::Label(SssMaskState()));
+    if (requested_sss)
+        DrawSssCoverage(changed);
     changed |= ImGui::Checkbox("Transparency albedo blend", &requested_blend);
     changed |= ImGui::Checkbox("Specular hit distance", &requested_hit);
     changed |= ImGui::Checkbox("Weapon depth", &requested_weapon_depth);

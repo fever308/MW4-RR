@@ -28,6 +28,8 @@ static_assert(defaults.blend);
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
               defaults.weapon_depth && defaults.preset == 6);
 static_assert(defaults.tolerate_isolated && defaults.water);
+// The Subsurface Scattering coverage selection and its counters are experiments: off.
+static_assert(!defaults.sss_coverage && !defaults.sss_coverage_compare);
 // The water responsivity mask starts on, and only preset F wants it.
 static_assert(rrwater::Settings{}.responsivity && rrwater::Settings{}.strength == 1.0f);
 static_assert(rrwater::Wanted(rrwater::Settings{}, true) &&

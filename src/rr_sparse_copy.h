@@ -8,6 +8,7 @@
 #include "../build/rr_vrrt_native.generated.h"
 #include "rr_lighting_source.h"
 #include "rr_sss_mask.h"
+#include "rr_sss_coverage.h"
 #include <array>
 #include <cstdio>
 #include <mutex>
@@ -254,6 +255,41 @@ inline bool SameDevice(ID3D12Device *d, ID3D12Resource *r) {
     return r && SUCCEEDED(r->GetDevice(IID_PPV_ARGS(&actual))) &&
            fg::SameNativeObject(actual.Get(), d);
 }
+// Inputs of the Subsurface Scattering coverage selection (rr_sss_coverage.h): this frame's
+// surface key, the coverage record's key and coverage, all left COMMON by the passes that
+// wrote them; this frame's counters (COMMON) and their readback (COPY_DEST); the constants.
+struct CoverageInputs {
+    ComPtr<ID3D12Resource> current, previous, coverage, counters, readback;
+    rrssscov::Constants constants{};
+};
+inline bool CoverageShape(const CoverageInputs &c, const D3D12_RESOURCE_DESC &lighting) {
+    auto one = [&](ID3D12Resource *r, DXGI_FORMAT format) {
+        if (!r)
+            return false;
+        const auto d = r->GetDesc();
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width == lighting.Width &&
+               d.Height == lighting.Height && d.DepthOrArraySize == 1 && d.MipLevels == 1 &&
+               d.SampleDesc.Count == 1 && d.Format == format;
+    };
+    auto buffer = [](ID3D12Resource *r) {
+        return r && r->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+               r->GetDesc().Width >= rrssscov::CounterBytes;
+    };
+    return one(c.current.Get(), DXGI_FORMAT_R32_UINT) &&
+           one(c.previous.Get(), DXGI_FORMAT_R32_UINT) &&
+           one(c.coverage.Get(), DXGI_FORMAT_R8_UINT) && c.current != c.previous &&
+           buffer(c.counters.Get()) && buffer(c.readback.Get()) &&
+           c.constants.width == lighting.Width && c.constants.height == lighting.Height;
+}
+// Private shader variants: lobe * Variants + bits, bit 1 the Subsurface Scattering coverage
+// selection (bit 0 is the edge-aware fill's). A masked root is params 0-4, then the coverage
+// table (t8..t10), its b4 constants and its u2 counters.
+inline constexpr unsigned CoverageBit = 2, Variants = 4;
+inline constexpr unsigned VariantIndex(unsigned lobe, unsigned bits) { return lobe * Variants + bits; }
+// The coverage parameters follow the edge table when both bits are set.
+inline constexpr unsigned CoverageTableParameter(unsigned bits) { return 5 + (bits & 1); }
+inline constexpr unsigned CoverageDescriptor = 10; // 10-12, after the edge fill's 5-9
+inline constexpr unsigned PrivateDescriptors = 13;
 class Pool {
 #ifdef RR_SPARSE_RETIREMENT_TEST
     friend struct RetirementTest;
@@ -266,14 +302,17 @@ class Pool {
         ComPtr<ID3D12PipelineState> scale;
         ComPtr<ID3D12Resource> rates;
         ComPtr<ID3D12RootSignature> privateRoot;
-        // privateRoot plus a t2 table for the SSS guide, for SSS-masked sources.
-        ComPtr<ID3D12RootSignature> privateMaskRoot;
-        // Indexed by rrlighting::Source.
-        std::array<ComPtr<ID3D12PipelineState>, rrlighting::Count> privateScale;
-        unsigned privateLobe{};
+        // privateRoot plus a t2 table for the SSS guide, for SSS-masked sources, by
+        // variant bits (VariantIndex).
+        std::array<ComPtr<ID3D12RootSignature>, Variants> privateMaskRoots;
+        // Indexed by VariantIndex(rrlighting::Source, bits).
+        std::array<ComPtr<ID3D12PipelineState>, rrlighting::Count * Variants> privateScale;
+        unsigned privateLobe{}, privateBits{};
         ComPtr<ID3D12DescriptorHeap> privateHeap;
         // SSS guide an SSS-masked preparation reads, retained like the inputs.
         ComPtr<ID3D12Resource> mask;
+        // The coverage selection's inputs, retained like the mask.
+        CoverageInputs coverage;
         ID3D12GraphicsCommandList *command{};
         UINT64 serial{}, signaled{}, bytes{};
         bool live{}, consumed{}, pending{}, poisoned{};
@@ -300,6 +339,7 @@ class Pool {
                 s.scale.Reset();
                 s.rates.Reset();
                 s.mask.Reset();
+                s.coverage = {};
                 s.command = nullptr;
             }
     }
@@ -315,7 +355,29 @@ class Pool {
             Transition(from, D3D12_RESOURCE_STATE_COPY_SOURCE, fs)};
         cl->ResourceBarrier(2, after.data());
     }
-    static D3D12_SHADER_BYTECODE PrivateScaleCode(bool packed_float, unsigned lobe) {
+    // The coverage selection's private reads, COMMON outside it.
+    static std::array<D3D12_RESOURCE_BARRIER, 4> CoverageBarriers(const Slot &s, bool read) {
+        constexpr auto common = D3D12_RESOURCE_STATE_COMMON,
+                       srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ID3D12Resource *r[] = {s.coverage.current.Get(), s.coverage.previous.Get(),
+                               s.coverage.coverage.Get()};
+        std::array<D3D12_RESOURCE_BARRIER, 4> b;
+        for (unsigned i = 0; i < 3; ++i)
+            b[i] = read ? Transition(r[i], common, srv) : Transition(r[i], srv, common);
+        b[3] = read ? Transition(s.coverage.counters.Get(), common, uav)
+                    : Transition(s.coverage.counters.Get(), uav,
+                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
+        return b;
+    }
+    static D3D12_SHADER_BYTECODE PrivateScaleCode(bool packed_float, unsigned lobe,
+                                                  unsigned bits = 0) {
+        if (lobe == rrlighting::SssHistory2 && (bits & CoverageBit))
+            return packed_float
+                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2CoverageFloat,
+                                               sizeof(RRVrrtScaleSssHistory2CoverageFloat)}
+                       : D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2Coverage,
+                                               sizeof(RRVrrtScaleSssHistory2Coverage)};
         if (lobe == rrlighting::SssHistory2)
             return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2Float,
                                                         sizeof(RRVrrtScaleSssHistory2Float)}
@@ -325,18 +387,25 @@ class Pool {
                             : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
     }
     // mask: a proven SSS guide for an SSS-masked lobe; without one it prepares raw.
+    // coverage: inputs of the coverage selection of an SSS-masked lobe; without them, or if
+    // that variant cannot be created, it uses the baseline guide test.
     static bool PreparePrivateScale(Slot &s, const Pair &input, const Pair &output,
-                                    unsigned lobe = 0, ID3D12Resource *mask = nullptr) {
+                                    unsigned lobe = 0, ID3D12Resource *mask = nullptr,
+                                    const CoverageInputs *coverage = nullptr) {
         if (lobe >= rrlighting::Count || (rrlighting::SssMasked(lobe) && !mask))
             lobe = 0;
-        // The mask root is the same layout plus parameter 4, a t2 table.
-        auto makeRoot = [&](bool masked, ComPtr<ID3D12RootSignature> &result) {
+        unsigned bits = coverage && rrlighting::SssMasked(lobe) ? CoverageBit : 0;
+        // The mask root is the same layout plus parameter 4, a t2 table, then for the
+        // coverage variant its t8..t10 table, b4 constants and u2 counters.
+        auto makeRoot = [&](bool masked, ComPtr<ID3D12RootSignature> &result,
+                            unsigned variant = 0) {
             if (result)
                 return true;
             D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0},
-                                               {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, 0}};
-            D3D12_ROOT_PARAMETER p[5]{};
+                                               {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, 0},
+                                               {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 8, 0, 0}};
+            D3D12_ROOT_PARAMETER p[8]{};
             for (unsigned i = 0; i < 2; ++i) {
                 p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
                 p[i].DescriptorTable = {1, &ranges[i]};
@@ -345,7 +414,18 @@ class Pool {
             }
             p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
             p[4].DescriptorTable = {1, &ranges[2]};
-            D3D12_ROOT_SIGNATURE_DESC rd{masked ? 5u : 4u, p};
+            unsigned count = masked ? 5u : 4u;
+            if (masked && (variant & CoverageBit)) {
+                const unsigned c = CoverageTableParameter(variant);
+                p[c].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                p[c].DescriptorTable = {1, &ranges[3]};
+                p[c + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                p[c + 1].Constants = {4, 0, rrssscov::ConstantWords};
+                p[c + 2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+                p[c + 2].Descriptor.ShaderRegister = 2;
+                count = c + 3;
+            }
+            D3D12_ROOT_SIGNATURE_DESC rd{count, p};
             ComPtr<ID3DBlob> code, error;
             ComPtr<ID3D12RootSignature> root;
             if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &code,
@@ -358,33 +438,41 @@ class Pool {
         };
         if (!makeRoot(false, s.privateRoot))
             return false;
-        if (rrlighting::SssMasked(lobe) && !makeRoot(true, s.privateMaskRoot))
+        if (bits && !makeRoot(true, s.privateMaskRoots[bits], bits))
+            bits = 0;
+        if (rrlighting::SssMasked(lobe) && !makeRoot(true, s.privateMaskRoots[0]))
             lobe = 0;
         const bool packed_float = output.r[0]->GetDesc().Format == DXGI_FORMAT_R32G32B32A32_FLOAT;
-        auto create = [&](unsigned variant) {
-            if (s.privateScale[variant])
+        auto create = [&](unsigned variant, unsigned variant_bits) {
+            auto &pipeline = s.privateScale[VariantIndex(variant, variant_bits)];
+            if (pipeline)
                 return true;
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = rrlighting::SssMasked(variant) ? s.privateMaskRoot.Get()
-                                                               : s.privateRoot.Get();
-            pd.CS = PrivateScaleCode(packed_float, variant);
-            return SUCCEEDED(s.device->CreateComputePipelineState(
-                &pd, IID_PPV_ARGS(&s.privateScale[variant])));
+            pd.pRootSignature = rrlighting::SssMasked(variant)
+                                    ? s.privateMaskRoots[variant_bits].Get()
+                                    : s.privateRoot.Get();
+            pd.CS = PrivateScaleCode(packed_float, variant, variant_bits);
+            return SUCCEEDED(s.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pipeline)));
         };
-        // A lobe variant that cannot be created falls back to raw preparation.
-        if (!create(lobe))
-            lobe = 0;
-        if (!create(lobe))
+        // A coverage variant that cannot be created falls back to the baseline guide test,
+        // and a lobe variant that cannot be created to raw preparation.
+        if (!rrlighting::SssMasked(lobe) || (bits && !create(lobe, bits)))
+            bits = 0;
+        if (!create(lobe, bits))
+            lobe = bits = 0;
+        if (!create(lobe, bits))
             return false;
         s.privateLobe = lobe;
+        s.privateBits = bits;
         if (!s.privateHeap) {
-            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5,
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                          PrivateDescriptors,
                                           D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
             if (FAILED(s.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.privateHeap))))
                 return false;
         }
         // A slot is selected only after both recording retirement and GPU completion.
-        // Its five descriptors stay immutable from Apply through every submission.
+        // Its descriptors stay immutable from Apply through every submission.
         auto cpu = s.privateHeap->GetCPUDescriptorHandleForHeapStart();
         auto stride =
             s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -408,6 +496,19 @@ class Pool {
             v.Texture2D.MipLevels = 1;
             v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             s.device->CreateShaderResourceView(mask, &v, {cpu.ptr + 4 * stride});
+        }
+        if (bits & CoverageBit) {
+            ID3D12Resource *views[] = {coverage->current.Get(), coverage->previous.Get(),
+                                       coverage->coverage.Get()};
+            for (unsigned i = 0; i < 3; ++i) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+                v.Format = views[i]->GetDesc().Format;
+                v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                v.Texture2D.MipLevels = 1;
+                v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                s.device->CreateShaderResourceView(
+                    views[i], &v, {cpu.ptr + (CoverageDescriptor + i) * stride});
+            }
         }
         return true;
     }
@@ -543,10 +644,17 @@ class Pool {
                ID3D12PipelineState *scale, ID3D12PipelineState *restore, UINT x, UINT y, UINT z,
                const rrvrrt::Data *rates = nullptr, const rrvrrt::CBVs *cbvs = nullptr,
                const rrcompute::Snapshot *privateRestore = nullptr, unsigned lobe = 0,
-               ID3D12Resource *mask = nullptr, bool *masked = nullptr) {
+               ID3D12Resource *mask = nullptr, bool *masked = nullptr,
+               const CoverageInputs *coverage = nullptr, bool *covered = nullptr) {
         std::lock_guard lock(mutex);
         if (masked)
             *masked = false;
+        if (covered)
+            *covered = false;
+        // An applied coverage selection never silently becomes the baseline: without it this
+        // attempt records nothing and the caller prepares raw lighting.
+        const bool coverageRequired =
+            coverage && (coverage->constants.flags & rrssscov::ApplyFlag) != 0;
         if (!Shape(input) || !Shape(output) || !scale || !restore || z != 1)
             return false;
         Slot *slot = nullptr;
@@ -607,14 +715,26 @@ class Pool {
         if (!privateRestore || !mask || !SameDevice(s.device.Get(), mask) ||
             !rrsssmask::Shape(mask->GetDesc(), desc))
             mask = nullptr;
-        if (privateRestore && !PreparePrivateScale(s, input, output, lobe, mask))
+        // The coverage selection needs the mask path and every input at the lighting extent.
+        if (!mask || !coverage || !CoverageShape(*coverage, desc) ||
+            !SameDevice(s.device.Get(), coverage->current.Get()) ||
+            !SameDevice(s.device.Get(), coverage->previous.Get()) ||
+            !SameDevice(s.device.Get(), coverage->coverage.Get()) ||
+            !SameDevice(s.device.Get(), coverage->counters.Get()) ||
+            !SameDevice(s.device.Get(), coverage->readback.Get()))
+            coverage = nullptr;
+        if (privateRestore && !PreparePrivateScale(s, input, output, lobe, mask, coverage))
             return false;
         const bool useMask = privateRestore && rrlighting::SssMasked(s.privateLobe);
+        const bool useCoverage = useMask && (s.privateBits & CoverageBit);
+        if (coverageRequired && !useCoverage)
+            return false;
         // All proofs and references acquired before the first output mutation.
         s.destination = output;
         s.scale = scale;
         s.rates = rates ? rates->buffer : nullptr;
         s.mask = useMask ? mask : nullptr;
+        s.coverage = useCoverage ? *coverage : CoverageInputs{};
         s.consumed = true;
         for (unsigned i = 0; i < 2; ++i)
             Copy(cl, output.r[i].Get(), output.state[i], s.privatePair.r[i].Get(),
@@ -625,8 +745,10 @@ class Pool {
                 s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             ID3D12DescriptorHeap *heaps[] = {s.privateHeap.Get()};
             cl->SetDescriptorHeaps(1, heaps);
-            cl->SetComputeRootSignature(useMask ? s.privateMaskRoot.Get() : s.privateRoot.Get());
-            cl->SetPipelineState(s.privateScale[s.privateLobe].Get());
+            cl->SetComputeRootSignature(useMask ? s.privateMaskRoots[s.privateBits].Get()
+                                                : s.privateRoot.Get());
+            cl->SetPipelineState(
+                s.privateScale[VariantIndex(s.privateLobe, useMask ? s.privateBits : 0)].Get());
             cl->SetComputeRootDescriptorTable(0, gpu);
             cl->SetComputeRootDescriptorTable(1, {gpu.ptr + 2 * stride});
             if (useMask) {
@@ -634,6 +756,15 @@ class Pool {
                 auto read = Transition(s.mask.Get(), D3D12_RESOURCE_STATE_COMMON,
                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 cl->ResourceBarrier(1, &read);
+            }
+            if (useCoverage) {
+                const unsigned c = CoverageTableParameter(s.privateBits);
+                cl->SetComputeRootDescriptorTable(c, {gpu.ptr + CoverageDescriptor * stride});
+                cl->SetComputeRoot32BitConstants(c + 1, rrssscov::ConstantWords,
+                                                 &s.coverage.constants, 0);
+                cl->SetComputeRootUnorderedAccessView(
+                    c + 2, s.coverage.counters->GetGPUVirtualAddress());
+                cl->ResourceBarrier(4, CoverageBarriers(s, true).data());
             }
         } else
             cl->SetPipelineState(scale);
@@ -662,8 +793,20 @@ class Pool {
                                    D3D12_RESOURCE_STATE_COMMON);
             cl->ResourceBarrier(1, &done);
         }
+        if (useCoverage) {
+            // This frame's counters go to the readback the controller reads once the frame's
+            // GPU work is complete.
+            cl->ResourceBarrier(4, CoverageBarriers(s, false).data());
+            cl->CopyBufferRegion(s.coverage.readback.Get(), 0, s.coverage.counters.Get(), 0,
+                                 rrssscov::CounterBytes);
+            auto back = Transition(s.coverage.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                   D3D12_RESOURCE_STATE_COMMON);
+            cl->ResourceBarrier(1, &back);
+        }
         if (masked)
             *masked = useMask;
+        if (covered)
+            *covered = useCoverage;
         if (privateRestore)
             privateRestore->Restore(cl, true);
         else
