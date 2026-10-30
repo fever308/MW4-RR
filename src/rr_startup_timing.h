@@ -33,6 +33,7 @@ enum class Stage : unsigned {
     Transform,
     Assemble,           // assembly and validation of the transformed shader
     OutputCheck,
+    Classify,           // transparency composite structural classification
     Count
 };
 inline constexpr const char *Names[] = {
@@ -40,7 +41,8 @@ inline constexpr const char *Names[] = {
     "native-create",     "library-load",  "proof-hook",        "alternate-create",
     "compiler-load",     "preparation",   "slot-wait",         "compiler-identity",
     "cache-load",        "cache-validate", "cache-store",      "disassembly",
-    "structure",         "transform",     "assembly",          "output-check"};
+    "structure",         "transform",     "assembly",          "output-check",
+    "transparency-classify"};
 static_assert(std::size(Names) == unsigned(Stage::Count));
 using Clock = std::chrono::steady_clock;
 inline uint64_t Now() noexcept {

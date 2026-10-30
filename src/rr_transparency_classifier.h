@@ -162,6 +162,7 @@ class Classifier {
                 const auto start = Now();
                 slot->result = Decide(*v.profile, code, size, hash, module, slot->target);
                 v.micros = Now() - start;
+                rrtiming::Global().Add(rrtiming::Stage::Classify, v.micros * 1000);
                 micros += v.micros;
                 for (auto seen = slowest.load(); v.micros > seen &&
                                                  !slowest.compare_exchange_weak(seen, v.micros);)
