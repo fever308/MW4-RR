@@ -166,16 +166,16 @@ static void Content() {
     float fg[8];
     std::memcpy(fg, sr, sizeof(fg));
     auto c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
-    assert(c.world == 4 && c.world_equal == 4 && c.weapon == 2 && c.weapon_equal == 2);
+    assert(c.world == 3 && c.world_equal == 3 && c.weapon == 3 && c.weapon_equal == 3);
     assert(c.world_max_diff == 0 && c.weapon_sr_min == 0.8f && c.weapon_sr_max == 0.95f);
     assert(c.fg_above_one == 0);
     fg[1] = 1.5f; // a weapon pixel moved in front of the near plane
     c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
-    assert(c.world_equal == 4 && c.weapon_equal == 1 && c.fg_above_one == 1);
+    assert(c.world_equal == 3 && c.weapon_equal == 2 && c.fg_above_one == 1);
     assert(c.weapon_fg_min == 0.8f && c.weapon_fg_max == 1.5f);
     fg[0] = 0.15f; // a world pixel differs
     c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
-    assert(c.world_equal == 3 && c.world_max_diff > 0.049f && c.world_max_diff < 0.051f);
+    assert(c.world_equal == 2 && c.world_max_diff > 0.049f && c.world_max_diff < 0.051f);
 }
 
 // The replacement is the weapon depth RR gets: world depth unchanged, the weapon slice in
