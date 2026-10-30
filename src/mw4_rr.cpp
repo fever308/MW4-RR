@@ -240,6 +240,8 @@ static rrtrace::Probe &Observer() {
         v->replace_evaluate = &SrReplacement;
         v->after_evaluate = &SrCompleted;
         v->after_constants = &FrameCamera;
+        v->fg_depth = [](const rrtrace::FgTag &t, sl::Resource &r) { return LiveRR().FgTag(t, r); };
+        v->fg_result = [](const rrtrace::FgTag &t, sl::Result r) { LiveRR().FgResult(t, r); };
         v->before_shutdown = &BeforeNgxShutdown;
         v->after_shutdown = &AfterNgxShutdown;
         return v;

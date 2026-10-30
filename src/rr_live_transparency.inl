@@ -132,7 +132,7 @@ bool TransparencyBudget(const D3D12_RESOURCE_DESC &source, UINT w, UINT h) {
         sss = (std::max)(sss, s.gpu.sss.bytes);
         water = (std::max)(water, s.gpu.water.bytes);
     }
-    const UINT64 kept = persistent.bytes;
+    const UINT64 kept = Kept();
     // Protect mandatory depth conversion and enabled SSS even while some slots
     // have not yet needed those resources. Exact device allocation sizes only.
     auto depth_desc = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);

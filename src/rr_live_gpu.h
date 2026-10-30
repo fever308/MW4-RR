@@ -279,7 +279,9 @@ struct GpuFrame {
     ComPtr<ID3D12Resource> specular_hit, hit_source;
     // Heap slots after the gate's: weapon depth's source and target (WeaponDepth), then the
     // guide shader's u4 water classification (WaterTarget).
-    static constexpr UINT DepthSource = 12, WeaponTarget = 13, WaterSlot = 14, HeapSize = 15;
+    // Weapon depth for Frame Generation (FgWeaponDepth): its source and target.
+    static constexpr UINT DepthSource = 12, WeaponTarget = 13, WaterSlot = 14, FgSource = 15,
+                          FgTarget = 16, HeapSize = 17;
     // The header (the gate's constants): the CPU writes bytes 0..HeaderWritten-1 every frame
     // (Header, WaterHeader). Then the stats UAV with its readback (layout at Prepare,
     // rr_gate_stats.h).
@@ -302,6 +304,12 @@ struct GpuFrame {
         bool ready{};
     } water;
     ComPtr<ID3D12DescriptorHeap> heap;
+    // Weapon depth for Frame Generation (rr_fg_depth.h): this slot's own texture, the size of
+    // the game's whole depth resource, kept with the slot until its GPU work completes. It is
+    // simultaneous-access, so it is back in COMMON after every submission. fg_bytes is its
+    // share of bytes; fg_growth what the reserve grew for it (given back with it).
+    ComPtr<ID3D12Resource> fg_depth;
+    UINT64 fg_bytes{}, fg_growth{};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_fp{};
     UINT64 bytes{};
     UINT w{}, h{}, ow{}, oh{};
@@ -758,6 +766,42 @@ struct GpuFrame {
         TestPass(cl, p, p.weapon_root.Get(), p.weapon_depth.Get(), DepthSource, linear,
                  WeaponTarget, c, 8);
     }
+    // Frame Generation's depth (rr_fg_depth.h): RR's depth source for this frame (the private
+    // copy of the game's depth, or the game's R32_FLOAT depth, both a shader resource here)
+    // through the weapon depth shader into fg_depth, the whole resource from its origin, so
+    // Frame Generation's tag extent keeps its meaning. Leaves fg_depth a non-pixel shader
+    // resource, the state its tag declares. The game's depth is only read.
+    void FgWeaponDepth(ID3D12GraphicsCommandList *cl, Pipelines &p,
+                       const rrweapondepth::Mapping &m) {
+        const auto d = fg_depth->GetDesc();
+        SRV(p, use_depth ? depth.Get() : sr[1].Get(), FgSource);
+        UAV(p, fg_depth.Get(), FgTarget);
+        UINT c[8] = {UINT(d.Width), d.Height, 0, 0};
+        const float f[] = {m.scale, m.offset, m.sky, rrweapondepth::Knee};
+        memcpy(&c[4], f, sizeof(f));
+        Change(cl, fg_depth.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(p.weapon_root.Get());
+        cl->SetPipelineState(p.weapon_depth.Get());
+        cl->SetComputeRootDescriptorTable(0, Gpu(p, FgSource));
+        cl->SetComputeRootDescriptorTable(1, Gpu(p, FgTarget));
+        cl->SetComputeRoot32BitConstants(2, 8, c, 0);
+        cl->Dispatch(UINT((d.Width + 7) / 8), (d.Height + 7) / 8, 1);
+        Order(cl);
+        Change(cl, fg_depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    // Drops fg_depth from this slot's ledger (the caller gives back fg_growth). Only once the
+    // slot's GPU work has completed or before this frame records it.
+    void ReleaseFg(Budget &b) {
+        Require(b.bytes >= fg_bytes && bytes >= fg_bytes, "live allocation ledger underflow");
+        b.bytes -= fg_bytes;
+        bytes -= fg_bytes;
+        fg_depth.Reset();
+        fg_bytes = fg_growth = 0;
+    }
     void GateEnd(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history,
                  bool inference_ok) {
         if (inference_ok) {
@@ -877,9 +921,10 @@ struct GpuFrame {
 inline bool SlotReservationParts(ID3D12Device *device, const rrlive::GpuFrame &frame, UINT64 limit,
                                  UINT64 &base, UINT64 &depth) {
     base = depth = 0;
-    if (!device || frame.bytes > limit)
+    if (!device || frame.bytes > limit || frame.fg_bytes > frame.bytes)
         return false;
-    base = frame.bytes;
+    // Frame Generation's depth texture is counted once, with the persistent bytes (Kept).
+    base = frame.bytes - frame.fg_bytes;
     if (!frame.depth && !frame.depth_buffer)
         return true;
     if (!frame.depth || !frame.depth_buffer || !frame.w || !frame.h)

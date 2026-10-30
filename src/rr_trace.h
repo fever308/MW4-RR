@@ -27,6 +27,7 @@
 #include "rr_sr_reset.h"
 #include "rr_sr_eligibility.h"
 #include "rr_foreign_hook.h"
+#include "rr_fg_depth.h"
 #include <optional>
 
 namespace rrtrace {
@@ -280,6 +281,63 @@ inline TagInfo ReadTag(const sl::BaseStructure *base) {
     }
     return v;
 }
+// A slSetTagForFrame call's Frame Generation depth tag (rrfgdepth::FgDepthIndex), read only
+// through public fields. index == count: the call has none.
+struct FgTag {
+    unsigned frame{UINT_MAX}, viewport{UINT_MAX}, index{}, count{};
+    uint32_t lifecycle{}, state{}, extent_width{}, extent_height{};
+    void *native{};
+    sl::CommandBuffer *command{};
+};
+static_assert(rrfgdepth::DepthTag == sl::kBufferTypeDepth &&
+                  rrfgdepth::HudlessTag == sl::kBufferTypeHUDLessColor &&
+                  rrfgdepth::OnlyValidNow == uint32_t(sl::eOnlyValidNow),
+              "Frame Generation tag constants match Streamline's");
+inline bool ReadFgTag(const sl::ResourceTag *tags, uint32_t count, FgTag &v) {
+    uint32_t types[rrfgdepth::MaxTags]{};
+    v.count = count;
+    v.index = count;
+    if (!tags || !count || count > rrfgdepth::MaxTags)
+        return false;
+    __try {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (tags[i].structType != sl::ResourceTag::s_structType ||
+                tags[i].structVersion != 1)
+                return false;
+            types[i] = tags[i].type;
+        }
+        const unsigned at = rrfgdepth::FgDepthIndex(types, count);
+        if (at == count)
+            return false;
+        const auto &tag = tags[at];
+        auto *r = tag.resource;
+        if (!r || r->structType != sl::Resource::s_structType || r->structVersion != 1 ||
+            r->type != sl::ResourceType::eTex2d || !r->native)
+            return false;
+        v.index = at;
+        v.lifecycle = uint32_t(tag.lifecycle);
+        v.extent_width = tag.extent.width;
+        v.extent_height = tag.extent.height;
+        v.native = r->native;
+        v.state = r->state;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        v.index = count;
+        return false;
+    }
+}
+// Copies the caller's tags and its depth tag's resource description, so a replacement changes
+// only the copy. The copies keep every other field, `next` chains included.
+inline bool CopyTags(const sl::ResourceTag *tags, uint32_t count, unsigned index,
+                     sl::ResourceTag *out, sl::Resource &resource) {
+    __try {
+        memcpy(out, tags, sizeof(sl::ResourceTag) * count);
+        memcpy(&resource, tags[index].resource, sizeof(sl::Resource));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 inline const char *TagName(unsigned t) {
     switch (t) {
     case 0:
@@ -350,6 +408,12 @@ class Probe {
     void (*after_evaluate)(ID3D12GraphicsCommandList *, Kind, const NVSDK_NGX_Parameter *,
                            NVSDK_NGX_Result){};
     void (*after_constants)(uint32_t, uint32_t, const sl::Constants &){};
+    // Frame Generation depth (rr_fg_depth.h): called for every slSetTagForFrame call that tags
+    // Frame Generation's depth, with no lock of the probe held. True: tag `replacement`
+    // instead of the game's depth (a copy of its description, to change native and state).
+    bool (*fg_depth)(const FgTag &, sl::Resource &replacement){};
+    // After a replacement was tagged: Streamline's result for it (eOk: kept).
+    void (*fg_result)(const FgTag &, sl::Result){};
     bool (*before_shutdown)(HMODULE, ID3D12Device *){};
     void (*after_shutdown)(HMODULE, ID3D12Device *, bool){};
     static SlCall CurrentCall() {
@@ -851,9 +915,46 @@ class Probe {
         }
         return active->sl_eval(f, frame, inputs, count, cl);
     }
+    // Frame Generation depth (rr_fg_depth.h): only a call that tags Frame Generation's depth
+    // may be changed, and then only in a copy; the game's array is never written. A refused
+    // replacement re-sends the game's own tags, so Frame Generation keeps its input.
     static sl::Result Tags(const sl::FrameToken &frame, const sl::ViewportHandle &viewport,
                            const sl::ResourceTag *tags, uint32_t count, sl::CommandBuffer *cl) {
-        return active->sl_tags(frame, viewport, tags, count, cl);
+        auto *self = active;
+        FgTag fg;
+        sl::ResourceTag copy[rrfgdepth::MaxTags];
+        sl::Resource resource(sl::ResourceType::eTex2d, nullptr);
+        bool replaced = false;
+        if (self->fg_depth) {
+            LastError preserve_error;
+            if (ReadFgTag(tags, count, fg)) {
+                fg.frame = FrameIndex(frame);
+                fg.viewport = ViewIndex(viewport);
+                fg.command = cl;
+                try {
+                    replaced = CopyTags(tags, count, fg.index, copy, resource) &&
+                               self->fg_depth(fg, resource);
+                } catch (...) {
+                    replaced = false;
+                }
+            }
+        }
+        if (!replaced)
+            return self->sl_tags(frame, viewport, tags, count, cl);
+        copy[fg.index].resource = &resource;
+        const auto supplied = self->sl_tags(frame, viewport, copy, count, cl);
+        const auto result = supplied == sl::Result::eOk
+                                ? supplied
+                                : self->sl_tags(frame, viewport, tags, count, cl);
+        {
+            LastError preserve_error;
+            try {
+                if (self->fg_result)
+                    self->fg_result(fg, supplied);
+            } catch (...) {
+            }
+        }
+        return result;
     }
     static sl::Result Legacy(const sl::ViewportHandle &viewport, const sl::ResourceTag *tags,
                              uint32_t count, sl::CommandBuffer *cl) {

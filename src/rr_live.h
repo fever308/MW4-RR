@@ -4,6 +4,7 @@
 #include "rr_guide_health.h"
 #include "rr_water.h"
 #include "rr_weapon_depth.h"
+#include "rr_fg_depth.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
@@ -52,6 +53,10 @@ class Controller {
         UINT64 fence_value{};
         rrtrace::CameraInfo camera;
         std::array<float, 16> view{}, projection{};
+        // Weapon depth for Frame Generation (rr_fg_depth.h): AfterSR wrote gpu.fg_depth for
+        // this frame (fg_prepared), or why not.
+        bool fg_prepared{};
+        rrfgdepth::Reason fg_prepare{rrfgdepth::Reason::NotRecorded};
         std::array<Observed, 4> states{};
         rreval::Options options;
     };
@@ -132,6 +137,19 @@ class Controller {
     WeaponHold weapon_hold{};
     unsigned weapon_hold_changes{};
     rrweapondepth::Mapping weapon_logged{}; // The mapping last written to the log.
+    // Weapon depth for Frame Generation (rr_fg_depth.h). fg_paused: Streamline refused the
+    // replacement RefusalLimit times in a row; cleared when the setting is off. Textures live
+    // in the slots (GpuFrame::fg_depth); their reserve growth is part of test_reserve.
+    bool fg_paused{}, fg_memory_logged{}, fg_supplied_logged{};
+    unsigned fg_refusals{}, fg_diagnostics{};
+    UINT64 fg_memory_retry_at{}, fg_summary_at{};
+    struct FgSignature {
+        UINT lifecycle{}, state{}, extent_w{}, extent_h{}, width{}, height{}, format{},
+            inverted{}, motion{}, jittered{}, offset_x{}, offset_y{}, render_w{}, render_h{};
+        bool same_list{}, same_depth{}, slot{};
+        rrfgdepth::Reason reason{};
+        bool operator==(const FgSignature &) const = default;
+    } fg_logged{};
     // Water responsivity mask (rr_water.h).
     rrwater::Settings water;
     rrwater::Status water_status;
@@ -198,6 +216,14 @@ class Controller {
             logger(s);
     }
 
+    // Bytes that the pool projections count once, not per slot: the persistent allocations and
+    // every slot's Frame Generation depth texture (SlotReservationParts leaves it out).
+    UINT64 Kept() const {
+        UINT64 total = persistent.bytes;
+        for (const auto &s : slots)
+            total += s.gpu.fg_bytes;
+        return total;
+    }
     // Whether a shared texture (weapon depth's) is used in this evaluation; creates it on
     // first use. The reserve first grows by the texture's size on top of everything it
     // already holds, so the texture never takes room the pool or the SSS and transparency
@@ -642,6 +668,11 @@ class Controller {
                 !s.pending_sr && Complete(s, done)) {
                 auto cache = std::move(s.gpu);
                 cache.Retire();
+                // Weapon depth for Frame Generation turned off, or Frame Generation tags no
+                // depth any more: its textures go as slots retire.
+                if (!rrfgdepth::enabled.load(std::memory_order_relaxed) ||
+                    !rrfgdepth::status.FgSeen(GetTickCount64()))
+                    ReleaseFgTexture(cache);
                 s = {};
                 s.gpu = std::move(cache);
                 s.busy = false;
@@ -669,6 +700,152 @@ class Controller {
         }
     }
 
+    // Weapon depth for Frame Generation (rr_fg_depth.h). Gives back a slot's texture and the
+    // reserve it added, never below what is still allocated. Only for a slot whose GPU work
+    // completed, or in AfterSR before the frame records it.
+    void ReleaseFgTexture(GpuFrame &g) {
+        if (!g.fg_depth)
+            return;
+        const UINT64 growth = g.fg_growth;
+        g.ReleaseFg(budget);
+        test_reserve -= (std::min)(test_reserve, growth);
+        budget.limit = (std::max)(
+            {Budget::Minimum, budget.bytes, budget.limit - (std::min)(growth, budget.limit)});
+    }
+    // The slot's texture at w x h, created on first use. Like UseTest, the reserve grows by
+    // its size first, so it never takes room RR's pool counted on. False: no GPU memory (a
+    // second's wait; RR keeps running).
+    bool FgTexture(Slot &s, UINT w, UINT h, UINT64 now) {
+        auto &g = s.gpu;
+        if (g.fg_depth) {
+            const auto d = g.fg_depth->GetDesc();
+            if (d.Width == w && d.Height == h)
+                return true;
+            ReleaseFgTexture(g); // this slot's last use completed before it was reused
+        }
+        auto d = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+        const UINT64 n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+        const UINT64 old = budget.limit;
+        bool ok = n && n != UINT64_MAX && old <= UINT64_MAX - n &&
+                  budget.Reserve(pipelines.device.Get(), old + n);
+        if (ok) {
+            const UINT64 before = g.bytes;
+            try {
+                g.fg_depth = g.Allocate(pipelines, budget, d);
+                g.fg_bytes = g.bytes - before;
+                g.fg_growth = budget.limit - old;
+                test_reserve += g.fg_growth;
+            } catch (const std::exception &) {
+                g.fg_depth.Reset();
+                g.Unwind(budget, before);
+                budget.limit = old;
+                ok = false;
+            }
+        }
+        if (ok) {
+            fg_memory_logged = false;
+            return true;
+        }
+        fg_memory_retry_at = now + 1000;
+        if (!fg_memory_logged) {
+            fg_memory_logged = true;
+            Log("Weapon depth for Frame Generation: not enough GPU memory; the game's depth is "
+                "used, retried every second");
+        }
+        return false;
+    }
+    // In AfterSR, on the frame's SR list after RR's depth source is a shader resource and
+    // before RR's own passes: writes this frame's replacement (GpuFrame::FgWeaponDepth). The
+    // setting is read once here, so the frame's tag follows this decision. A failure here
+    // only leaves the frame's Frame Generation depth the game's own.
+    void PrepareFgDepth(Slot &s, ID3D12GraphicsCommandList *cl) {
+        s.fg_prepared = false;
+        const bool on = rrfgdepth::enabled.load(std::memory_order_relaxed);
+        if (!on) {
+            fg_paused = false;
+            fg_refusals = 0;
+            fg_supplied_logged = false;
+        }
+        const UINT64 now = GetTickCount64();
+        try {
+            const auto native = s.gpu.sr[1]->GetDesc();
+            const bool format_ok =
+                native.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                    ? s.gpu.use_depth && s.gpu.depth
+                    : native.Format == DXGI_FORMAT_R32_FLOAT && !s.gpu.use_depth;
+            rrweapondepth::Mapping map;
+            const bool mapped = rrweapondepth::Map(s.projection, map);
+            auto why = rrfgdepth::Prepare(on, fg_paused, rrfgdepth::status.FgSeen(now), format_ok,
+                                          mapped, now < fg_memory_retry_at);
+            if (why == rrfgdepth::Reason::Supplied &&
+                (native.Width > UINT_MAX || !FgTexture(s, UINT(native.Width), native.Height, now)))
+                why = rrfgdepth::Reason::Memory;
+            s.fg_prepare = why;
+            if (why != rrfgdepth::Reason::Supplied)
+                return;
+            s.gpu.FgWeaponDepth(cl, pipelines, map);
+            s.fg_prepared = true;
+        } catch (const std::exception &e) {
+            s.fg_prepare = rrfgdepth::Reason::NotRecorded;
+            std::string line = std::string("Weapon depth for Frame Generation: ") + e.what();
+            Log(line.c_str());
+        }
+    }
+    // One diagnostic line when a Frame Generation depth tag's metadata changes, at most 24 a
+    // session, and a 10 s summary of the reasons. Metadata only: no resource is read.
+    void FgDiagnose(const rrtrace::FgTag &t, const Slot *s, bool same_list, bool same_depth,
+                    rrfgdepth::Reason why, UINT64 now) {
+        FgSignature v{t.lifecycle, t.state, t.extent_width, t.extent_height};
+        v.same_list = same_list;
+        v.same_depth = same_depth;
+        v.slot = s != nullptr;
+        v.reason = why;
+        if (s && same_depth) {
+            const auto d = s->gpu.sr[1]->GetDesc();
+            v.width = UINT(d.Width);
+            v.height = d.Height;
+            v.format = UINT(d.Format);
+            v.offset_x = s->options.depth_x;
+            v.offset_y = s->options.depth_y;
+            v.render_w = s->options.width;
+            v.render_h = s->options.height;
+        }
+        if (s) {
+            v.inverted = s->camera.depth_inverted;
+            v.motion = s->camera.camera_motion;
+            v.jittered = s->camera.motion_jittered;
+        }
+        if (!(v == fg_logged) && fg_diagnostics < 24) {
+            fg_logged = v;
+            ++fg_diagnostics;
+            char line[512];
+            snprintf(line, sizeof(line),
+                     "FG depth tag: frame=%u view=%u lifecycle=%u extent=%ux%u state=0x%x "
+                     "rrFrame=%u sameList=%u sameDepth=%u depth=%ux%u format=%u "
+                     "srSubrect=%u,%u+%ux%u camera{depthInverted=%u cameraMotionIncluded=%u "
+                     "mvJittered=%u near=%g far=%g} -> %s",
+                     t.frame, t.viewport, t.lifecycle, t.extent_width, t.extent_height, t.state,
+                     unsigned(v.slot), unsigned(same_list), unsigned(same_depth), v.width,
+                     v.height, v.format, v.offset_x, v.offset_y, v.render_w, v.render_h,
+                     v.inverted, v.motion, v.jittered, s ? s->camera.near_plane : 0.f,
+                     s ? s->camera.far_plane : 0.f, rrfgdepth::Key(why));
+            Log(line);
+        }
+        if (!fg_summary_at)
+            fg_summary_at = now;
+        if (now - fg_summary_at >= 10000) {
+            fg_summary_at = now;
+            char counts[384];
+            rrfgdepth::status.Drain(counts, sizeof(counts));
+            if (counts[0]) {
+                char line[448];
+                snprintf(line, sizeof(line), "Weapon depth for Frame Generation (10s): %s",
+                         counts);
+                Log(line);
+            }
+        }
+    }
 #include "rr_live_pool.inl"
   public:
     explicit Controller(rreval::Api (*loader)(HMODULE) = &rreval::Api::Load) : resolve(loader) {}
@@ -683,6 +860,115 @@ class Controller {
     void SetTolerateIsolated(bool value) {
         std::lock_guard lock(mutex);
         tolerate_isolated = value;
+    }
+    // Weapon depth for Frame Generation (rr_fg_depth.h), from the Streamline tag hook with no
+    // other lock held: true hands Frame Generation this frame's replacement in `out` (the
+    // game's depth tag description, copied). Native identities are read before the lock.
+    bool FgTag(const rrtrace::FgTag &t, sl::Resource &out) {
+        auto &status = rrfgdepth::status;
+        const UINT64 now = GetTickCount64();
+        status.fg_seen_at.store(now, std::memory_order_relaxed);
+        rrfgdepth::Match m;
+        m.enabled = rrfgdepth::enabled.load(std::memory_order_relaxed);
+        if (!m.enabled && !rrfgdepth::observe.load(std::memory_order_relaxed)) {
+            status.Note(rrfgdepth::Reason::Disabled);
+            return false;
+        }
+        auto list = fg::NativeObject<ID3D12GraphicsCommandList>(
+            reinterpret_cast<IUnknown *>(t.command));
+        auto depth = fg::NativeObject<ID3D12Resource>(reinterpret_cast<IUnknown *>(t.native));
+        std::lock_guard lock(mutex);
+        m.paused = fg_paused;
+        m.lifecycle_now = t.lifecycle == rrfgdepth::OnlyValidNow;
+        m.rr_running = enabled && !failed && !retired;
+        Slot *s{};
+        for (auto &v : slots)
+            if (v.recorded && v.frame == t.frame && v.viewport == t.viewport &&
+                t.frame != UINT_MAX) {
+                if (s) {
+                    s = nullptr; // two slots for one frame: no identity
+                    break;
+                }
+                s = &v;
+            }
+        m.slot = s != nullptr;
+        bool same_list = false, same_depth = false;
+        if (s) {
+            m.prepared = s->fg_prepared;
+            m.prepare = s->fg_prepare;
+            same_list = list && s->sr_live && list.Get() == s->sr.Get();
+            same_depth = depth && s->gpu.sr[1] && depth.Get() == s->gpu.sr[1].Get();
+            m.same_list = same_list;
+            m.unsubmitted = !s->sealed;
+            m.same_depth = same_depth;
+        }
+        const auto why = rrfgdepth::Decide(m);
+        FgDiagnose(t, s, same_list, same_depth, why, now);
+        if (why != rrfgdepth::Reason::Supplied) {
+            status.Note(why);
+            return false;
+        }
+        const auto d = s->gpu.fg_depth->GetDesc();
+        out.native = s->gpu.fg_depth.Get();
+        out.memory = nullptr;
+        out.view = nullptr;
+        out.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        out.width = UINT(d.Width);
+        out.height = d.Height;
+        out.nativeFormat = DXGI_FORMAT_R32_FLOAT;
+        out.mipLevels = 1;
+        out.arrayLayers = 1;
+        out.gpuVirtualAddress = 0;
+        return true;
+    }
+    // Streamline's result for a replacement FgTag supplied. A refusal already re-sent the
+    // game's tags; RefusalLimit in a row pause the replacement until the setting is off.
+    void FgResult(const rrtrace::FgTag &t, sl::Result r) {
+        auto &status = rrfgdepth::status;
+        std::lock_guard lock(mutex);
+        if (r == sl::Result::eOk) {
+            status.Note(rrfgdepth::Reason::Supplied);
+            status.supplied_at.store(GetTickCount64(), std::memory_order_relaxed);
+            fg_refusals = 0;
+            if (!fg_supplied_logged) {
+                fg_supplied_logged = true;
+                char line[256];
+                snprintf(line, sizeof(line),
+                         "Weapon depth for Frame Generation: replacement supplied from frame %u "
+                         "(Streamline accepted the tag; whether Frame Generation uses it is not "
+                         "observed)",
+                         t.frame);
+                Log(line);
+            }
+            return;
+        }
+        status.Note(rrfgdepth::Reason::Rejected);
+        char line[160];
+        snprintf(line, sizeof(line),
+                 "Weapon depth for Frame Generation: Streamline refused the replacement (%d) on "
+                 "frame %u; the game's depth was tagged instead",
+                 int(r), t.frame);
+        Log(line);
+        if (++fg_refusals >= rrfgdepth::RefusalLimit && !fg_paused) {
+            fg_paused = true;
+            Log("Weapon depth for Frame Generation: off after 3 refusals in a row, until the "
+                "setting is turned off and on");
+        }
+    }
+    // The panel's line: the last reason, Supplied only while replacements were supplied within
+    // the last 2 s.
+    rrfgdepth::Reason FgState() const {
+        auto &status = rrfgdepth::status;
+        if (!rrfgdepth::enabled.load(std::memory_order_relaxed))
+            return rrfgdepth::Reason::Disabled;
+        const UINT64 now = GetTickCount64();
+        if (!status.FgSeen(now))
+            return rrfgdepth::Reason::NoFgTags;
+        const auto last = rrfgdepth::Reason(status.last.load(std::memory_order_relaxed));
+        if (last == rrfgdepth::Reason::Supplied &&
+            now - status.supplied_at.load(std::memory_order_relaxed) > 2000)
+            return rrfgdepth::Reason::NotRecorded;
+        return last;
     }
     // Weapon depth state for the panel. Restarting: RR is being recreated with the
     // depth type the setting asks for (the change takes effect once in-flight frames retire).
@@ -902,7 +1188,7 @@ class Controller {
                 depth = (std::max)(depth, d);
                 water_bytes = (std::max)(water_bytes, slot.gpu.water.bytes);
             }
-            const UINT64 kept = persistent.bytes;
+            const UINT64 kept = Kept();
             auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
             texture.Flags = D3D12_RESOURCE_FLAG_NONE;
             auto buffer = rrprivate::Buffer(((UINT64(s.gpu.w) * 4 + 255) & ~255ull) * s.gpu.h);
@@ -1691,6 +1977,7 @@ class Controller {
                 if (i != 1 || !s->gpu.use_depth)
                     Change(cl.Get(), s->gpu.sr[i].Get(), states[i],
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0);
+            PrepareFgDepth(*s, cl.Get());
             s->gpu.GateBegin(cl.Get(), pipelines, history.Get());
             if (s->sss_used) {
                 s->gpu.sss.Resolve(cl.Get(), pipelines, s->gpu.header.Get(), s->gpu.stats.Get(),
