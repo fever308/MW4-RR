@@ -44,10 +44,14 @@ validation, preset selection and retirement, unfinished command recordings,
 fence completion, exactly-once hook forwarding, private transition lock
 ordering, native Super Resolution replacement and history recovery, and
 spatial fallback coordinates, weapon depth, the water responsivity mask, the
-transparency albedo blend and the edge-aware Subsurface Scattering no-history fill
+transparency albedo blend, the edge-aware Subsurface Scattering no-history fill
 (`edge-fill`: weights, normalization, surface separation, frame/group/strip
 boundaries, unclassified and no-neighbour outcomes and input shapes, evaluated with
-the header the shader includes, not the compiled shader). The private-transition test includes an optional
+the header the shader includes, not the compiled shader) and the Subsurface Scattering coverage experiment
+(`sss-coverage`: key encoding, record age, generation and resize invalidation,
+camera reprojection direction, scale, jitter convention and age against two
+pixels of a real capture, and the off-screen, disocclusion, normal and
+moving-object rejections of the CPU mirror; it does not run the shader). The private-transition test includes an optional
 `RR_RELEASE_NEGATIVE_CONTROL` compile definition that deliberately bypasses
 the internal-call guard and is expected to fail. Never use that definition
 for an addon build.

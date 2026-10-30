@@ -69,19 +69,30 @@ def main():
                                '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
                                *extra)), False)
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))],
-        # The same with the edge-aware no-history fill (src/rr_edge_fill.h), a panel experiment.
-        *[(f'RRVrrtScaleSssHistory2Edge{suffix}',
-           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_ssshistory2_edge',
+        # The same with the panel experiments: the edge-aware no-history fill (src/rr_edge_fill.h,
+        # variant bit 0, EdgeBit) and the "SSS pixel" decision from reprojected Subsurface
+        # Scattering pass coverage (src/rr_sss_coverage.h, bit 1, CoverageBit), alone and together.
+        *[(f'RRVrrtScaleSssHistory2{name}{suffix}',
+           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_ssshistory2{tag}',
                         flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',
                                '-D', 'RR_SSS_MASK=1', '-D', 'RR_FILL_HISTORY=1',
                                '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
-                               '-D', 'RR_FILL_EDGE=1', *extra)), False)
+                               *defines, *extra)), False)
+          for name, tag, defines in (('Edge', '_edge', ('-D', 'RR_FILL_EDGE=1')),
+                                     ('Coverage', '_coverage', ('-D', 'RR_SSS_COVERAGE=1')),
+                                     ('EdgeCoverage', '_edge_coverage',
+                                      ('-D', 'RR_FILL_EDGE=1', '-D', 'RR_SSS_COVERAGE=1')))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
-        ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
+        ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False),
+        ('RRSSSDeinterleaveCoverage', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave_coverage',
+                                                   flags=('-D', 'RR_SSS_COVERAGE_OUT=1')), False)])
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
-        ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])
+        ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False),
+        ('RRSSSStencilMarkerPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_marker_ps', 'ps_6_0', 'ps_marker'), False)])
+    header(out / 'rr_sss_coverage.generated.h', [
+        ('RRSSSCoverageKey', compile_hlsl('rr_sss_coverage_key.hlsl', 'rr_sss_coverage_key'), False)])
     # Water responsivity mask (src/rr_water.h).
     header(out / 'rr_water_masks.generated.h', [
         ('RRWaterMasks', compile_hlsl('rr_water_masks.hlsl', 'rr_water_masks'), False)])

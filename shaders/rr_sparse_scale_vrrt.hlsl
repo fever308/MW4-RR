@@ -44,6 +44,94 @@ uint PixelCode(uint2 p){
 #if RR_SSS_MASK
 Texture2D<float> sssGuide:register(t2);
 #endif
+// RR_SSS_COVERAGE (src/rr_sss_coverage.h; needs RR_SSS_MASK): the "SSS pixel" decision also
+// comes from an earlier frame's Subsurface Scattering pass coverage (t10), reprojected with
+// this pixel's depth and both frames' cameras (b4) and used only where the surface stored
+// for that frame (t9) matches this one (t8). The RR guide is not read for it. CoverageFlags
+// bit 0 applies it; otherwise the baseline guide test above is applied unchanged and the
+// coverage decision is only counted (u2).
+#ifndef RR_SSS_COVERAGE
+#define RR_SSS_COVERAGE 0
+#endif
+#if RR_SSS_COVERAGE&&!RR_SSS_MASK
+#error RR_SSS_COVERAGE refines the SSS-masked selection and needs RR_SSS_MASK
+#endif
+#if RR_SSS_COVERAGE
+#include "rr_guide_math.hlsli"
+cbuffer CoverageControl:register(b4){
+ uint CoverageWidth,CoverageHeight,CoverageFlags,CoverageAge;
+ float CoverageAX,CoverageBX,CoverageAY,CoverageBY;
+ float CurrentScale,CurrentOffset,PreviousScale,PreviousOffset;
+ float4 Reproject0,Reproject1,Reproject2,Reproject3; // current view position -> previous clip
+ float DepthTolerance,NormalCos,CoveragePad0,CoveragePad1;
+}
+Texture2D<uint> currentKey:register(t8);
+Texture2D<uint> previousKey:register(t9);
+Texture2D<uint> previousCoverage:register(t10);
+RWByteAddressBuffer coverageCounters:register(u2);
+// rrssscov::Pixel
+static const uint PixelCovered=0,PixelNotCovered=1,PixelSky=2,PixelOffScreen=3,
+ PixelDisoccluded=4,PixelNormal=5,PixelUnknown=6;
+struct CoverageSurface{bool present,weapon;float depth;float3 normal;};
+CoverageSurface DecodeKey(uint key){
+ CoverageSurface s;uint high=key>>16;
+ s.present=(high&0x7fffu)!=0;s.weapon=(high&0x8000u)!=0;
+ s.depth=f16tof32(high&0x7fffu);s.normal=RRDecodeSurfaceNormal(key&0xffffu);
+ return s;
+}
+// rrssscov::Decide, same operations in the same order.
+uint CoverageDecide(uint2 p){
+ CoverageSurface s=DecodeKey(currentKey.Load(int3(p,0)));
+ if(!s.present)return PixelSky;
+ float3 q;
+ if(s.weapon)q=float3(float2(p)+0.5,s.depth);
+ else{
+  float z=CurrentScale/(s.depth+CurrentOffset);
+  float nx=(p.x+0.5)/float(CoverageWidth)*2-1,ny=1-(p.y+0.5)/float(CoverageHeight)*2;
+  float3 v=float3(z*(nx*CoverageAX+CoverageBX),z*(ny*CoverageAY+CoverageBY),z);
+  float4 c=v.x*Reproject0+v.y*Reproject1+v.z*Reproject2+Reproject3;
+  if(!(c.w>0))return PixelOffScreen;
+  q=float3((c.x/c.w*0.5+0.5)*CoverageWidth,(0.5-c.y/c.w*0.5)*CoverageHeight,c.w);
+ }
+ if(!(q.x>=0&&q.y>=0&&q.x<float(CoverageWidth)&&q.y<float(CoverageHeight)))return PixelOffScreen;
+ // Coverage only from the footprint texel nearest q that is the same surface on its own.
+ int2 b=int2(floor(q.xy-0.5)),sel=0;
+ bool depthMatch=false;float nearest=1e38;
+ [unroll]for(int dy=0;dy<2;++dy)[unroll]for(int dx=0;dx<2;++dx){
+  int2 t=b+int2(dx,dy);
+  if(any(t<0)||t.x>=int(CoverageWidth)||t.y>=int(CoverageHeight))continue;
+  CoverageSurface u=DecodeKey(previousKey.Load(int3(t,0)));
+  if(!u.present||u.weapon!=s.weapon)continue;
+  float d=u.weapon?u.depth:PreviousScale/(u.depth+PreviousOffset);
+  if(!(q.z>=d*(1-DepthTolerance)&&q.z<=d*(1+DepthTolerance)))continue;
+  depthMatch=true;
+  if(dot(s.normal,u.normal)<NormalCos)continue;
+  float2 e=float2(t)+0.5-q.xy;float n=dot(e,e);
+  if(n<nearest){nearest=n;sel=t;}
+ }
+ if(!depthMatch)return PixelDisoccluded;
+ if(!(nearest<1e38))return PixelNormal;
+ uint v=previousCoverage.Load(int3(sel,0));
+ return v==1?PixelCovered:v==0?PixelNotCovered:PixelUnknown;
+}
+void CoverageCount(uint slot,bool value){
+ uint n=WaveActiveCountBits(value);
+ if(WaveIsFirstLane()&&n!=0){uint old;coverageCounters.InterlockedAdd(slot*4,n,old);}
+}
+// Whether the SSS-masked source takes native lobe 2 here (rrssscov::Native), and the counts
+// of rrssscov::Counter.
+bool CoverageSelect(uint2 p,bool baseline){
+ uint d=CoverageDecide(p);
+ bool coverage=d==PixelCovered;
+ bool native=(CoverageFlags&1)!=0?coverage:baseline;
+ CoverageCount(0,true);CoverageCount(1,baseline);CoverageCount(2,coverage);
+ CoverageCount(3,baseline!=coverage);CoverageCount(4,native);CoverageCount(5,d==PixelSky);
+ CoverageCount(6,d==PixelOffScreen);CoverageCount(7,d==PixelDisoccluded);
+ CoverageCount(8,d==PixelNormal);CoverageCount(9,d==PixelUnknown);
+ CoverageCount(10,(currentKey.Load(int3(p,0))&0x80000000u)!=0);
+ return native;
+}
+#endif
 float4 UnpackLobe(uint2 packed){
  return float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
 }
@@ -231,7 +319,11 @@ void main(uint3 id:SV_DispatchThreadID){
 #endif
 #if RR_SSS_MASK
  // An out-of-range load returns 0, so a mismatched guide leaves raw lighting.
- if(sssGuide.Load(int3(p,0))==0){ca=rawA;cb=rawB;outWeights=rawWeights;}
+ bool sssNative=!(sssGuide.Load(int3(p,0))==0);
+#if RR_SSS_COVERAGE
+ sssNative=CoverageSelect(p,sssNative);
+#endif
+ if(!sssNative){ca=rawA;cb=rawB;outWeights=rawWeights;}
 #endif
 #ifdef RR_PACKED_FLOAT
  color[p]=asfloat(uint4(ca,cb));

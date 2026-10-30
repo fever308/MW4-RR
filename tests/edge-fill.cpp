@@ -382,14 +382,23 @@ static void Shapes() {
                   rrsparsecopy::VariantIndex(rrlighting::SssHistory2, rrsparsecopy::EdgeBit) == 5 &&
                   rrsparsecopy::VariantIndex(rrlighting::Count - 1, rrsparsecopy::Variants - 1) <
                       rrlighting::Count * rrsparsecopy::Variants);
-    static_assert(rrsparsecopy::PrivateDescriptors == 10 &&
-                  rrsparsecopy::EdgeTableParameter == 5);
+    // Descriptors 0-4 base, 5-9 edge, 10-12 the Subsurface Scattering coverage selection;
+    // its root parameters follow the edge table when both bits are set.
+    static_assert(rrsparsecopy::EdgeDescriptor == 5 && rrsparsecopy::CoverageDescriptor == 10 &&
+                  rrsparsecopy::PrivateDescriptors == 13 &&
+                  rrsparsecopy::EdgeTableParameter == 5 &&
+                  rrsparsecopy::CoverageTableParameter(rrsparsecopy::CoverageBit) == 5 &&
+                  rrsparsecopy::CoverageTableParameter(rrsparsecopy::EdgeBit |
+                                                       rrsparsecopy::CoverageBit) == 6 &&
+                  rrsparsecopy::VariantIndex(rrlighting::SssHistory2,
+                                             rrsparsecopy::EdgeBit | rrsparsecopy::CoverageBit) ==
+                      7);
 }
 #endif
 
 int main() {
-    // The experiment starts off: the production default is the baseline group mean.
-    CHECK(!rredgefill::enabled.load());
+    // Always on (no panel control); the baseline group mean stays the fallback.
+    CHECK(rredgefill::enabled.load());
     CHECK(std::string_view(Label(State::Baseline)).find("baseline") != std::string_view::npos);
     Weights();
     Classification();

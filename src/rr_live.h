@@ -1,5 +1,6 @@
 #pragma once
 #include "rr_live_gpu.h"
+#include "rr_sss_coverage_gpu.h"
 #include "rr_live_policy.h"
 #include "rr_guide_health.h"
 #include "rr_water.h"
@@ -34,6 +35,8 @@ class Controller {
     };
     struct Slot {
         rrsss::Producer sss;
+        // The coverage key pass's descriptor set this frame used (CoverageHistory::Sets: none).
+        unsigned coverage_set = CoverageHistory::Sets;
         bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
@@ -206,6 +209,18 @@ class Controller {
     // Latest guide an admitted SR submission resolves, for SSS-masked lighting.
     rrsssmask::Record sss_mask;
     ComPtr<ID3D12Resource> sss_mask_guide;
+    // Subsurface Scattering coverage experiment (rr_sss_coverage.h): the history ring, the
+    // record sealed with the latest admitted guide, and the panel's counts. The ring is in the
+    // persistent ledger; coverage_reserve is the budget growth it added, given back by
+    // Reconfigure with test_reserve.
+    CoverageHistory coverage_history;
+    rrssscov::Record coverage_record;
+    bool coverage_failed{};
+    UINT64 coverage_retry_after{};
+    rrssscov::Totals coverage_window, coverage_last;
+    UINT64 coverage_window_start{};
+    UINT64 coverage_key_skips{}; // surface keys skipped because the entry was still in flight
+    rrssscov::FrameReason coverage_reason = rrssscov::FrameReason::NoRecord;
     bool hit_enabled{};
     unsigned hit_reports{};
     HMODULE runtime{};
@@ -611,6 +626,11 @@ class Controller {
         water_retry_after = 0;
         sss_mask = {};
         sss_mask_guide.Reset();
+        coverage_record = {};
+        // Its allocations are in the persistent ledger released below; its budget growth is
+        // in test_reserve.
+        coverage_history.Release();
+        coverage_retry_after = 0;
         history.Reset();
         zero.Reset();
         persistent.Release(budget);
@@ -683,6 +703,7 @@ class Controller {
                 const auto finite = s.gate_recorded ? s.gpu.ReadFinite() : std::array<UINT, 2>{};
                 const bool sss = s.sss_used && s.sss.admission.accepted;
                 const bool glass = s.transparency_used && s.transparency_accepted;
+                CoverageCounters(s);
                 // A frame whose gate never ran never reached RR: no guide counts for it.
                 health.Frame(v, {finite[0], finite[1], sss, glass, s.gate_recorded && s.hit_used,
                                  s.gate_recorded && s.responsivity_used});
@@ -738,6 +759,143 @@ class Controller {
         } else if (sss_mask_guide && sss_mask_guide == s.gpu.sss.guide) {
             sss_mask = {};
             sss_mask_guide.Reset();
+        }
+        SealSssCoverage(s, accepted);
+    }
+    // The coverage record follows the guide: replaced by an admitted guide whose frame
+    // recorded both its surface key and its coverage, dropped with a rejected one. An
+    // admitted frame without coverage keeps the older record: Check still limits its age,
+    // generation and extent, and with MaxAge < Ring its entry is not rewritten while usable.
+    void SealSssCoverage(const Slot &s, bool accepted) {
+        if (!accepted) {
+            if (coverage_record.valid && coverage_record.frame == s.frame)
+                coverage_record = {};
+            return;
+        }
+        const auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
+        if (!coverage_history.Matches(s.gpu.w, s.gpu.h) || !s.sss.marked ||
+            e.key_frame != s.frame || e.coverage_frame != s.frame || e.generation != s.generation) {
+            // A record from before a camera cut never outlives the cut.
+            if (s.camera.reset != 0)
+                coverage_record = {};
+            return;
+        }
+        coverage_record = {true, s.frame, s.generation, s.gpu.w, s.gpu.h, CoverageCamera(s)};
+    }
+    static rrssscov::Camera CoverageCamera(const Slot &s) {
+        rrssscov::Camera c;
+        c.view = s.view;
+        c.projection = s.projection;
+        c.frame = s.frame;
+        c.viewport = s.viewport;
+        c.valid = s.camera.readable && s.camera.basis_valid && s.camera.projection_valid;
+        c.reset = s.camera.reset != 0;
+        return c;
+    }
+    // Allocates the coverage history once it is wanted and a mandatory RR slot exists; a
+    // budget or memory shortage retries a second later, any other failure turns the
+    // experiment off for the session. Never fails RR.
+    bool PrepareSssCoverage(UINT w, UINT h) {
+        if (coverage_history.ready)
+            return coverage_history.Matches(w, h);
+        const UINT64 now = GetTickCount64();
+        if (coverage_failed || now < coverage_retry_after || !pipelines.device)
+            return false;
+        const UINT64 n = CoverageHistory::Bytes(pipelines.device.Get(), w, h);
+        const UINT64 old = budget.limit;
+        const UINT64 before = persistent.bytes;
+        try {
+            if (!n || old > UINT64_MAX - n || !budget.Reserve(pipelines.device.Get(), old + n))
+                throw rrprivate::AllocationDeferred();
+            test_reserve += budget.limit - old;
+            coverage_history.Prepare(pipelines, budget, persistent, w, h);
+            coverage_retry_after = 0;
+            Log("Subsurface Scattering coverage history allocated (experiment)");
+            return true;
+        } catch (const rrprivate::AllocationDeferred &) {
+            CoverageUnwind(before, old);
+            if (!coverage_retry_after)
+                Log("Subsurface Scattering coverage history waiting for GPU memory; retried "
+                    "every second");
+            coverage_retry_after = now + 1000;
+        } catch (const std::exception &e) {
+            CoverageUnwind(before, old);
+            coverage_failed = true;
+            const std::string line =
+                std::string("Subsurface Scattering coverage experiment unavailable: ") + e.what();
+            Log(line.c_str());
+        }
+        return false;
+    }
+    // A failed preparation: nothing references its resources yet, so they and the budget
+    // growth are given back.
+    void CoverageUnwind(UINT64 before, UINT64 old_limit) {
+        coverage_history.Release();
+        persistent.Unwind(budget, before);
+        if (budget.limit > old_limit) {
+            test_reserve -= (std::min)(test_reserve, budget.limit - old_limit);
+            budget.limit = (std::max)(old_limit, budget.bytes);
+        }
+    }
+    // Right after a prepass: this frame's surface key, with a descriptor set no busy slot
+    // holds. Skipped (the frame then has no record) only if every set is held, which needs
+    // more busy slots than Sets.
+    void CoverageKey(Slot &s, ID3D12GraphicsCommandList *cl) {
+        if (!rrssscov::Wanted() || !sss_enabled || sss_failed || !PrepareSssCoverage(s.gpu.w, s.gpu.h))
+            return;
+        std::array<bool, CoverageHistory::Sets> held{};
+        for (const auto &o : slots)
+            if (&o != &s && o.busy && o.coverage_set < CoverageHistory::Sets)
+                held[o.coverage_set] = true;
+        unsigned set = 0;
+        while (set < CoverageHistory::Sets && held[set])
+            ++set;
+        if (set == CoverageHistory::Sets) {
+            // Logged at 1, 2, 4, 8, ...
+            if (!(++coverage_key_skips & (coverage_key_skips - 1)))
+                Log("Subsurface Scattering coverage: surface key skipped, every descriptor set "
+                    "is still in flight (raw lighting this frame)");
+            return;
+        }
+        if (coverage_history.Key(cl, pipelines, s.gpu.sources[3].Get(), s.frame, s.generation,
+                                 set))
+            s.coverage_set = set;
+    }
+    // The Subsurface Scattering pass of slot s records coverage (marker initializer).
+    bool CoverageMarking(const Slot &s, const rrsss::StencilSetup &stencil) const {
+        return rrssscov::Wanted() && coverage_history.Matches(s.gpu.w, s.gpu.h) &&
+               stencil.required && stencil.marker;
+    }
+    // The coverage texture this slot's resolve writes, or null for the baseline resolve.
+    ID3D12Resource *CoverageTarget(const Slot &s) {
+        auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
+        if (!s.sss.marked)
+            return nullptr;
+        // A marked producer gives 65504 where the baseline gives 0, so its resolve takes the
+        // coverage variant even when no record can be kept (the stamps below). Marking needs
+        // a matching ring and Reconfigure retires every slot before releasing it, so this
+        // test does not fail for a marked recording.
+        if (!coverage_history.Matches(s.gpu.w, s.gpu.h))
+            return nullptr;
+        if (e.key_frame == s.frame && e.generation == s.generation)
+            e.coverage_frame = s.frame;
+        return e.coverage.Get();
+    }
+    void CoverageCounters(const Slot &s) {
+        auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
+        if (!e.counted || e.key_frame != s.frame || !e.map)
+            return;
+        e.counted = false;
+        uint32_t v[rrssscov::Counters];
+        memcpy(v, e.map, sizeof(v));
+        const UINT64 now = GetTickCount64();
+        if (!coverage_window_start)
+            coverage_window_start = now;
+        coverage_window.Add(v, e.age);
+        if (now - coverage_window_start >= 1000) {
+            coverage_last = coverage_window;
+            coverage_window = {};
+            coverage_window_start = now;
         }
     }
 
@@ -1258,6 +1416,7 @@ class Controller {
             sss_enabled = value;
             sss_mask = {};
             sss_mask_guide.Reset();
+            coverage_record = {};
             policy.Reject();
         }
     }
@@ -1307,6 +1466,79 @@ class Controller {
     void ToggleSss() {
         std::lock_guard lock(mutex);
         SetSssEnabled(!sss_enabled);
+    }
+    // The coverage selection's inputs for the SSS-masked first spatial pass on cl's frame
+    // (rr_sss_coverage.h). reason says why there are none; apply: the selection is used
+    // (else only counted beside the baseline).
+    bool SssCoverage(ID3D12GraphicsCommandList *cl, bool apply, rrsparsecopy::CoverageInputs &out,
+                     rrssscov::FrameReason &reason) {
+        std::lock_guard lock(mutex);
+        out = {};
+        // Every return leaves its reason for the panel.
+        reason = coverage_reason = rrssscov::FrameReason::NoStorage;
+        if (!sss_enabled || sss_failed || !coverage_history.ready)
+            return false;
+        const Slot *match{};
+        for (const auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                if (match)
+                    return false;
+                match = &s;
+            }
+        if (!match)
+            return false;
+        auto &current = coverage_history.entries[rrssscov::Entry(match->frame)];
+        if (current.key_frame != match->frame || current.generation != generation)
+            return false;
+        const auto camera = CoverageCamera(*match);
+        reason = rrssscov::Check(coverage_record, match->frame, generation, match->gpu.w,
+                                 match->gpu.h, match->viewport, camera.reset);
+        coverage_reason = reason;
+        if (reason == rrssscov::FrameReason::Reset)
+            coverage_record = {}; // a cut: the record is from before it
+        if (reason != rrssscov::FrameReason::Ready)
+            return false;
+        const auto &previous = coverage_history.entries[rrssscov::Entry(coverage_record.frame)];
+        if (previous.key_frame != coverage_record.frame ||
+            previous.coverage_frame != coverage_record.frame ||
+            previous.generation != coverage_record.generation) {
+            reason = coverage_reason = rrssscov::FrameReason::NoStorage;
+            return false;
+        }
+        const unsigned age = match->frame - coverage_record.frame;
+        if (!rrssscov::Make(camera, coverage_record.camera, match->gpu.w, match->gpu.h, age, apply,
+                            out.constants)) {
+            reason = coverage_reason = rrssscov::FrameReason::Camera;
+            return false;
+        }
+        out.current = current.key;
+        out.previous = previous.key;
+        out.coverage = previous.coverage;
+        out.counters = current.counters;
+        out.readback = current.readback;
+        current.age = age;
+        return true;
+    }
+    // The pass recorded the selection: its counters are read once the frame completes.
+    void SssCoverageRecorded(ID3D12GraphicsCommandList *cl) {
+        std::lock_guard lock(mutex);
+        for (const auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                auto &e = coverage_history.entries[rrssscov::Entry(s.frame)];
+                if (e.key_frame == s.frame)
+                    e.counted = true;
+            }
+    }
+    struct SssCoverageState {
+        bool allocated{}, failed{}, waiting{};
+        rrssscov::FrameReason reason{};
+        rrssscov::Totals totals;
+        UINT64 key_skips{};
+    };
+    SssCoverageState SssCoverageReport() {
+        std::lock_guard lock(mutex);
+        return {coverage_history.ready, coverage_failed, coverage_retry_after != 0,
+                coverage_reason, coverage_last, coverage_key_skips};
     }
     bool SpecularHitEnabled() {
         std::lock_guard lock(mutex);
@@ -1482,6 +1714,7 @@ class Controller {
             s.sss.variant = variant;
             s.sss.original = original;
             s.sss.stencil = stencil;
+            s.sss.mark = CoverageMarking(s, stencil);
             s.sss.live = true;
             rrinternal::Scope copies;
             rrcompute::Tracker::Internal state;
@@ -1720,6 +1953,7 @@ class Controller {
             cl->Dispatch(x, y, z);
             dispatched = true;
             s.gpu.Convert(cl, pipelines);
+            CoverageKey(s, cl);
             restore.Restore(cl, true);
             return true;
         } catch (const std::exception &e) {
@@ -2230,7 +2464,7 @@ class Controller {
             s->gpu.GateBegin(cl.Get(), pipelines, history.Get());
             if (s->sss_used) {
                 s->gpu.sss.Resolve(cl.Get(), pipelines, s->gpu.header.Get(), s->gpu.stats.Get(),
-                                   history.Get());
+                                   history.Get(), CoverageTarget(*s));
             }
             CoverageBlend(*s, cl.Get(), o.width, o.height);
             if (s->transparency_used)

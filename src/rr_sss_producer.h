@@ -54,10 +54,15 @@ struct Producer {
     StencilSetup stencil;
     GraphicsOutputSnapshot original;
     bool live{}, submitted{}, written{};
+    // mark: record Subsurface Scattering coverage with the marker initializer
+    // (rrssscov::Marker); marked: this recording did, so its resolve must use the coverage
+    // resolve, which gives the guide 0 for the marker as the baseline does for 0.
+    bool mark{}, marked{};
     Admission admission;
     template <class Gpu>
     DrawResult Record(ID3D12GraphicsCommandList *cl, const ProducerDraw &draw, Gpu &gpu) {
         bool begun = false;
+        marked = false;
         return DrawOnce(
             [&] {
                 if (bool(original.DepthTarget().ptr) != stencil.required ||
@@ -70,7 +75,8 @@ struct Producer {
                 const auto depth = original.DepthTarget();
                 if (stencil.required) {
                     auto target = gpu.Target();
-                    cl->SetPipelineState(stencil.pipeline.Get());
+                    marked = mark && stencil.marker;
+                    cl->SetPipelineState(marked ? stencil.marker.Get() : stencil.pipeline.Get());
                     cl->OMSetRenderTargets(1, &target, FALSE, &depth);
                     if (stencil.replay_geometry)
                         draw.Issue(cl);
