@@ -8,6 +8,7 @@ struct Preferences {
     bool blend = true;
     bool hit = true;
     bool weapon_depth = true; // the weapon kept in front with its own depth (rr_weapon_depth.h)
+    bool fg_weapon_depth = false; // experimental: weapon depth for Frame Generation (rr_fg_depth.h)
     bool water = true;        // water responsivity mask (rr_water.h), preset F only
     bool replace_sr = true;   // RR takes the place of the game's SR when it can
     // Edge-aware Subsurface Scattering no-history fill (rr_edge_fill.h): a panel experiment,

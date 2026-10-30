@@ -4,6 +4,7 @@
 #include "rr_edge_fill.h"
 #include "rr_water.h"
 #include "rr_weapon_depth.h"
+#include "rr_fg_depth.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -16,6 +17,7 @@ static bool &requested_glass = preferences.glass;
 static bool &requested_tolerate = preferences.tolerate_isolated;
 static bool &requested_hit = preferences.hit;
 static bool &requested_weapon_depth = preferences.weapon_depth;
+static bool &requested_fg_weapon_depth = preferences.fg_weapon_depth;
 static bool &requested_water = preferences.water;
 static bool &requested_replace_sr = preferences.replace_sr;
 static bool &requested_sss_edge_fill = preferences.sss_edge_fill;
@@ -29,6 +31,8 @@ static void SaveToggles() {
                               requested_tolerate);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::set_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
+    reshade::set_config_value(nullptr, SettingsSection, "FgWeaponDepth",
+                              requested_fg_weapon_depth);
     reshade::set_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
     reshade::set_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
     reshade::set_config_value(nullptr, SettingsSection, "SubsurfaceScatteringEdgeAwareFill",
@@ -40,6 +44,9 @@ static void ApplyEnabled(bool allowed) {
     // a running RR and retries weapon depth held off since the last change.
     if (rrweapondepth::enabled.exchange(requested_weapon_depth) != requested_weapon_depth)
         ++rrweapondepth::changes;
+    // Read by RR once per frame (Controller::PrepareFgDepth): applies from the next frame.
+    if (rrfgdepth::enabled.exchange(requested_fg_weapon_depth) != requested_fg_weapon_depth)
+        ++rrfgdepth::changes;
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
     // A shader variant choice only: no history reset or RR restart.
@@ -71,6 +78,11 @@ static void LoadSettings() {
     requested_tolerate = true;
     reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::get_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
+    reshade::get_config_value(nullptr, SettingsSection, "FgWeaponDepth",
+                              requested_fg_weapon_depth);
+    bool fg_observe = false;
+    reshade::get_config_value(nullptr, SettingsSection, "FgWeaponDepthObserve", fg_observe);
+    rrfgdepth::observe.store(fg_observe, std::memory_order_relaxed);
     reshade::get_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
     reshade::get_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
     reshade::get_config_value(nullptr, SettingsSection, "SubsurfaceScatteringEdgeAwareFill",
@@ -255,6 +267,21 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                            "front of everything else; the rest of the scene keeps the game's "
                            "depth unchanged, so add-ons such as DLSS5 NR keep working. Changing "
                            "it restarts RR, like a preset change.");
+        ImGui::Unindent();
+    }
+    changed |= ImGui::Checkbox("Weapon depth for Frame Generation (experimental)",
+                               &requested_fg_weapon_depth);
+    {
+        ImGui::Indent();
+        const auto fg = LiveRR().FgState();
+        ImGui::Text("Frame Generation depth: %s", rrfgdepth::Label(fg));
+        ImGui::TextWrapped("An experiment: Frame Generation is given a copy of the game's depth "
+                           "with the weapon and hands remapped as Weapon depth remaps them for "
+                           "RR (world depth unchanged). It needs Ray Reconstruction running, "
+                           "which tracks each frame and writes the copy, but not the Weapon "
+                           "depth checkbox above. \"Supplied\" means Streamline accepted it, "
+                           "not that it looks better. It applies from the next frame, without a "
+                           "restart; Frame Generation's history is not reset.");
         ImGui::Unindent();
     }
     changed |= ImGui::Checkbox("Water responsivity mask", &requested_water);
