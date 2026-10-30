@@ -146,12 +146,17 @@ class Controller {
     // replacement RefusalLimit times in a row; cleared when the setting is off. Textures live
     // in the slots (GpuFrame::fg_depth); their reserve growth is part of test_reserve.
     bool fg_paused{}, fg_memory_logged{}, fg_supplied_logged{};
-    unsigned fg_refusals{}, fg_diagnostics{}, fg_changes{};
+    unsigned fg_refusals{}, fg_diagnostics{}, fg_changes{}, fg_pairs{};
     UINT64 fg_memory_retry_at{}, fg_summary_at{};
     struct FgSignature {
         UINT lifecycle{}, state{}, extent_w{}, extent_h{}, width{}, height{}, format{}, inverted{},
             motion{}, jittered{}, offset_x{}, offset_y{}, render_w{}, render_h{};
         bool same_list{}, same_depth{}, slot{}, submitted{};
+        // The tagged depth's own description, and the frame delta of the RR slot whose SR depth
+        // it is (NoMatch: none of the slots').
+        UINT fg_width{}, fg_height{}, fg_format{}, fg_flags{};
+        int match{NoMatch};
+        static constexpr int NoMatch = INT_MIN;
         bool operator==(const FgSignature &) const = default;
     } fg_logged{};
     // Water responsivity mask (rr_water.h).
@@ -819,8 +824,18 @@ class Controller {
     // One diagnostic line when a Frame Generation depth tag's metadata changes, at most 24 a
     // session, and a 10 s summary of the reasons. Metadata only: no resource is read.
     void FgDiagnose(const rrtrace::FgTag &t, const Slot *s, bool same_list, bool same_depth,
-                    rrfgdepth::Reason why, UINT64 now) {
+                    ID3D12Resource *depth, const D3D12_RESOURCE_DESC &tagged, rrfgdepth::Reason why,
+                    UINT64 now) {
         FgSignature v{t.lifecycle, t.state, t.extent_width, t.extent_height};
+        v.fg_width = UINT(tagged.Width);
+        v.fg_height = tagged.Height;
+        v.fg_format = UINT(tagged.Format);
+        v.fg_flags = UINT(tagged.Flags);
+        for (auto &o : slots)
+            if (depth && o.recorded && o.gpu.sr[1].Get() == depth) {
+                v.match = int(INT64(o.frame) - INT64(t.frame));
+                break;
+            }
         v.same_list = same_list;
         v.same_depth = same_depth;
         v.slot = s != nullptr;
@@ -840,20 +855,41 @@ class Controller {
             v.motion = s->camera.camera_motion;
             v.jittered = s->camera.motion_jittered;
         }
+        char delta[16] = "none";
+        if (v.match != FgSignature::NoMatch)
+            snprintf(delta, sizeof(delta), "%+d", v.match);
         if (!(v == fg_logged) && fg_diagnostics < 24) {
             fg_logged = v;
             ++fg_diagnostics;
-            char line[512];
+            char line[640];
             snprintf(line, sizeof(line),
                      "FG depth tag: frame=%u view=%u lifecycle=%u extent=%ux%u state=0x%x "
                      "rrFrame=%u sameList=%u srSubmitted=%u sameDepth=%u depth=%ux%u format=%u "
                      "srSubrect=%u,%u+%ux%u camera{depthInverted=%u cameraMotionIncluded=%u "
-                     "mvJittered=%u near=%g far=%g} -> %s",
+                     "mvJittered=%u near=%g far=%g} tagged=%ux%u format=%u flags=0x%x "
+                     "srDepthOfFrame=%s -> %s",
                      t.frame, t.viewport, t.lifecycle, t.extent_width, t.extent_height, t.state,
-                     unsigned(v.slot), unsigned(same_list), unsigned(v.submitted), unsigned(same_depth), v.width, v.height,
-                     v.format, v.offset_x, v.offset_y, v.render_w, v.render_h, v.inverted, v.motion,
-                     v.jittered, s ? s->camera.near_plane : 0.f, s ? s->camera.far_plane : 0.f,
-                     rrfgdepth::Key(why));
+                     unsigned(v.slot), unsigned(same_list), unsigned(v.submitted),
+                     unsigned(same_depth), v.width, v.height, v.format, v.offset_x, v.offset_y,
+                     v.render_w, v.render_h, v.inverted, v.motion, v.jittered,
+                     s ? s->camera.near_plane : 0.f, s ? s->camera.far_plane : 0.f, v.fg_width,
+                     v.fg_height, v.fg_format, v.fg_flags, delta, rrfgdepth::Key(why));
+            Log(line);
+        }
+        // The identities themselves for the first frames whose depth is not SR's: whether the
+        // game alternates depth textures, or tags a texture RR never saw.
+        if (s && !same_depth && fg_pairs < 16) {
+            ++fg_pairs;
+            char line[384];
+            int n = snprintf(line, sizeof(line),
+                             "FG depth pair: frame=%u tagged=%p srDepth=%p slots{", t.frame,
+                             static_cast<void *>(depth), static_cast<void *>(s->gpu.sr[1].Get()));
+            for (auto &o : slots)
+                if (o.recorded && n > 0 && size_t(n) < sizeof(line))
+                    n += snprintf(line + n, sizeof(line) - n, " %u:%p", o.frame,
+                                  static_cast<void *>(o.gpu.sr[1].Get()));
+            if (n > 0 && size_t(n) < sizeof(line))
+                snprintf(line + n, sizeof(line) - n, " }");
             Log(line);
         }
         if (!fg_summary_at)
@@ -899,6 +935,9 @@ class Controller {
         auto list =
             fg::NativeObject<ID3D12GraphicsCommandList>(reinterpret_cast<IUnknown *>(t.command));
         auto depth = fg::NativeObject<ID3D12Resource>(reinterpret_cast<IUnknown *>(t.native));
+        D3D12_RESOURCE_DESC tagged{};
+        if (depth)
+            tagged = depth->GetDesc();
         std::unique_lock lock(mutex);
         FgSettingChanged();
         m.paused = fg_paused;
@@ -927,7 +966,7 @@ class Controller {
             m.same_depth = same_depth;
         }
         const auto why = rrfgdepth::Decide(m);
-        FgDiagnose(t, s, same_list, same_depth, why, now);
+        FgDiagnose(t, s, same_list, same_depth, depth.Get(), tagged, why, now);
         if (why != rrfgdepth::Reason::Supplied) {
             status.Note(why);
             return false;
