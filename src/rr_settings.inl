@@ -34,16 +34,8 @@ static void SaveToggles() {
                               requested_tolerate);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::set_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
-    reshade::set_config_value(nullptr, SettingsSection, "FgWeaponDepth",
-                              requested_fg_weapon_depth);
     reshade::set_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
     reshade::set_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
-    reshade::set_config_value(nullptr, SettingsSection, "SubsurfaceScatteringCoverageSelection",
-                              requested_sss_coverage);
-    reshade::set_config_value(nullptr, SettingsSection, "SubsurfaceScatteringCoverageCompare",
-                              requested_sss_coverage_compare);
-    reshade::set_config_value(nullptr, SettingsSection, "SubsurfaceScatteringEdgeAwareFill",
-                              requested_sss_edge_fill);
 }
 static void ApplyEnabled(bool allowed) {
     config_allowed = allowed;
@@ -88,19 +80,16 @@ static void LoadSettings() {
     requested_tolerate = true;
     reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::get_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
-    reshade::get_config_value(nullptr, SettingsSection, "FgWeaponDepth",
-                              requested_fg_weapon_depth);
-    bool fg_observe = false;
-    reshade::get_config_value(nullptr, SettingsSection, "FgWeaponDepthObserve", fg_observe);
-    rrfgdepth::observe.store(fg_observe, std::memory_order_relaxed);
+    // Always on (Beta 3), without a panel control: earlier test builds' saved keys
+    // (FgWeaponDepth, FgWeaponDepthObserve, SubsurfaceScatteringCoverageSelection,
+    // SubsurfaceScatteringCoverageCompare, SubsurfaceScatteringEdgeAwareFill) are ignored.
+    requested_fg_weapon_depth = true;
+    rrfgdepth::observe.store(false, std::memory_order_relaxed);
+    requested_sss_coverage = true;
+    requested_sss_coverage_compare = false;
+    requested_sss_edge_fill = true;
     reshade::get_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
     reshade::get_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
-    reshade::get_config_value(nullptr, SettingsSection, "SubsurfaceScatteringCoverageSelection",
-                              requested_sss_coverage);
-    reshade::get_config_value(nullptr, SettingsSection, "SubsurfaceScatteringCoverageCompare",
-                              requested_sss_coverage_compare);
-    reshade::get_config_value(nullptr, SettingsSection, "SubsurfaceScatteringEdgeAwareFill",
-                              requested_sss_edge_fill);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -231,54 +220,6 @@ static void OnSwapchain(reshade::api::swapchain *, bool resize) {
 static void StatusRow(const char *name, rrstatus::State value) {
     ImGui::Text("%s: %s", name, rrstatus::Label(value));
 }
-// Subsurface Scattering coverage experiment (rr_sss_coverage.h).
-static void DrawSssCoverage(bool &changed) {
-    ImGui::Indent();
-    changed |= ImGui::Checkbox("Subsurface Scattering coverage selection (experiment)",
-                               &requested_sss_coverage);
-    changed |= ImGui::Checkbox("Compare Subsurface Scattering selections (counters)",
-                               &requested_sss_coverage_compare);
-    if (LiveRR().Running() && (requested_sss_coverage || requested_sss_coverage_compare)) {
-        const auto r = LiveRR().SssCoverageReport();
-        if (r.failed)
-            ImGui::TextUnformatted("Coverage history: unavailable (see ReShade.log)");
-        else if (!r.allocated)
-            ImGui::Text("Coverage history: %s",
-                        r.waiting ? "waiting for GPU memory" : "waiting for RR");
-        else
-            ImGui::Text("Coverage record: %s", rrssscov::Label(r.reason));
-        if (r.key_skips)
-            ImGui::Text("Frames without a surface key (GPU far behind): %llu",
-                        (unsigned long long)r.key_skips);
-        const auto &t = r.totals;
-        const double pixels = double(t.value[rrssscov::Pixels]);
-        if (t.frames && pixels > 0) {
-            auto pct = [&](unsigned i) { return 100.0 * double(t.value[i]) / pixels; };
-            ImGui::Text("Last second: %llu frames, record %.1f frames old on average",
-                        (unsigned long long)t.frames, double(t.age_sum) / double(t.frames));
-            ImGui::Text("Native history by the previous guide at the same pixel: %.2f%%",
-                        pct(rrssscov::BaselineNative));
-            ImGui::Text("Native history by reprojected Subsurface Scattering coverage: %.2f%%",
-                        pct(rrssscov::CoverageNative));
-            ImGui::Text("Pixels where the two differ: %.2f%%  (applied: %.2f%%)",
-                        pct(rrssscov::Differ), pct(rrssscov::Applied));
-            ImGui::Text("Coverage not usable: off-screen %.2f%%, disoccluded %.2f%%, "
-                        "normal %.2f%%, unknown %.2f%%",
-                        pct(rrssscov::CountOffScreen), pct(rrssscov::CountDisoccluded),
-                        pct(rrssscov::CountNormal), pct(rrssscov::CountUnknown));
-            ImGui::Text("Sky %.2f%%, first-person weapon %.2f%%", pct(rrssscov::CountSky),
-                        pct(rrssscov::CountWeapon));
-        }
-    }
-    ImGui::TextWrapped(
-        "Off is the baseline: Subsurface Scattering pixels are found from an earlier frame's "
-        "Subsurface Scattering guide at the same screen position. On, they are found from "
-        "where the game's Subsurface Scattering pass drew in that frame, followed to this "
-        "frame with the camera and each pixel's depth; pixels whose surface does not match "
-        "get raw lighting. The guide RR receives is unchanged. Compare counts both choices "
-        "without changing the picture. Switching either does not reset history.");
-    ImGui::Unindent();
-}
 static void DrawSettings(reshade::api::effect_runtime *) {
     std::lock_guard lock(settings_mutex);
     LoadSettings();
@@ -288,22 +229,6 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
     if (requested_sss && LiveRR().Running())
         ImGui::Text("SSS lighting: %s", rrsssmask::Label(SssMaskState()));
-    if (requested_sss) {
-        ImGui::Indent();
-        changed |= ImGui::Checkbox("Subsurface Scattering edge-aware fill (experiment)",
-                                   &requested_sss_edge_fill);
-        if (LiveRR().Running())
-            ImGui::Text("Edge-aware fill: %s",
-                        requested_sss_edge_fill ? rredgefill::Label(EdgeFillState())
-                                                : "off (baseline group mean)");
-        ImGui::TextWrapped("Off is the baseline. On, a Subsurface Scattering pixel with no ray "
-                           "this frame and no history is filled only from nearby rays on the "
-                           "same surface (matching depth, normal and material class) instead "
-                           "of every ray in its 16x16 block. For A/B comparison; switching it "
-                           "does not reset history.");
-        ImGui::Unindent();
-        DrawSssCoverage(changed);
-    }
     changed |= ImGui::Checkbox("Transparency albedo blend", &requested_blend);
     changed |= ImGui::Checkbox("Specular hit distance", &requested_hit);
     changed |= ImGui::Checkbox("Weapon depth", &requested_weapon_depth);
@@ -330,21 +255,6 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                            "front of everything else; the rest of the scene keeps the game's "
                            "depth unchanged, so add-ons such as DLSS5 NR keep working. Changing "
                            "it restarts RR, like a preset change.");
-        ImGui::Unindent();
-    }
-    changed |= ImGui::Checkbox("Weapon depth for Frame Generation (experimental)",
-                               &requested_fg_weapon_depth);
-    {
-        ImGui::Indent();
-        const auto fg = LiveRR().FgState();
-        ImGui::Text("Frame Generation depth: %s", rrfgdepth::Label(fg));
-        ImGui::TextWrapped("An experiment: Frame Generation is given a copy of the game's depth "
-                           "with the weapon and hands remapped as Weapon depth remaps them for "
-                           "RR (world depth unchanged). It needs Ray Reconstruction running, "
-                           "which tracks each frame and writes the copy, but not the Weapon "
-                           "depth checkbox above. \"Supplied\" means Streamline accepted it, "
-                           "not that it looks better. It applies from the next frame, without a "
-                           "restart; Frame Generation's history is not reset.");
         ImGui::Unindent();
     }
     changed |= ImGui::Checkbox("Water responsivity mask", &requested_water);

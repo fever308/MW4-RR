@@ -37,7 +37,8 @@
 namespace rrssscov {
 // Which predicate the SSS-masked lighting source uses.
 enum class Selection : unsigned { Baseline, Coverage };
-inline std::atomic<unsigned> selection{unsigned(Selection::Baseline)};
+// Always the coverage selection (Beta 3), with no panel control; Baseline stays for tests.
+inline std::atomic<unsigned> selection{unsigned(Selection::Coverage)};
 // Count both predicates' choices every frame for the panel (diagnostic only).
 inline std::atomic<bool> compare{};
 inline bool Wanted() {

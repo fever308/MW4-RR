@@ -420,11 +420,14 @@ void Selections() {
     t.Add(v, 3);
     assert(t.frames == 2 && t.value[Pixels] == 200 && t.value[Differ] == 14 && t.age_sum == 4);
     static_assert(sizeof(Constants) == 32 * 4 && CounterBytes == 64);
-    // Session state starts at the baseline, with no comparison.
-    assert(selection.load() == unsigned(Selection::Baseline) && !compare.load() && !Wanted());
+    // Always the coverage selection (no control), without the comparison counters.
+    assert(selection.load() == unsigned(Selection::Coverage) && !compare.load() && Wanted());
+    selection = unsigned(Selection::Baseline);
+    assert(!Wanted());
     compare = true;
     assert(Wanted());
     compare = false;
+    selection = unsigned(Selection::Coverage);
 }
 } // namespace
 

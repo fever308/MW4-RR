@@ -397,8 +397,8 @@ static void Shapes() {
 #endif
 
 int main() {
-    // The experiment starts off: the production default is the baseline group mean.
-    CHECK(!rredgefill::enabled.load());
+    // Always on (no panel control); the baseline group mean stays the fallback.
+    CHECK(rredgefill::enabled.load());
     CHECK(std::string_view(Label(State::Baseline)).find("baseline") != std::string_view::npos);
     Weights();
     Classification();

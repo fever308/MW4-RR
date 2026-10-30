@@ -37,7 +37,8 @@ namespace rrfgdepth {
 
 // The setting as applied (rr_settings.inl ApplyEnabled). Read once per frame by AfterSR,
 // so a change applies from the next frame RR records; the frame's tag follows that frame.
-inline std::atomic<bool> enabled{};
+// Always on (Beta 3), with no panel control.
+inline std::atomic<bool> enabled{true};
 // FgWeaponDepthObserve=1 in ReShade.ini (no panel control): with the setting off, still match
 // each Frame Generation depth tag to RR's frame and log its metadata (Controller::FgDiagnose),
 // replacing nothing. For establishing the path before trying the replacement.
