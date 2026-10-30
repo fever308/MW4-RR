@@ -14,6 +14,9 @@ struct Preferences {
     // counters: panel experiments, off (the baseline guide test) until visually validated.
     bool sss_coverage = false;
     bool sss_coverage_compare = false;
+    // Edge-aware Subsurface Scattering no-history fill (rr_edge_fill.h): a panel experiment,
+    // off (the baseline group mean) until it is visually validated.
+    bool sss_edge_fill = false;
     unsigned preset = 6;
     bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame
 };

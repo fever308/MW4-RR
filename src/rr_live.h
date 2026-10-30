@@ -906,6 +906,27 @@ class Controller {
             *age = match->frame - sss_mask.frame;
         return sss_mask_guide;
     }
+    // This frame's surface for the edge-aware no-history fill (rr_edge_fill.h), from the
+    // slot SssMask() matches on cl: its prepass PackedSurface and the guide conversion's
+    // normals and Status, recorded earlier on cl and left COMMON. False without exactly
+    // one such slot with converted guides.
+    bool EdgeSurface(ID3D12GraphicsCommandList *cl, ComPtr<ID3D12Resource> &surface,
+                     ComPtr<ID3D12Resource> &normal, ComPtr<ID3D12Resource> &status) {
+        std::lock_guard lock(mutex);
+        const Slot *match{};
+        for (const auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                if (match)
+                    return false;
+                match = &s;
+            }
+        if (!match || !match->gpu.sources[3] || !match->gpu.guides[0] || !match->gpu.guides[3])
+            return false;
+        surface = match->gpu.sources[3];
+        normal = match->gpu.guides[0];
+        status = match->gpu.guides[3];
+        return true;
+    }
     void ToggleSss() {
         std::lock_guard lock(mutex);
         SetSssEnabled(!sss_enabled);

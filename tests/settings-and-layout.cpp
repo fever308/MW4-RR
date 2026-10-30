@@ -30,6 +30,8 @@ static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
 static_assert(defaults.tolerate_isolated && defaults.water);
 // The Subsurface Scattering coverage selection and its counters are experiments: off.
 static_assert(!defaults.sss_coverage && !defaults.sss_coverage_compare);
+// The edge-aware Subsurface Scattering fill is an experiment: off by default.
+static_assert(!defaults.sss_edge_fill);
 // The water responsivity mask starts on, and only preset F wants it.
 static_assert(rrwater::Settings{}.responsivity && rrwater::Settings{}.strength == 1.0f);
 static_assert(rrwater::Wanted(rrwater::Settings{}, true) &&
