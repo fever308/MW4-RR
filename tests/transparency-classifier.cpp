@@ -229,6 +229,27 @@ static void TestClassifierSynthetic() {
     uint64_t hash = 7;
     CHECK(!ClassifiedTarget(2, objects, hash, c) && hash == 7);
     CHECK(!ClassifiedTarget(0, objects, hash, c) && !ClassifiedTarget(2, nullptr, hash, c));
+    // Past the slot capacity, a candidate is refused unclassified: counted, logged once.
+    for (unsigned i = 0; c.Stats().candidates < Classifier::Capacity; ++i) {
+        const auto other = Container({{rrsss::SFI0, "feat"},
+                                      {rrsss::ISG1, "sample-index"},
+                                      {rrsss::OSG1, "two-targets"},
+                                      {rrsss::PSV0, "runtime"},
+                                      {0x4e444c49u, "build " + std::to_string(i)}});
+        CHECK(c.Classify(other.data(), other.size(), nullptr).profile);
+    }
+    lines.clear();
+    for (int i = 0; i < 2; ++i) {
+        const auto extra = Container({{rrsss::SFI0, "feat"},
+                                      {rrsss::ISG1, "sample-index"},
+                                      {rrsss::OSG1, "two-targets"},
+                                      {rrsss::PSV0, "runtime"},
+                                      {0x4e444c49u, "extra " + std::to_string(i)}});
+        v = c.Classify(extra.data(), extra.size(), nullptr);
+        CHECK(!v.target && !strcmp(v.status, "too-many-candidates"));
+    }
+    CHECK(c.Stats().overflow == 2 && lines.size() == 1 &&
+          lines[0].find("not classified: too-many-candidates") != std::string::npos);
 }
 
 static std::vector<unsigned char> Read(const wchar_t *path) {
@@ -340,6 +361,14 @@ static int Private(wchar_t **argv) {
     uint64_t hash = 0;
     CHECK(ClassifiedTarget(1, objects, hash, c) == verdicts[0].target && hash == tester_hash);
     CHECK(c.Stats().candidates == 1); // reused, not classified again
+    {
+        // The same bytes already registered under the other role are never accepted twice.
+        RecognizedTargets other;
+        CHECK(other.Add(tester_hash, tester.size(), Kind::Refraction));
+        Classifier conflict(&other);
+        const auto k = conflict.Classify(tester.data(), tester.size(), module);
+        CHECK(!k.target && !strcmp(k.status, "identity-kind-conflict") && !other.IsOit(tester_hash));
+    }
     // The refraction composite rebuilt with one codec removed is recognized as refraction.
     const auto refr = Rebuild(module, b723, [](std::string &t) {
         const std::string codec = ", %struct.GfxVelocityCodec";

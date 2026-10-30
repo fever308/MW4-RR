@@ -108,21 +108,29 @@ inline const char *Label(Note note) {
     static_assert(sizeof(names) / sizeof(names[0]) == size_t(Note::Count));
     return unsigned(note) < unsigned(Note::Count) ? names[unsigned(note)] : "unknown";
 }
-// The latest composition outcome, keyed by the camera frame it belongs to.
+// The composition outcome of recent camera frames, keyed by frame, so that a
+// later frame's composition recorded before an earlier frame's seal cannot
+// relabel the earlier one.
 struct CompositionNote {
-    uint32_t frame{UINT32_MAX};
-    Note note{Note::None};
+    static constexpr unsigned Frames = 8; // more than the frames RR keeps in flight
+    struct Entry {
+        uint32_t frame{UINT32_MAX};
+        Note note{Note::None};
+    } entries[Frames]{};
     void Set(uint32_t current, Note value) {
-        // The latch keeps the first composition per frame; a later one never overwrites it.
-        if (current == UINT32_MAX || frame == current)
+        if (current == UINT32_MAX)
             return;
-        frame = current;
-        note = value;
+        auto &e = entries[current % Frames];
+        // The latch keeps the first composition per frame; a later one never overwrites it.
+        if (e.frame == current)
+            return;
+        e = {current, value};
     }
     // recognized: a composition shader identity is registered in this process.
     Note For(uint32_t slot_frame, bool recognized) const {
-        if (frame == slot_frame && slot_frame != UINT32_MAX)
-            return note;
+        const auto &e = entries[slot_frame % Frames];
+        if (slot_frame != UINT32_MAX && e.frame == slot_frame)
+            return e.note;
         return recognized ? Note::None : Note::Unrecognized;
     }
 };

@@ -63,7 +63,8 @@ inline const Target *ClassifiedTarget(unsigned n, const reshade::api::pipeline_s
         const auto &s = *static_cast<const reshade::api::shader_desc *>(o.data);
         if (!s.code || !s.code_size)
             continue;
-        const auto v = classifier.Classify(s.code, s.code_size, nullptr, &rrsss::ReplayCompiler);
+        // The DXC companion is loaded only for a shader that passes the part filter.
+        const auto v = classifier.Classify(s.code, s.code_size);
         if (v.target) {
             hash = v.target->hash;
             return v.target;
@@ -561,12 +562,8 @@ class CoveragePipelineRegistry {
         {
             PipelineProof::QualityScope quality(native_device.Get(), expected);
             reshade::api::pipeline made{};
-            bool created;
-            {
-                rrtiming::Scope scope(rrtiming::Stage::AlternateCreate);
-                created = device->create_pipeline(layout, patch.count, patch.objects.data(), &made);
-            }
-            if (!created || !made.handle)
+            if (!device->create_pipeline(layout, patch.count, patch.objects.data(), &made) ||
+                !made.handle)
                 return "variant-creation-failed";
             out.variant = fg::NativeObject<ID3D12PipelineState>(
                 reinterpret_cast<ID3D12PipelineState *>(made.handle));

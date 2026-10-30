@@ -81,6 +81,13 @@ static void TestCompositionNote() {
     assert(n.For(6, true) == Note::Anchored);
     n.Set(UINT32_MAX, Note::Failed);
     assert(n.For(6, true) == Note::Anchored && n.For(UINT32_MAX, true) == Note::None);
+    // A later frame's composition recorded before an earlier frame's seal keeps both.
+    n.Set(10, Note::Context);
+    n.Set(11, Note::Anchored);
+    assert(n.For(10, true) == Note::Context && n.For(11, true) == Note::Anchored);
+    // Frames older than the ring are no longer known.
+    n.Set(10 + CompositionNote::Frames, Note::NoSlot);
+    assert(n.For(10, true) == Note::None && n.For(10 + CompositionNote::Frames, true) == Note::NoSlot);
 }
 
 static void TestReport() {

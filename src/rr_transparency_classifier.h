@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include "rr_sss_runtime_shader.h"
+#include "rr_sss_vertex_proof.h"
 #include "rr_transparency_shaders.h"
 // Structural recognition of other builds of the transparency composites, at
 // pipeline creation. The input is the bytecode the game's pipeline callback
@@ -80,7 +81,7 @@ inline const char *StructureVerdict(const Profile &p, const std::string &text) {
 
 // Counts for the log: unrelated shaders are counted, never logged one by one.
 struct ClassifierStats {
-    uint64_t unrelated, pinned, candidates, accepted, refused, retried;
+    uint64_t unrelated, pinned, candidates, accepted, refused, retried, overflow;
     uint64_t micros, slowest_micros; // disassembly and comparison time of the candidates
 };
 
@@ -95,6 +96,7 @@ class Classifier {
         bool structural{}; // accepted by structure, not by an exact pin
         bool decided{};    // this call made the decision (log it once)
         const Profile *profile{};
+        uint64_t hash{};
         uint64_t micros{};
     };
     static constexpr size_t Capacity = 32;
@@ -104,9 +106,22 @@ class Classifier {
                         std::span<const Profile> profiles = Profiles)
         : registry(registry), profiles(profiles) {}
 
-    // load, if given, supplies the compiler only when a candidate needs it.
-    Verdict Classify(const void *code, size_t size, HMODULE module,
-                     HMODULE (*load)() = nullptr) noexcept {
+    // The add-on's own DXC companion, loaded only once a shader passes the part filter.
+    Verdict Classify(const void *code, size_t size) noexcept {
+        return Classify(code, size, nullptr, true);
+    }
+    // A given DXC module (tests).
+    Verdict Classify(const void *code, size_t size, HMODULE module) noexcept {
+        return Classify(code, size, module, false);
+    }
+    ClassifierStats Stats() const {
+        return {unrelated.load(), pinned.load(),  candidates.load(), accepted.load(),
+                refused.load(),   retried.load(), overflow.load(),   micros.load(),
+                slowest.load()};
+    }
+
+  private:
+    Verdict Classify(const void *code, size_t size, HMODULE module, bool companion) noexcept {
         Verdict v;
         try {
             if (!code || !size || size > 4 * 1024 * 1024) {
@@ -129,7 +144,7 @@ class Classifier {
                 ++unrelated;
                 return v;
             }
-            const auto hash = rrsss::ShaderHash(code, size);
+            const auto hash = v.hash = rrsss::ShaderHash(code, size);
             if (const auto *t = registry->Find(hash, size); t && t->kind == v.profile->kind) {
                 v.target = t;
                 v.status = "recognized";
@@ -139,6 +154,7 @@ class Classifier {
             std::array<unsigned char, 32> digest{};
             if (!rrsss::Sha256(code, size, digest)) {
                 v.status = "hash-unavailable";
+                Overflow(v);
                 return v;
             }
             std::shared_ptr<Slot> slot;
@@ -150,6 +166,7 @@ class Classifier {
                 if (!slot) {
                     if (slots.size() >= Capacity) {
                         v.status = "too-many-candidates";
+                        Overflow(v);
                         return v;
                     }
                     slot = std::make_shared<Slot>();
@@ -163,7 +180,7 @@ class Classifier {
             if (!slot->done) {
                 const auto start = Now();
                 slot->result = Decide(*v.profile, code, size, hash,
-                                      module || !load ? module : load(), slot->target);
+                                      companion ? rrsss::ReplayCompiler() : module, slot->target);
                 v.micros = Now() - start;
                 rrtiming::Global().Add(rrtiming::Stage::Classify, v.micros * 1000);
                 micros += v.micros;
@@ -187,15 +204,9 @@ class Classifier {
             v.status = "classification-exception";
         }
         if (v.decided)
-            Report(v, code, size);
+            Report(v, size);
         return v;
     }
-    ClassifierStats Stats() const {
-        return {unrelated.load(), pinned.load(),  candidates.load(), accepted.load(),
-                refused.load(),   retried.load(), micros.load(),     slowest.load()};
-    }
-
-  private:
     static constexpr const char *Unavailable = "shader-compiler-unavailable";
     struct Slot {
         std::array<unsigned char, 32> digest{};
@@ -211,7 +222,8 @@ class Classifier {
     std::mutex mutex;
     std::vector<std::shared_ptr<Slot>> slots;
     std::atomic<uint64_t> unrelated{}, pinned{}, candidates{}, accepted{}, refused{}, retried{},
-        micros{}, slowest{};
+        overflow{}, micros{}, slowest{};
+    std::atomic<bool> overflow_logged{};
 
     static uint64_t Now() noexcept {
         LARGE_INTEGER t{}, f{};
@@ -230,10 +242,28 @@ class Classifier {
             return "shader-disassembly-failed";
         if (const char *why = StructureVerdict(p, text))
             return why;
+        // The same bytes registered under another role: never both.
+        if (const auto *t = registry->Find(hash, size); t && t->kind != p.kind)
+            return "identity-kind-conflict";
         target = registry->Add(hash, size, p.kind);
         return target ? "structure-matched" : "registry-full";
     }
-    void Report(const Verdict &v, const void *code, size_t size) noexcept {
+    // A candidate that could not be classified at all: counted, and logged once per process.
+    void Overflow(const Verdict &v) noexcept {
+        ++overflow;
+        if (!logger || overflow_logged.exchange(true))
+            return;
+        try {
+            char line[256];
+            snprintf(line, sizeof(line),
+                     "Transparency composite 0x%016llx not classified: %s (further ones counted "
+                     "only)",
+                     static_cast<unsigned long long>(v.hash), v.status);
+            logger(line);
+        } catch (...) {
+        }
+    }
+    void Report(const Verdict &v, size_t size) noexcept {
         if (!logger || !v.profile)
             return;
         try {
@@ -242,7 +272,7 @@ class Classifier {
             snprintf(line, sizeof(line),
                      "Transparency composite 0x%016llx (%zu B) %s as %s build of 0x%016llx: %s "
                      "(%.1f ms; candidates=%llu accepted=%llu refused=%llu unrelated=%llu)",
-                     static_cast<unsigned long long>(rrsss::ShaderHash(code, size)), size,
+                     static_cast<unsigned long long>(v.hash), size,
                      v.target ? "recognized" : "refused", v.profile->name,
                      static_cast<unsigned long long>(v.profile->canonical), v.status,
                      double(v.micros) / 1000.0, static_cast<unsigned long long>(s.candidates),

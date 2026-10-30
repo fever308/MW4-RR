@@ -138,10 +138,12 @@ void CoverageReportLocked(ULONGLONG now) {
         state = "failed";
         window = 3;
         k.last = rrblend::Reason::Failed;
+        k.last_stale = false; // the window's own state, not a remembered refusal
     } else if (blend_unavailable != rrblend::Reason::None) {
         state = "unavailable";
         window = 4;
         k.last = blend_unavailable;
+        k.last_stale = false;
     }
     if (k.covered != blend_mark)
         window |= 8;

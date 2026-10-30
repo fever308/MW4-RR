@@ -577,6 +577,9 @@ class Controller {
         transparency_source.Reset();
         transparency_composition = {};
         transparency_note = {};
+        transparency_counters = {};
+        transparency_window = transparency_logged_at = 0;
+        transparency_failing = false;
         CoverageReconfigured();
         initialized = false;
         signaled = 0;
