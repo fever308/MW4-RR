@@ -181,7 +181,7 @@ static void Normalization() {
     CHECK(EdgeResolve(sum, total, mean));
     CHECK(Near(mean.x, (1 + 1.5f) / 1.5f) && Near(mean.y, (2 + 3) / 1.5f) &&
           Near(mean.z, (3 + 4.5f) / 1.5f) && Near(mean.w, (4 + 6) / 1.5f));
-    // No accepted sample: no result (the shader keeps native temporal), never 0/0.
+    // No accepted sample: no result (the shader writes 0, as the baseline does with no sample), never 0/0.
     float4 none{};
     CHECK(!EdgeResolve({}, 0.0f, none));
     // The result stays inside fp16 range.

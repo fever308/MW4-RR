@@ -22,9 +22,9 @@
 // valid samples, normalized by their total weight. Spatial weights stay uniform, as in
 // the baseline, so a difference is attributable to edge rejection and boundary support.
 // Outcomes: Edge (a weighted mean), NoNeighbour (the centre is classified but no sample
-// passes: the pixel keeps its own native temporal lobe 2, the selection before the spatial
-// fill existed, instead of borrowing another surface's light) and Unclassified (the centre
-// has no usable surface: the baseline group mean, so those pixels match the baseline).
+// passes: 0, the baseline's own value for a fill with no sample, instead of borrowing
+// another surface's light) and Unclassified (the centre has no usable surface: the
+// baseline group mean, so those pixels match the baseline). Weight bits stay native in all.
 #define RR_EDGE_RADIUS 2
 #define RR_EDGE_SLICE (63.0f / 64.0f)
 #define RR_EDGE_MIN_COSINE 0.906f

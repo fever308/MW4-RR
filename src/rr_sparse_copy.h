@@ -593,6 +593,7 @@ class Pool {
         s.destination = {};
         s.scale.Reset();
         s.mask.Reset();
+        s.edge = {};
         s.command = cl;
         s.live = true;
         s.consumed = false;

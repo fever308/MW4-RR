@@ -218,7 +218,7 @@ void main(uint3 id:SV_DispatchThreadID){
  if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY){
 #if RR_FILL_EDGE
   uint outcome;const uint2 e=EdgeFill(p,w,h,outcome);
-  cb=outcome==RR_EDGE_OUTCOME_EDGE?e:outcome==RR_EDGE_OUTCOME_NO_NEIGHBOUR?nc.zw:GroupMean(gt.xy,found);
+  cb=outcome==RR_EDGE_OUTCOME_EDGE?e:outcome==RR_EDGE_OUTCOME_NO_NEIGHBOUR?uint2(0,0):GroupMean(gt.xy,found);
 #else
   cb=GroupMean(gt.xy,found);
 #endif
