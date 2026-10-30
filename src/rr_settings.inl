@@ -18,12 +18,8 @@ static bool &requested_glass = preferences.glass;
 static bool &requested_tolerate = preferences.tolerate_isolated;
 static bool &requested_hit = preferences.hit;
 static bool &requested_weapon_depth = preferences.weapon_depth;
-static bool &requested_fg_weapon_depth = preferences.fg_weapon_depth;
 static bool &requested_water = preferences.water;
 static bool &requested_replace_sr = preferences.replace_sr;
-static bool &requested_sss_coverage = preferences.sss_coverage;
-static bool &requested_sss_coverage_compare = preferences.sss_coverage_compare;
-static bool &requested_sss_edge_fill = preferences.sss_edge_fill;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
@@ -43,16 +39,8 @@ static void ApplyEnabled(bool allowed) {
     // a running RR and retries weapon depth held off since the last change.
     if (rrweapondepth::enabled.exchange(requested_weapon_depth) != requested_weapon_depth)
         ++rrweapondepth::changes;
-    // Read by RR once per frame (Controller::PrepareFgDepth): applies from the next frame.
-    if (rrfgdepth::enabled.exchange(requested_fg_weapon_depth) != requested_fg_weapon_depth)
-        ++rrfgdepth::changes;
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
-    // A shader variant and predicate choice only: no history reset or RR restart.
-    rrssscov::selection = unsigned(requested_sss_coverage ? rrssscov::Selection::Coverage
-                                                          : rrssscov::Selection::Baseline);
-    rrssscov::compare = requested_sss_coverage_compare;
-    rredgefill::enabled = requested_sss_edge_fill;
     LiveRR().SetTransparencyEnabled(requested_glass);
     LiveRR().SetTransparencyBlendEnabled(requested_blend);
     LiveRR().SetSpecularHitEnabled(requested_hit);
@@ -80,14 +68,6 @@ static void LoadSettings() {
     requested_tolerate = true;
     reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::get_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
-    // Always on (Beta 3), without a panel control: earlier test builds' saved keys
-    // (FgWeaponDepth, FgWeaponDepthObserve, SubsurfaceScatteringCoverageSelection,
-    // SubsurfaceScatteringCoverageCompare, SubsurfaceScatteringEdgeAwareFill) are ignored.
-    requested_fg_weapon_depth = true;
-    rrfgdepth::observe.store(false, std::memory_order_relaxed);
-    requested_sss_coverage = true;
-    requested_sss_coverage_compare = false;
-    requested_sss_edge_fill = true;
     reshade::get_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
     reshade::get_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);

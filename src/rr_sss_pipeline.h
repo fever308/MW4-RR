@@ -460,14 +460,14 @@ class PipelineRegistry {
                 stencil.required = true;
                 stencil.read_mask = depth.desc.FrontFace.StencilReadMask;
                 stencil.replay_geometry = true;
-                // Optional: without it the Subsurface Scattering coverage experiment records
+                // Optional: without it the Subsurface Scattering coverage selection records
                 // no coverage; the guide is unaffected.
                 PipelinePatch marker;
                 if (!marker.PrepareHelper(n, objects, true) ||
                     !create(marker, true, stencil.marker)) {
                     stencil.marker.Reset();
                     Report("Subsurface Scattering coverage initializer unavailable; the "
-                           "coverage experiment records no coverage");
+                           "coverage selection records no coverage");
                 }
             }
             Microsoft::WRL::ComPtr<ID3D12PipelineState> alternate;

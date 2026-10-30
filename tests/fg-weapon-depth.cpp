@@ -30,7 +30,7 @@ static void Classification() {
 
 static rrfgdepth::Match Ready() {
     rrfgdepth::Match m;
-    m.enabled = m.lifecycle_now = m.rr_running = m.slot = m.prepared = m.same_list = m.unsubmitted =
+    m.lifecycle_now = m.rr_running = m.slot = m.prepared = m.same_list = m.unsubmitted =
         m.same_depth = m.list_ok = true;
     return m;
 }
@@ -38,9 +38,6 @@ static void Decisions() {
     using rrfgdepth::Decide;
     assert(Decide(Ready()) == Reason::Supplied);
     auto m = Ready();
-    m.enabled = false;
-    assert(Decide(m) == Reason::Disabled);
-    m = Ready();
     m.paused = true;
     assert(Decide(m) == Reason::Paused);
     m = Ready();
@@ -95,13 +92,12 @@ static void Decisions() {
     assert(Decide(m) == Reason::Submitted);
 
     using rrfgdepth::Prepare;
-    assert(Prepare(true, false, true, true, true, false) == Reason::Supplied);
-    assert(Prepare(false, false, true, true, true, false) == Reason::Disabled);
-    assert(Prepare(true, true, true, true, true, false) == Reason::Paused);
-    assert(Prepare(true, false, false, true, true, false) == Reason::NoFgTags);
-    assert(Prepare(true, false, true, false, true, false) == Reason::Format);
-    assert(Prepare(true, false, true, true, false, false) == Reason::Projection);
-    assert(Prepare(true, false, true, true, true, true) == Reason::Memory);
+    assert(Prepare(false, true, true, true, false) == Reason::Supplied);
+    assert(Prepare(true, true, true, true, false) == Reason::Paused);
+    assert(Prepare(false, false, true, true, false) == Reason::NoFgTags);
+    assert(Prepare(false, true, false, true, false) == Reason::Format);
+    assert(Prepare(false, true, true, false, false) == Reason::Projection);
+    assert(Prepare(false, true, true, true, true) == Reason::Memory);
 }
 
 static void StatusAndLabels() {
@@ -119,11 +115,6 @@ static void StatusAndLabels() {
     char line[128];
     s.Drain(line, sizeof(line));
     assert(std::strcmp(line, "supplied=2 depth=1") == 0);
-    s.Drain(line, sizeof(line));
-    assert(line[0] == 0);
-    // A change of the setting starts the counts over.
-    s.Note(Reason::Disabled);
-    s.Reset();
     s.Drain(line, sizeof(line));
     assert(line[0] == 0);
     // A small buffer truncates, never overflows.
@@ -164,26 +155,6 @@ static void Tags() {
     assert(!rrtrace::ReadFgTag(nullptr, 3, t));
 }
 
-// The content check: world and weapon (SR depth above the slice) compared separately.
-static void Content() {
-    const float slice = 0.75f;
-    // 3x2 in rows 4 floats apart; the last column is padding and never read.
-    const float sr[] = {0.1f, 0.9f, 0.2f, 99, 0.95f, 0.3f, 0.8f, 99};
-    float fg[8];
-    std::memcpy(fg, sr, sizeof(fg));
-    auto c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
-    assert(c.world == 3 && c.world_equal == 3 && c.weapon == 3 && c.weapon_equal == 3);
-    assert(c.world_max_diff == 0 && c.weapon_sr_min == 0.8f && c.weapon_sr_max == 0.95f);
-    assert(c.fg_above_one == 0);
-    fg[1] = 1.5f; // a weapon pixel moved in front of the near plane
-    c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
-    assert(c.world_equal == 3 && c.weapon_equal == 2 && c.fg_above_one == 1);
-    assert(c.weapon_fg_min == 0.8f && c.weapon_fg_max == 1.5f);
-    fg[0] = 0.15f; // a world pixel differs
-    c = rrfgdepth::Compare(fg, sr, 3, 2, 4, slice);
-    assert(c.world_equal == 2 && c.world_max_diff > 0.049f && c.world_max_diff < 0.051f);
-}
-
 // The replacement is the weapon depth RR gets: world depth unchanged, the weapon slice in
 // front of the near plane (the shader is rrweapondepth::Hardware's twin).
 static void Remap() {
@@ -204,7 +175,6 @@ int main() {
     Decisions();
     StatusAndLabels();
     Tags();
-    Content();
     Remap();
     std::puts("fg-weapon-depth: passed");
     return 0;

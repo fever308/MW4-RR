@@ -60,26 +60,15 @@ def main():
         ('RRVrrtProbability', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability', flags=('-Ges',)), False),
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),
         ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False),
-        # SSS lighting (src/rr_lighting_source.h SssHistory2): on SSS pixels lobe 2 from native
-        # temporal wherever it has history, else fresh unboosted, else this frame's spatial mean.
-        *[(f'RRVrrtScaleSssHistory2{suffix}',
-           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_ssshistory2',
-                        flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',
-                               '-D', 'RR_SSS_MASK=1', '-D', 'RR_FILL_HISTORY=1',
-                               '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
-                               *extra)), False)
-          for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))],
-        # The same with the panel experiments: the edge-aware no-history fill (src/rr_edge_fill.h,
-        # variant bit 0, EdgeBit) and the "SSS pixel" decision from reprojected Subsurface
-        # Scattering pass coverage (src/rr_sss_coverage.h, bit 1, CoverageBit), alone and together.
+        # SSS coverage selects matched, drawn surfaces. Keep the group-mean variant for
+        # unavailable edge inputs, and the edge-aware fill for proven surface inputs.
         *[(f'RRVrrtScaleSssHistory2{name}{suffix}',
            compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_ssshistory2{tag}',
                         flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',
                                '-D', 'RR_SSS_MASK=1', '-D', 'RR_FILL_HISTORY=1',
                                '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
                                *defines, *extra)), False)
-          for name, tag, defines in (('Edge', '_edge', ('-D', 'RR_FILL_EDGE=1')),
-                                     ('Coverage', '_coverage', ('-D', 'RR_SSS_COVERAGE=1')),
+          for name, tag, defines in (('Coverage', '_coverage', ('-D', 'RR_SSS_COVERAGE=1')),
                                      ('EdgeCoverage', '_edge_coverage',
                                       ('-D', 'RR_FILL_EDGE=1', '-D', 'RR_SSS_COVERAGE=1')))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])

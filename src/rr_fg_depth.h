@@ -7,8 +7,8 @@ namespace rrfgdepth {
 // toggle). DLSS Frame Generation gets a depth in which the weapon slice is remapped as
 // RR's weapon depth remaps it (rrweapondepth::Hardware): world
 // depth is the game's own, bit for bit, and the weapon and hands keep their own depth order in
-// front of the near plane (reverse-Z depth above 1). Whether Frame Generation reads that as
-// intended is what the experiment tests: nothing here assumes it does.
+// front of the near plane (reverse-Z depth above 1). Streamline accepting the replacement
+// confirms the tag, not how Frame Generation interprets its depth.
 //
 // The path, from the MW4 RR trace of 2026-10-17 (mw4-rr-trace.log, Streamline 2.12):
 //   1. slSetTagForFrame(frame N): color-in, motion, color-out (eValidUntilEvaluate), then the
@@ -35,22 +35,9 @@ namespace rrfgdepth {
 // another queue waits on RR's fence, Controller::Before). The slot then also tracks the
 // tagging recording until Reset and is not reused until every execution has completed.
 
-// The setting as applied (rr_settings.inl ApplyEnabled). Read once per frame by AfterSR,
-// so a change applies from the next frame RR records; the frame's tag follows that frame.
-// Always on (Beta 3), with no panel control.
-inline std::atomic<bool> enabled{true};
-// Developer observation path retained for diagnostics; Beta 3 does not read an ini value
-// or expose a panel control for it. When enabled internally, it also observes disabled
-// replacement frames and permits the bounded content probe below.
-inline std::atomic<bool> observe{};
-// Bumped on every change of the setting (rr_settings.inl ApplyEnabled): clears a pause and the
-// reason counts at the next frame (Controller::FgSettingChanged).
-inline std::atomic<unsigned> changes{};
-
 // Why a frame's Frame Generation depth is the game's own (Reason::Supplied: the replacement).
 enum class Reason : unsigned {
     Supplied,    // the replacement was tagged and Streamline returned success
-    Disabled,    // the setting is off
     NoFgTags,    // no Frame Generation depth tag in the last 2 s (Frame Generation off?)
     RrOff,       // RR is off, failed or restarting: it tracks the frame and owns the texture
     NoFrame,     // RR recorded no SR for this tag's frame and viewport
@@ -63,7 +50,7 @@ enum class Reason : unsigned {
     Projection,  // the frame's projection is not the game's reverse-Z (rrweapondepth::Map)
     Memory,      // no GPU memory for the texture; retried after a second
     Rejected,    // Streamline refused the replacement; the game's tags were re-sent
-    Paused,      // Streamline refused it 3 frames in a row: off until the setting changes
+    Paused,      // Streamline refused it 3 frames in a row: off for the session
     Stale,       // supplied before, but not in the last 2 s (no frame has matched since)
     ListType,    // tagged on a list that cannot take a shader-resource barrier (a copy list)
     Count
@@ -72,8 +59,6 @@ inline const char *Label(Reason r) {
     switch (r) {
     case Reason::Supplied:
         return "replacement supplied";
-    case Reason::Disabled:
-        return "off";
     case Reason::NoFgTags:
         return "waiting: no Frame Generation depth tag (is Frame Generation on?)";
     case Reason::RrOff:
@@ -99,7 +84,7 @@ inline const char *Label(Reason r) {
     case Reason::Rejected:
         return "unavailable: Streamline refused the replacement";
     case Reason::Paused:
-        return "off: Streamline refused it 3 frames in a row (turn it off and on to retry)";
+        return "off for this session: Streamline refused it 3 frames in a row";
     case Reason::Stale:
         return "waiting: no replacement supplied in the last 2 s";
     case Reason::ListType:
@@ -110,9 +95,9 @@ inline const char *Label(Reason r) {
 }
 inline const char *Key(Reason r) {
     static const char *keys[] = {
-        "supplied",  "disabled", "no_fg_tags", "rr_off",    "no_frame", "not_recorded",
-        "lifecycle", "order",    "depth",      "submitted", "format",   "projection",
-        "memory",    "rejected", "paused",     "stale",     "list_type"};
+        "supplied", "no_fg_tags", "rr_off",    "no_frame", "not_recorded", "lifecycle",
+        "order",    "depth",      "submitted", "format",   "projection",   "memory",
+        "rejected", "paused",     "stale",     "list_type"};
     static_assert(sizeof(keys) / sizeof(*keys) == unsigned(Reason::Count));
     return unsigned(r) < unsigned(Reason::Count) ? keys[unsigned(r)] : "unknown";
 }
@@ -150,13 +135,11 @@ struct Match {
     // format, the game's own copy for Frame Generation (every frame since 2026-10-30: one
     // persistent texture, while SR's depth rotates among three). Its contents are not compared: it
     // is taken to hold this frame's depth, as Frame Generation is told it does.
-    bool enabled{}, paused{}, lifecycle_now{}, rr_running{}, slot{}, prepared{}, same_list{},
+    bool paused{}, lifecycle_now{}, rr_running{}, slot{}, prepared{}, same_list{},
         other_list{}, list_ok{}, unsubmitted{}, same_depth{}, game_copy{};
     Reason prepare{}; // why AfterSR did not prepare it (when !prepared)
 };
 inline constexpr Reason Decide(const Match &m) {
-    if (!m.enabled)
-        return Reason::Disabled;
     if (m.paused)
         return Reason::Paused;
     if (!m.lifecycle_now)
@@ -182,33 +165,28 @@ inline constexpr Reason Decide(const Match &m) {
 }
 // At AfterSR: whether to write the replacement for this frame. fg_seen: a Frame Generation
 // depth tag within the last 2 s. Supplied means prepare it.
-inline constexpr Reason Prepare(bool enabled, bool paused, bool fg_seen, bool format_ok,
-                                bool mapped, bool memory_wait) {
-    return !enabled      ? Reason::Disabled
-           : paused      ? Reason::Paused
+inline constexpr Reason Prepare(bool paused, bool fg_seen, bool format_ok, bool mapped,
+                                bool memory_wait) {
+    return paused        ? Reason::Paused
            : !fg_seen    ? Reason::NoFgTags
            : !format_ok  ? Reason::Format
            : !mapped     ? Reason::Projection
            : memory_wait ? Reason::Memory
                          : Reason::Supplied;
 }
-// Streamline refusals in a row before the replacement pauses until the setting changes.
+// Streamline refusals in a row before the replacement pauses for the session.
 inline constexpr unsigned RefusalLimit = 3;
 
 // The panel's status and the log's 10 s summary. Written by the tagging thread and AfterSR
 // (under the controller's lock), read lock-free by the panel.
 struct Status {
-    std::atomic<unsigned> last{unsigned(Reason::Disabled)};
+    std::atomic<unsigned> last{unsigned(Reason::NoFgTags)};
     std::atomic<uint64_t> fg_seen_at{};  // GetTickCount64 of the last FG depth tag
     std::atomic<uint64_t> supplied_at{}; // ... of the last supplied replacement
     std::atomic<unsigned> counts[unsigned(Reason::Count)]{};
     void Note(Reason r) {
         last.store(unsigned(r), std::memory_order_relaxed);
         counts[unsigned(r)].fetch_add(1, std::memory_order_relaxed);
-    }
-    void Reset() {
-        for (auto &c : counts)
-            c.store(0, std::memory_order_relaxed);
     }
     bool FgSeen(uint64_t now) const {
         const auto at = fg_seen_at.load(std::memory_order_relaxed);
@@ -234,51 +212,4 @@ struct Status {
 };
 inline Status status;
 
-// The developer content check (Controller::FgProbe; only with observe and the replacement
-// enabled internally, since it allocates a readback on the render thread): the 2026-10-30
-// sessions showed that the game tags Frame Generation with its own persistent depth texture
-// (same size and format),
-// never one of SR's rotating depths, so a pointer cannot tell what it holds. One frame of both
-// depth planes is read back and compared here, world and weapon (SR depth above `slice`)
-// separately: a plain copy matches everywhere; a weapon-corrected copy differs in the weapon.
-// It was: bit-identical on all 6 frames checked, weapon included.
-struct Comparison {
-    uint64_t world{}, world_equal{}, weapon{}, weapon_equal{}, fg_above_one{};
-    float world_max_diff{}, weapon_sr_min{}, weapon_sr_max{}, weapon_fg_min{}, weapon_fg_max{};
-};
-// fg and sr: rows of `width` floats, `pitch` floats apart.
-inline Comparison Compare(const float *fg, const float *sr, unsigned width, unsigned height,
-                          size_t pitch, float slice) {
-    Comparison c;
-    bool first = true;
-    for (unsigned y = 0; y < height; ++y)
-        for (unsigned x = 0; x < width; ++x) {
-            const float f = fg[y * pitch + x], d = sr[y * pitch + x];
-            c.fg_above_one += f > 1;
-            if (!(d > slice)) {
-                ++c.world;
-                const float diff = f > d ? f - d : d - f;
-                if (f == d)
-                    ++c.world_equal;
-                else if (!(diff <= c.world_max_diff))
-                    c.world_max_diff = diff; // NaN wins: it is worth seeing
-                continue;
-            }
-            ++c.weapon;
-            c.weapon_equal += f == d;
-            if (first) {
-                c.weapon_sr_min = c.weapon_sr_max = d;
-                c.weapon_fg_min = c.weapon_fg_max = f;
-                first = false;
-            }
-            c.weapon_sr_min = d < c.weapon_sr_min ? d : c.weapon_sr_min;
-            c.weapon_sr_max = d > c.weapon_sr_max ? d : c.weapon_sr_max;
-            c.weapon_fg_min = f < c.weapon_fg_min ? f : c.weapon_fg_min;
-            c.weapon_fg_max = f > c.weapon_fg_max ? f : c.weapon_fg_max;
-        }
-    return c;
-}
-// At most one check in flight, at least 10 s apart, 6 a session.
-inline constexpr unsigned ProbeLimit = 6;
-inline constexpr uint64_t ProbeInterval = 10000;
 } // namespace rrfgdepth

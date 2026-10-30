@@ -384,12 +384,12 @@ static void Shapes() {
                       rrlighting::Count * rrsparsecopy::Variants);
     // Descriptors 0-4 base, 5-9 edge, 10-12 the Subsurface Scattering coverage selection;
     // its root parameters follow the edge table when both bits are set.
-    static_assert(rrsparsecopy::EdgeDescriptor == 5 && rrsparsecopy::CoverageDescriptor == 10 &&
-                  rrsparsecopy::PrivateDescriptors == 13 &&
-                  rrsparsecopy::EdgeTableParameter == 5 &&
-                  rrsparsecopy::CoverageTableParameter(rrsparsecopy::CoverageBit) == 5 &&
+    static_assert(rrsparsecopy::EdgeDescriptor == 4 && rrsparsecopy::CoverageDescriptor == 9 &&
+                  rrsparsecopy::PrivateDescriptors == 12 &&
+                  rrsparsecopy::EdgeTableParameter == 4 &&
+                  rrsparsecopy::CoverageTableParameter(rrsparsecopy::CoverageBit) == 4 &&
                   rrsparsecopy::CoverageTableParameter(rrsparsecopy::EdgeBit |
-                                                       rrsparsecopy::CoverageBit) == 6 &&
+                                                       rrsparsecopy::CoverageBit) == 5 &&
                   rrsparsecopy::VariantIndex(rrlighting::SssHistory2,
                                              rrsparsecopy::EdgeBit | rrsparsecopy::CoverageBit) ==
                       7);
@@ -397,9 +397,6 @@ static void Shapes() {
 #endif
 
 int main() {
-    // Always on (no panel control); the baseline group mean stays the fallback.
-    CHECK(rredgefill::enabled.load());
-    CHECK(std::string_view(Label(State::Baseline)).find("baseline") != std::string_view::npos);
     Weights();
     Classification();
     Separation();

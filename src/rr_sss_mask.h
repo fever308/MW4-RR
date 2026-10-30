@@ -1,8 +1,7 @@
 #pragma once
 #include <d3d12.h>
-// SSS-masked lighting sources (rrlighting::SssMasked) take the native lobe only
-// where an earlier frame's SSS guide is nonzero. The guide is handed off when
-// its SR recording, which leaves it COMMON, is submitted and admitted.
+// An admitted SSS guide gates the matching coverage record used by SSS-masked lighting.
+// Its SR recording leaves it COMMON and must be submitted and admitted before reuse.
 namespace rrsssmask {
 // An older guide trails moving SSS edges further; past this, use raw lighting.
 inline constexpr unsigned MaxAge = 3;
@@ -28,17 +27,13 @@ inline constexpr bool Shape(const D3D12_RESOURCE_DESC &guide, const D3D12_RESOUR
 // Latest outcome of an SSS-masked first spatial preparation, for the overlay.
 enum class State : unsigned {
     Idle,
-    Active,
     NoGuide,
     Unsupported,
-    // Subsurface Scattering coverage experiment (rr_sss_coverage.h) selected.
     CoverageActive,
     CoverageWaiting
 };
 inline constexpr const char *Label(State s) {
     switch (s) {
-    case State::Active:
-        return "active";
     case State::CoverageActive:
         return "active, selected by reprojected Subsurface Scattering coverage";
     case State::CoverageWaiting:

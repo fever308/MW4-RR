@@ -185,21 +185,14 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
     rrinternal::Scope ignoreCopies;
     rrcompute::Tracker::Internal ignoreState;
     const auto rates = LiveRR().SamplingData(native.Get());
-    // SSS-masked sources read an earlier frame's SSS guide, which only the private
-    // root binds; without the guide or that path they prepare raw lighting.
+    // An admitted guide gates coverage. Only matched, drawn surfaces take native history;
+    // without a usable record, prepare raw lighting.
     unsigned mask_age{};
     const auto mask = LiveRR().SssMask(native.Get(), &mask_age);
-    // Subsurface Scattering coverage experiment (rr_sss_coverage.h): selected, the masked
-    // source takes native history only where reprojected coverage says so, and a frame
-    // without usable coverage prepares raw lighting; compared only, the baseline is applied
-    // unchanged and the coverage choice is counted.
-    const bool coverage_apply = rrssscov::selection.load(std::memory_order_relaxed) ==
-                                unsigned(rrssscov::Selection::Coverage);
     rrsparsecopy::CoverageInputs coverage;
     auto coverage_reason = rrssscov::FrameReason::NoStorage;
     const bool coverage_ready =
-        mask && rrssscov::Wanted() &&
-        LiveRR().SssCoverage(native.Get(), coverage_apply, coverage, coverage_reason);
+        mask && LiveRR().SssCoverage(native.Get(), coverage, coverage_reason);
     const auto cbvs = ComputeState().RateCBVs(
         native.Get(), (ID3D12PipelineState *)effective,
         (ID3D12RootSignature *)rrbindings::State(device)->tracker.CurrentLayout(
@@ -221,22 +214,19 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         rrbypass::Fail(device, text);
         return false;
     }
-    // The edge-aware fill is a panel experiment on the SSS-masked path only; without its
-    // proven inputs that path keeps the baseline group mean.
-    const bool edge_wanted = mask && privateValid && rredgefill::enabled.load();
+    // Without proven edge-fill inputs, covered pixels use the group-mean fallback.
+    const bool edge_wanted = mask && privateValid;
     rrsparsecopy::EdgeInputs edge;
     char edge_detail[96]{};
     const char *edge_why =
         edge_wanted ? SparseEdgeInputs(list, native.Get(), effective, edge, edge_detail) : nullptr;
     bool masked = false, edged = false, covered = false;
-    bool replaced = mask && privateValid && (!coverage_apply || coverage_ready) &&
+    bool replaced = mask && privateValid && coverage_ready &&
                     SparsePool().Apply(native.Get(), input, output, scale.Get(),
                                        (ID3D12PipelineState *)effective, x, y, z, &rates, nullptr,
                                        &privateRestore, lobe, mask.Get(), &masked,
                                        edge_wanted && !edge_why ? &edge : nullptr, &edged,
                                        coverage_ready ? &coverage : nullptr, &covered);
-    if (covered)
-        LiveRR().SssCoverageRecorded(native.Get());
     // A rejected attempt records nothing; the usual path then prepares raw lighting.
     if (!replaced)
         replaced = SparsePool().Apply(native.Get(), input, output, scale.Get(),
@@ -247,22 +237,18 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         char why[96]{};
         if (masked)
             snprintf(why, sizeof(why), "guide %u frame(s) old%s", mask_age,
-                     covered ? (coverage_apply ? ", coverage record selecting"
-                                               : ", coverage record compared")
-                             : "");
+                     covered ? ", coverage record selecting" : "");
         // Without a usable record the coverage reason; with one, the masked preparation
         // itself refused (its private snapshot reason below, or the coverage inputs).
-        const bool coverage_why = mask && coverage_apply && !masked && privateValid;
+        const bool coverage_why = mask && !masked && privateValid;
         if (coverage_why)
             snprintf(why, sizeof(why), "%s",
                      coverage_ready ? "coverage inputs or shader variant refused (shape, device "
                                       "or pipeline)"
                                     : rrssscov::Label(coverage_reason));
-        ReportSssMask(masked && coverage_apply   ? rrsssmask::State::CoverageActive
-                      : masked                   ? rrsssmask::State::Active
-                      : !mask                    ? rrsssmask::State::NoGuide
-                      : coverage_apply           ? rrsssmask::State::CoverageWaiting
-                                                 : rrsssmask::State::Unsupported,
+        ReportSssMask(masked ? rrsssmask::State::CoverageActive
+                      : !mask ? rrsssmask::State::NoGuide
+                              : rrsssmask::State::CoverageWaiting,
                       masked || coverage_why ? why
                       : !mask                              ? nullptr
                       : !privateRestore.valid              ? privateRestore.status
@@ -272,9 +258,7 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                                       : "masked preparation rejected (guide, format or shader)");
     }
     if (replaced && masked)
-        ReportEdgeFill(edged         ? rredgefill::State::Active
-                       : !edge_wanted ? rredgefill::State::Baseline
-                                      : rredgefill::State::Unavailable,
+        ReportEdgeFill(edged ? rredgefill::State::Active : rredgefill::State::Unavailable,
                        edged || !edge_wanted ? nullptr
                        : edge_why            ? edge_why
                                              : "surface inputs rejected (shape, format or state)");

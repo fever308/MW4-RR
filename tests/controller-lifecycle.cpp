@@ -416,8 +416,6 @@ struct ControllerCpuTest {
         s.viewport = 0;
         s.gpu.sr[1] = depth.Get();
         s.gpu.fg_depth = replacement.Get();
-        rrfgdepth::enabled = true;
-        rrfgdepth::observe = false;
         rrtrace::FgTag tag;
         tag.frame = 41;
         tag.viewport = 0;
@@ -450,7 +448,6 @@ struct ControllerCpuTest {
         s.fg_list = list.As<ID3D12GraphicsCommandList>();
         s.gpu.fg_depth.Attach(new CpuResource);
         // Keep the texture cached while the slot is idle, until reconfiguration.
-        rrfgdepth::enabled = true;
         rrfgdepth::status.fg_seen_at = GetTickCount64();
         ID3D12CommandList *lists[] = {list.As<ID3D12CommandList>()};
         c.Before(first.As<ID3D12CommandQueue>(), 1, lists);

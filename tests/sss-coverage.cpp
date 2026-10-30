@@ -6,7 +6,7 @@
 #include <limits>
 #include <vector>
 
-// CPU checks of the Subsurface Scattering coverage experiment (src/rr_sss_coverage.h): the
+// CPU checks of the Subsurface Scattering coverage selection (src/rr_sss_coverage.h): the
 // key encoding, record age and invalidation, the reprojection's direction, scale and age, and
 // the per-pixel decision the lighting shader mirrors. No GPU is used; these do not prove that
 // the HLSL in shaders/rr_sparse_scale_vrrt.hlsl matches this mirror, nor anything visual.
@@ -111,26 +111,25 @@ void Records() {
 
 void Cameras() {
     Constants c{};
-    assert(Make(Still(2), Still(1), 64, 48, 1, false, c));
-    assert(c.flags == 0 && c.age == 1 && c.width == 64 && c.height == 48);
-    assert(Make(Still(2), Still(1), 64, 48, 1, true, c) && c.flags == ApplyFlag);
+    assert(Make(Still(2), Still(1), 64, 48, 1, c));
+    assert(c.reserved == 0 && c.age == 1 && c.width == 64 && c.height == 48);
     // Projection or view that cannot be reprojected.
     auto shear = Still(1);
     shear.projection[4] = 0.5f;
-    assert(!Make(Still(2), shear, 64, 48, 1, true, c));
+    assert(!Make(Still(2), shear, 64, 48, 1, c));
     auto ortho = Still(1);
     ortho.projection[11] = 0;
-    assert(!Make(ortho, Still(1), 64, 48, 1, true, c));
+    assert(!Make(ortho, Still(1), 64, 48, 1, c));
     auto flipped = Still(1); // clip w = -view z
     flipped.projection[11] = -1;
-    assert(!Make(flipped, Still(1), 64, 48, 1, true, c));
+    assert(!Make(flipped, Still(1), 64, 48, 1, c));
     auto scaled = Still(2);
     scaled.view[0] = 2; // not rigid
-    assert(!Make(scaled, Still(1), 64, 48, 1, true, c));
+    assert(!Make(scaled, Still(1), 64, 48, 1, c));
     auto invalid = Still(1);
     invalid.valid = false;
-    assert(!Make(Still(2), invalid, 64, 48, 1, true, c));
-    assert(!Make(Still(2), Still(1), 0, 48, 1, true, c));
+    assert(!Make(Still(2), invalid, 64, 48, 1, c));
+    assert(!Make(Still(2), Still(1), 0, 48, 1, c));
 }
 
 // Frames 2 and 3 of the strafing capture 20261025-181459, as RR got them (also used by the
@@ -155,7 +154,7 @@ Camera Capture(bool current) {
 }
 void RealMotion() {
     Constants c{};
-    assert(Make(Capture(true), Capture(false), 2224, 1248, 1, true, c));
+    assert(Make(Capture(true), Capture(false), 2224, 1248, 1, c));
     struct Sample {
         uint32_t x, y;
         float z, mx, my, tolerance;
@@ -209,7 +208,7 @@ void StillCamera() {
                 s.coverage[y * w + x] = x < w / 2 ? Drawn : NotDrawn;
             }
         Constants c{};
-        assert(Make(Still(5), Still(4), w, h, 1, true, c));
+        assert(Make(Still(5), Still(4), w, h, 1, c));
         for (uint32_t y = 0; y < h; ++y)
             for (uint32_t x = 0; x < w; ++x)
                 assert(s.At(c, x, y) == (x < w / 2 ? Pixel::Covered : Pixel::NotCovered));
@@ -226,7 +225,7 @@ void JitteredCamera() {
         current.jitter = {0.375f, -0.375f};
         previous.jitter = {-0.375f, 0.375f};
         Constants c{};
-        assert(Make(current, previous, w, h, age, true, c));
+        assert(Make(current, previous, w, h, age, c));
         const auto world = Reproject(c, 20, 12, Decode(Key(0.125f, Up)));
         assert(world.ok && Near(world.x, 19.75, 1e-5) && Near(world.y, 13.25, 1e-5));
         // Both axes and the weapon camera use the same pixel-space raster shift.
@@ -249,7 +248,7 @@ void JitteredCamera() {
         assert(s.At(c, 20, 12) == Pixel::Disoccluded);
 
         std::swap(current.jitter, previous.jitter);
-        assert(Make(current, previous, w, h, age, true, c));
+        assert(Make(current, previous, w, h, age, c));
         const auto reverse = Reproject(c, 20, 12, Decode(Key(0.125f, Up)));
         assert(reverse.ok && Near(reverse.x, 21.25, 1e-5) && Near(reverse.y, 11.75, 1e-5));
     }
@@ -260,7 +259,7 @@ void JitteredCamera() {
     current.jitter = {0.375f, -0.375f};
     previous.jitter = {-0.375f, 0.375f};
     Constants c{};
-    assert(Make(current, previous, w, h, 1, true, c));
+    assert(Make(current, previous, w, h, 1, c));
     const auto zoom = Reproject(c, 20, 12, Decode(Key(0.125f, Up)));
     assert(zoom.ok && Near(zoom.x, 25.6875, 1e-5) && Near(zoom.y, 13.25, 1e-5));
     // Bad jitter cannot turn into invalid shader reprojection constants.
@@ -269,8 +268,8 @@ void JitteredCamera() {
         for (unsigned axis = 0; axis < 2; ++axis) {
             auto bad = Still(2);
             bad.jitter[axis] = invalid;
-            assert(!Make(bad, previous, w, h, 1, true, c));
-            assert(!Make(current, bad, w, h, 1, true, c));
+            assert(!Make(bad, previous, w, h, 1, c));
+            assert(!Make(current, bad, w, h, 1, c));
         }
 }
 
@@ -288,7 +287,7 @@ void Strafe() {
                 s.coverage[y * w + x] = x >= 20 && x < 40 ? Drawn : NotDrawn;
             }
         Constants c{};
-        assert(Make(At(10, dx * 10, 0, 0), At(10 - age, dx * (10 - age), 0, 0), w, h, age, true,
+        assert(Make(At(10, dx * 10, 0, 0), At(10 - age, dx * (10 - age), 0, 0), w, h, age,
                     c));
         for (uint32_t x = 0; x < w; ++x) {
             const auto q = Reproject(c, x, 10, Decode(s.current[10 * w + x]));
@@ -302,8 +301,7 @@ void Strafe() {
             const uint32_t from = uint32_t(q.x);
             assert(d == (from >= 20 && from < 40 ? Pixel::Covered : Pixel::NotCovered));
         }
-        // The baseline (same pixel) and the reprojection disagree on a band of ~shift*age px
-        // at each edge; the reprojection follows the surface.
+        // Reprojection follows the surface across a band of ~shift*age pixels at each edge.
         assert(s.At(c, uint32_t(std::ceil(20 - shift * age)), 10) == Pixel::Covered);
         assert(s.At(c, 39, 10) == Pixel::NotCovered || age * shift < 1);
     }
@@ -315,14 +313,14 @@ void Strafe() {
     for (auto &v : s.coverage)
         v = Drawn;
     Constants c{};
-    assert(Make(At(1, -2, 0, 0), At(0, 0, 0, 0), w, h, 1, true, c));
+    assert(Make(At(1, -2, 0, 0), At(0, 0, 0, 0), w, h, 1, c));
     assert(s.At(c, 0, 5) == Pixel::OffScreen && s.At(c, w - 1, 5) == Pixel::Covered);
 }
 
 void Rejections() {
     const uint32_t w = 32, h = 32;
     Constants c{};
-    assert(Make(Still(3), Still(2), w, h, 1, true, c));
+    assert(Make(Still(3), Still(2), w, h, 1, c));
     Scene s(w, h);
     for (uint32_t i = 0; i < w * h; ++i) {
         s.current[i] = s.previous[i] = Key(0.1f, Up);
@@ -364,7 +362,7 @@ void Rejections() {
     for (unsigned i = 0; i < 3; ++i)
         turned.view[i * 4 + 2] = -turned.view[i * 4 + 2]; // view z flipped (and x, keep rigid)
     turned.view[0] = -1;
-    assert(Make(Still(3), turned, w, h, 1, true, back));
+    assert(Make(Still(3), turned, w, h, 1, back));
     assert(s.At(back, 16, 16) == Pixel::OffScreen);
     for (unsigned i = 0; i < unsigned(Pixel::Count); ++i)
         (void)Accepted(Pixel(i));
@@ -388,7 +386,7 @@ void Silhouette() {
             s.coverage[y * w + x] = x >= 32 ? Drawn : NotDrawn;
         }
     Constants c{};
-    assert(Make(At(1, dx, 0, 0), At(0, 0, 0, 0), w, h, 1, true, c));
+    assert(Make(At(1, dx, 0, 0), At(0, 0, 0, 0), w, h, 1, c));
     const auto q = Reproject(c, 30, 8, Decode(s.current[8 * w + 30]));
     assert(q.ok && uint32_t(q.x) == 32 && uint32_t(std::floor(q.x - 0.5f)) == 31);
     assert(s.At(c, 30, 8) == Pixel::NotCovered); // texel 31, not the character's 32
@@ -413,7 +411,6 @@ void Silhouette() {
 // A character moves right 3 px over a still background while the camera does not move. The
 // camera-only reprojection maps its new pixels to the same pixels in the record, where the
 // background was: they are rejected (disoccluded), never classified from the background.
-// The baseline reads the record at the same pixel and would.
 void MovingObject() {
     const uint32_t w = 48, h = 32;
     Scene s(w, h);
@@ -426,7 +423,7 @@ void MovingObject() {
             s.coverage[y * w + x] = before ? Drawn : NotDrawn;        // the character is skin
         }
     Constants c{};
-    assert(Make(Still(8), Still(7), w, h, 1, true, c));
+    assert(Make(Still(8), Still(7), w, h, 1, c));
     for (uint32_t x = 20; x < 23; ++x) // newly covered by the character
         assert(s.At(c, x, 16) == Pixel::Disoccluded);
     for (uint32_t x = 11; x < 13; ++x) // newly uncovered background
@@ -447,7 +444,7 @@ void Weapon() {
     }
     Constants c{};
     // Even a large camera move leaves the weapon where it is.
-    assert(Make(At(1, 5, 0, 0), At(0, 0, 0, 0), w, h, 1, true, c));
+    assert(Make(At(1, 5, 0, 0), At(0, 0, 0, 0), w, h, 1, c));
     assert(s.At(c, 8, 8) == Pixel::Covered);
     for (uint32_t i = 0; i < w * h; ++i)
         s.previous[i] = Key(0.1f, Up);
@@ -457,36 +454,15 @@ void Weapon() {
     assert(s.At(c, 8, 8) == Pixel::Disoccluded); // the weapon moved in depth
 }
 
-void Selections() {
-    Constants baseline{}, applied{};
-    assert(Make(Still(1), Still(0), 4, 4, 1, false, baseline));
-    assert(Make(Still(1), Still(0), 4, 4, 1, true, applied));
-    // The baseline is exactly the shader's old test: native unless the guide is (+/-)0.
-    assert(!Native(baseline, 0.0f, Pixel::Covered) && !Native(baseline, -0.0f, Pixel::Covered));
-    assert(Native(baseline, 1e-8f, Pixel::NotCovered) && Native(baseline, -2.0f, Pixel::Sky));
-    assert(Native(baseline, std::numeric_limits<float>::quiet_NaN(), Pixel::Unknown));
-    // Applied: only where the record says covered, whatever the guide.
-    assert(Native(applied, 0.0f, Pixel::Covered));
+void Selection() {
+    // Only a matched, drawn surface uses native history; every rejection keeps raw lighting.
+    assert(Native(Pixel::Covered));
     for (auto p : {Pixel::NotCovered, Pixel::Sky, Pixel::OffScreen, Pixel::Disoccluded,
                    Pixel::Normal, Pixel::Unknown})
-        assert(!Native(applied, 1.0f, p));
-    Totals t;
-    uint32_t v[Counters]{};
-    v[Pixels] = 100;
-    v[Differ] = 7;
-    t.Add(v, 1);
-    t.Add(v, 3);
-    assert(t.frames == 2 && t.value[Pixels] == 200 && t.value[Differ] == 14 && t.age_sum == 4);
-    static_assert(sizeof(Constants) == 32 * 4 && CounterBytes == 64);
-    // Always the coverage selection (no control), without the comparison counters.
-    assert(selection.load() == unsigned(Selection::Coverage) && !compare.load() && Wanted());
-    selection = unsigned(Selection::Baseline);
-    assert(!Wanted());
-    compare = true;
-    assert(Wanted());
-    compare = false;
-    selection = unsigned(Selection::Coverage);
+        assert(!Native(p));
+    static_assert(sizeof(Constants) == 32 * 4);
 }
+
 } // namespace
 
 int main() {
@@ -502,7 +478,7 @@ int main() {
     MovingObject();
     Silhouette();
     Weapon();
-    Selections();
+    Selection();
     std::puts("sss-coverage: OK");
     return 0;
 }

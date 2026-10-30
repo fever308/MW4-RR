@@ -1,6 +1,5 @@
 #pragma once
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -9,14 +8,8 @@
 // Subsurface Scattering coverage selection (always on in Beta 3).
 //
 // The SSS-masked lighting source (rrlighting::SssHistory2) takes native temporal lobe 2 on
-// Subsurface Scattering pixels. Its baseline decides "SSS pixel" from an earlier frame's RR
-// Subsurface Scattering guide, read at the same screen pixel: the guide is 1 to 3 frames old
-// (it is resolved after the lighting pass), so camera and object motion move that decision
-// onto another surface, and a zero guide value (a luminance difference) does not mean "no
-// scattering material".
-//
-// The experiment keeps the RR guide exactly as it is and decides from a separate coverage
-// record instead:
+// Subsurface Scattering pixels identified by a separate coverage record. The RR guide
+// remains unchanged: its luminance difference can be zero on scattering materials.
 // - Coverage: which pixels the game's Subsurface Scattering draw shaded, from its own stencil
 //   test. The owned stencil initializer writes Marker (instead of 0) where the stencil
 //   rejects, so the resolve can tell "not drawn" from "drawn, guide 0"; the RR guide still
@@ -26,30 +19,18 @@
 // - At a later frame's lighting pass each pixel is reprojected into the coverage record's
 //   frame with both frames' cameras and its own depth, for the record's actual age, and the
 //   record is used only where the stored surface there matches (depth and normal); off-screen,
-//   disoccluded, mismatched and unknown pixels take raw lighting (the defined fallback the
-//   baseline uses whenever it has no guide).
+//   disoccluded, mismatched and unknown pixels take raw lighting.
 // Current-frame coverage before the lighting pass is not used: the Subsurface Scattering
 // draw (and so its stencil test and material inputs) runs after it, and the timing of the
 // stencil buffer at the lighting pass is not proven. The game's motion vectors are not used
 // for the same reason: they are only known to be written by the time of the SR call. So the
 // reprojection is camera-only; moving objects are covered only by the surface match (see
-// RejectReason), never by assumed motion.
+// Pixel), never by assumed motion.
 namespace rrssscov {
-// Which predicate the SSS-masked lighting source uses.
-enum class Selection : unsigned { Baseline, Coverage };
-// Always the coverage selection (Beta 3), with no panel control; Baseline stays for tests.
-inline std::atomic<unsigned> selection{unsigned(Selection::Coverage)};
-// Count both predicates' choices every frame for the panel (diagnostic only).
-inline std::atomic<bool> compare{};
-inline bool Wanted() {
-    return selection.load(std::memory_order_relaxed) == unsigned(Selection::Coverage) ||
-           compare.load(std::memory_order_relaxed);
-}
-
 // The stencil initializer's value for stencil-rejected samples while coverage is recorded.
 // It is outside the guide's valid range (|value| < 65504, rrsss::ValidScalar), so it can only
 // collide with a Subsurface Scattering output that was already unusable; the resolve gives
-// the RR guide 0 for it, as for the baseline initializer's 0.
+// the RR guide 0 for it, as for the unmarked initializer's 0.
 inline constexpr float Marker = 65504.0f;
 // Resolved coverage per full-resolution pixel (R8_UINT).
 enum Coverage : uint32_t { NotDrawn = 0, Drawn = 1, Unknown = 2 };
@@ -235,11 +216,9 @@ inline FrameReason Check(const Record &r, unsigned frame, unsigned generation, u
     return FrameReason::Ready;
 }
 
-// Shader flags.
-inline constexpr uint32_t ApplyFlag = 1; // use the coverage decision (else the baseline's)
 // Root constants b4 of the SSS-masked lighting variant (32 words).
 struct Constants {
-    uint32_t width, height, flags, age;
+    uint32_t width, height, reserved, age; // reserved keeps the b4 packing aligned
     float ax, bx, ay, by;                                       // current view position
     float current_scale, current_offset, previous_scale, previous_offset; // depth to view z
     float reproject[16]; // current view position -> previous clip, row-vector
@@ -332,12 +311,11 @@ inline bool Projectable(const std::array<float, 16> &p) {
            rrweapondepth::Map(p, m);
 }
 inline bool Make(const Camera &current, const Camera &previous, uint32_t width, uint32_t height,
-                 unsigned age, bool apply, Constants &c) {
+                 unsigned age, Constants &c) {
     c = {};
     c.width = width;
     c.height = height;
     c.age = age;
-    c.flags = apply ? ApplyFlag : 0u;
     c.depth_tolerance = DepthTolerance;
     c.normal_cos = NormalCos;
     if (!width || !height || !current.valid || !previous.valid ||
@@ -474,37 +452,9 @@ Pixel Decide(const Constants &c, uint32_t x, uint32_t y, uint32_t current_key, K
     const uint32_t v = previous_coverage(uint32_t(sx), uint32_t(sy));
     return v == Drawn ? Pixel::Covered : v == NotDrawn ? Pixel::NotCovered : Pixel::Unknown;
 }
-// Whether the SSS-masked source takes native temporal lobe 2 at a pixel. The baseline takes
-// it wherever the earlier guide is nonzero; the experiment where the record says Covered.
-inline bool Native(const Constants &c, float baseline_guide, Pixel decision) {
-    return (c.flags & ApplyFlag) ? decision == Pixel::Covered : !(baseline_guide == 0);
+// Only a matched surface drawn by the SSS pass takes native temporal lobe 2.
+inline bool Native(Pixel decision) {
+    return decision == Pixel::Covered;
 }
 
-// ---- Counters (u2 of the lighting variant, 16 words, zeroed by the key pass) ----
-enum Counter : unsigned {
-    Pixels,         // SSS-masked lighting pixels evaluated
-    BaselineNative, // the baseline would take native history
-    CoverageNative, // the coverage record would
-    Differ,         // the two disagree
-    Applied,        // native history taken (the active selection)
-    CountSky,
-    CountOffScreen,
-    CountDisoccluded,
-    CountNormal,
-    CountUnknown,
-    CountWeapon, // pixels on the first-person weapon slice
-    Counters = 16
-};
-static_assert(unsigned(CountWeapon) < Counters);
-inline constexpr unsigned CounterBytes = Counters * 4;
-struct Totals {
-    uint64_t frames{}, value[Counters]{};
-    unsigned age_sum{};
-    void Add(const uint32_t *v, unsigned age) {
-        ++frames;
-        age_sum += age;
-        for (unsigned i = 0; i < Counters; ++i)
-            value[i] += v[i];
-    }
-};
 } // namespace rrssscov

@@ -26,7 +26,7 @@ uint PixelCode(uint2 p){
 // native temporal output (t0, the native spatial input) instead of raw
 // current-frame lighting. The game's SSS blur spreads sparse, boosted raw
 // diffuse samples into blotches. Its weight bits come along too, matching the
-// temporal-only passthrough comparison.
+// native temporal output.
 // RR_NATIVE_FILL keeps a lobe's fresh sample, without the inverse-probability
 // boost, wherever a ray landed this frame; only unsampled pixels take native.
 #ifndef RR_NATIVE_LOBE
@@ -35,31 +35,23 @@ uint PixelCode(uint2 p){
 #ifndef RR_NATIVE_FILL
 #define RR_NATIVE_FILL 0
 #endif
-// RR_SSS_MASK applies that selection only where the previous frame's SSS guide
-// (t2) is nonzero; every other pixel keeps raw boosted lighting. The game's
-// guide is exactly 0 off SSS pixels. Only the private root binds t2.
+// RR_SSS_MASK applies native lobe selection only where the reprojected SSS coverage
+// record identifies the same drawn surface; all other pixels keep raw boosted lighting.
 #ifndef RR_SSS_MASK
 #define RR_SSS_MASK 0
 #endif
-#if RR_SSS_MASK
-Texture2D<float> sssGuide:register(t2);
-#endif
-// RR_SSS_COVERAGE (src/rr_sss_coverage.h; needs RR_SSS_MASK): the "SSS pixel" decision also
-// comes from an earlier frame's Subsurface Scattering pass coverage (t10), reprojected with
-// this pixel's depth and both frames' cameras (b4) and used only where the surface stored
-// for that frame (t9) matches this one (t8). The RR guide is not read for it. CoverageFlags
-// bit 0 applies it; otherwise the baseline guide test above is applied unchanged and the
-// coverage decision is only counted (u2).
+// Coverage (t10) is reprojected with this pixel's depth and both frames' cameras (b4),
+// then accepted only where the stored surface (t9) matches this frame's surface (t8).
 #ifndef RR_SSS_COVERAGE
 #define RR_SSS_COVERAGE 0
 #endif
-#if RR_SSS_COVERAGE&&!RR_SSS_MASK
-#error RR_SSS_COVERAGE refines the SSS-masked selection and needs RR_SSS_MASK
+#if RR_SSS_COVERAGE!=RR_SSS_MASK
+#error SSS-masked selection requires reprojected coverage
 #endif
 #if RR_SSS_COVERAGE
 #include "rr_guide_math.hlsli"
 cbuffer CoverageControl:register(b4){
- uint CoverageWidth,CoverageHeight,CoverageFlags,CoverageAge;
+ uint CoverageWidth,CoverageHeight,CoverageReserved,CoverageAge;
  float CoverageAX,CoverageBX,CoverageAY,CoverageBY;
  float CurrentScale,CurrentOffset,PreviousScale,PreviousOffset;
  float4 Reproject0,Reproject1,Reproject2,Reproject3; // current view position -> previous clip
@@ -68,7 +60,6 @@ cbuffer CoverageControl:register(b4){
 Texture2D<uint> currentKey:register(t8);
 Texture2D<uint> previousKey:register(t9);
 Texture2D<uint> previousCoverage:register(t10);
-RWByteAddressBuffer coverageCounters:register(u2);
 // rrssscov::Pixel
 static const uint PixelCovered=0,PixelNotCovered=1,PixelSky=2,PixelOffScreen=3,
  PixelDisoccluded=4,PixelNormal=5,PixelUnknown=6;
@@ -114,22 +105,9 @@ uint CoverageDecide(uint2 p){
  uint v=previousCoverage.Load(int3(sel,0));
  return v==1?PixelCovered:v==0?PixelNotCovered:PixelUnknown;
 }
-void CoverageCount(uint slot,bool value){
- uint n=WaveActiveCountBits(value);
- if(WaveIsFirstLane()&&n!=0){uint old;coverageCounters.InterlockedAdd(slot*4,n,old);}
-}
-// Whether the SSS-masked source takes native lobe 2 here (rrssscov::Native), and the counts
-// of rrssscov::Counter.
-bool CoverageSelect(uint2 p,bool baseline){
- uint d=CoverageDecide(p);
- bool coverage=d==PixelCovered;
- bool native=(CoverageFlags&1)!=0?coverage:baseline;
- CoverageCount(0,true);CoverageCount(1,baseline);CoverageCount(2,coverage);
- CoverageCount(3,baseline!=coverage);CoverageCount(4,native);CoverageCount(5,d==PixelSky);
- CoverageCount(6,d==PixelOffScreen);CoverageCount(7,d==PixelDisoccluded);
- CoverageCount(8,d==PixelNormal);CoverageCount(9,d==PixelUnknown);
- CoverageCount(10,(currentKey.Load(int3(p,0))&0x80000000u)!=0);
- return native;
+// Native history is used only for matched, drawn surfaces (rrssscov::Native).
+bool CoverageSelect(uint2 p){
+ return CoverageDecide(p)==PixelCovered;
 }
 #endif
 float4 UnpackLobe(uint2 packed){
@@ -318,11 +296,7 @@ void main(uint3 id:SV_DispatchThreadID){
 #endif
 #endif
 #if RR_SSS_MASK
- // An out-of-range load returns 0, so a mismatched guide leaves raw lighting.
- bool sssNative=!(sssGuide.Load(int3(p,0))==0);
-#if RR_SSS_COVERAGE
- sssNative=CoverageSelect(p,sssNative);
-#endif
+ bool sssNative=CoverageSelect(p);
  if(!sssNative){ca=rawA;cb=rawB;outWeights=rawWeights;}
 #endif
 #ifdef RR_PACKED_FLOAT

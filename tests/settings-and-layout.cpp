@@ -28,10 +28,6 @@ static_assert(defaults.blend);
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
               defaults.weapon_depth && defaults.preset == 6);
 static_assert(defaults.tolerate_isolated && defaults.water);
-// Always on (no control): weapon depth for Frame Generation, the Subsurface Scattering
-// coverage selection and the edge-aware fill; the comparison counters off.
-static_assert(defaults.fg_weapon_depth && defaults.sss_coverage && defaults.sss_edge_fill &&
-              !defaults.sss_coverage_compare);
 // The water responsivity mask starts on, and only preset F wants it.
 static_assert(rrwater::Settings{}.responsivity && rrwater::Settings{}.strength == 1.0f);
 static_assert(rrwater::Wanted(rrwater::Settings{}, true) &&
@@ -361,7 +357,7 @@ int main() {
     wrong = mask;
     wrong.DepthOrArraySize = 4;
     assert(!rrsssmask::Shape(wrong, lighting));
-    assert(std::string_view(rrsssmask::Label(rrsssmask::State::Active)) == "active");
+
     // Specular hit distance follows the runtime guide extent, not a fixed resolution.
     D3D12_RESOURCE_DESC h{};
     h.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;

@@ -34,7 +34,6 @@
 #define RR_EDGE_OUTCOME_NO_NEIGHBOUR 2u
 
 #ifdef __cplusplus
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 namespace rredgefill {
@@ -139,19 +138,14 @@ RR_EDGE_FN bool EdgeResolve(float4 sum, float total, RR_EDGE_INOUT(float4) mean)
 }
 
 #ifdef __cplusplus
-// Read by the first spatial pass; always on (rr_settings.inl), with no panel control.
-// It selects a shader variant only: no history reset, no RR restart.
-inline std::atomic<bool> enabled{true};
 // Latest outcome of an edge-fill preparation, for the panel.
-enum class State : unsigned { Idle, Active, Baseline, Unavailable };
+enum class State : unsigned { Idle, Active, Unavailable };
 inline constexpr const char *Label(State s) {
     switch (s) {
     case State::Active:
         return "active";
-    case State::Baseline:
-        return "off (baseline group mean)";
     case State::Unavailable:
-        return "unavailable this frame (baseline group mean; see ReShade.log)";
+        return "unavailable this frame (group mean fallback; see ReShade.log)";
     default:
         return "not running";
     }
