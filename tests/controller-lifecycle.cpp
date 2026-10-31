@@ -7,6 +7,22 @@
 #include <string>
 #include <thread>
 
+// Count heap traffic only inside the submission interval, after fixtures and TLS warm up.
+static thread_local bool count_submission_allocations{};
+static thread_local size_t submission_allocations{};
+void *operator new(size_t n) {
+    if (count_submission_allocations)
+        ++submission_allocations;
+    if (auto *p = std::malloc(n ? n : 1))
+        return p;
+    throw std::bad_alloc();
+}
+void *operator new[](size_t n) { return ::operator new(n); }
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete[](void *p) noexcept { std::free(p); }
+void operator delete(void *p, size_t) noexcept { std::free(p); }
+void operator delete[](void *p, size_t) noexcept { std::free(p); }
+
 // CPU-only COM double. No device, adapter, queue, or GPU is created.
 struct CpuFence final : ID3D12Fence {
     ULONG refs = 1;
@@ -131,6 +147,8 @@ struct FgCpuObject {
     D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     UINT barriers{}, bad_barriers{}, signals{}, waits{};
     UINT64 signaled{}, waited{};
+    void (*on_signal)(void *){};
+    void *signal_context{};
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     void *table[64]{};
     explicit FgCpuObject(const IID &id) : vtable(table), iid(&id) {
@@ -178,6 +196,8 @@ struct FgCpuObject {
     static HRESULT STDMETHODCALLTYPE Signal(FgCpuObject *s, ID3D12Fence *, UINT64 value) {
         ++s->signals;
         s->signaled = value;
+        if (s->on_signal)
+            s->on_signal(s->signal_context);
         return S_OK;
     }
     static HRESULT STDMETHODCALLTYPE Wait(FgCpuObject *s, ID3D12Fence *, UINT64 value) {
@@ -476,7 +496,75 @@ struct ControllerCpuTest {
         discarded.Reset(list.As<ID3D12GraphicsCommandList>());
         assert(!d.busy && !d.fg_list_live);
     }
+    // The production Before/After path must reuse scratch storage after warmup.
+    // Nested submissions must not overwrite which slot the outer submission owns.
+    static void SubmissionAllocations() {
+        FgCpuObject device(__uuidof(ID3D12Device));
+        FgCpuObject outer(__uuidof(ID3D12GraphicsCommandList));
+        FgCpuObject inner(__uuidof(ID3D12GraphicsCommandList));
+        FgCpuObject queue(__uuidof(ID3D12CommandQueue));
+        queue.device = &device;
+        Controller c;
+        c.pipelines.device = device.As<ID3D12Device>();
+        c.fence.Attach(new CpuFence);
+        // Exercise a non-default pool size too: scratch must not assume six slots.
+        c.slots.emplace_back();
+        auto &a = c.slots[0];
+        auto &b = c.slots.back();
+        a.busy = a.fg_list_live = b.busy = b.fg_list_live = true;
+        a.fg_list = outer.As<ID3D12GraphicsCommandList>();
+        b.fg_list = inner.As<ID3D12GraphicsCommandList>();
+        ID3D12CommandList *aa[] = {outer.As<ID3D12CommandList>()};
+        ID3D12CommandList *bb[] = {inner.As<ID3D12CommandList>()};
+        auto run = [&] {
+            const auto start = c.signaled;
+            c.Before(queue.As<ID3D12CommandQueue>(), 1, aa);
+            c.Before(queue.As<ID3D12CommandQueue>(), 1, bb);
+            c.After(queue.As<ID3D12CommandQueue>());
+            assert(b.fence_value == start + 1 && a.fence_value <= start);
+            c.After(queue.As<ID3D12CommandQueue>());
+            assert(a.fence_value == start + 2 && b.fence_value == start + 1);
+            // Empty and invalid submissions must not reuse stale touched flags.
+            c.Before(nullptr, 0, nullptr);
+            c.Before(nullptr, 1, nullptr);
+            c.After(nullptr);
+            c.After(nullptr);
+            assert(c.signaled == start + 2);
+        };
+        struct NestedSignal {
+            Controller *controller;
+            FgCpuObject *queue;
+            ID3D12CommandList **lists;
+        } nested{&c, &queue, bb};
+        queue.signal_context = &nested;
+        auto reentrant = [&] {
+            const auto start = c.signaled;
+            queue.on_signal = [](void *context) {
+                auto &n = *static_cast<NestedSignal *>(context);
+                n.queue->on_signal = nullptr; // recurse only once
+                n.controller->Before(n.queue->As<ID3D12CommandQueue>(), 1, n.lists);
+                n.controller->After(n.queue->As<ID3D12CommandQueue>());
+            };
+            c.Before(queue.As<ID3D12CommandQueue>(), 1, aa);
+            c.After(queue.As<ID3D12CommandQueue>());
+            assert(a.fence_value == start + 1 && b.fence_value == start + 2);
+            assert(c.signaled == start + 2);
+        };
+        run();
+        reentrant();
+        submission_allocations = 0;
+        count_submission_allocations = true;
+        for (unsigned i = 0; i < 1000; ++i) {
+            run();
+            reentrant();
+        }
+        count_submission_allocations = false;
+        fprintf(stderr, "Submission heap allocations after warmup (1000 nested + reentrant batches): %zu\n",
+               submission_allocations);
+        assert(submission_allocations == 0 && "submission scratch must be reused");
+    }
     static void Run() {
+        SubmissionAllocations();
         FgRepeatedTags();
         FgRecordingLifetime();
         DevTests();
@@ -735,7 +823,9 @@ struct ControllerCpuTest {
 };
 } // namespace rrlive
 int main(int argc, char **argv) {
-    if (argc > 1 && std::strcmp(argv[1], "fg-tags") == 0)
+    if (argc > 1 && std::strcmp(argv[1], "submission-allocations") == 0)
+        rrlive::ControllerCpuTest::SubmissionAllocations();
+    else if (argc > 1 && std::strcmp(argv[1], "fg-tags") == 0)
         rrlive::ControllerCpuTest::FgRepeatedTags();
     else if (argc > 1 && std::strcmp(argv[1], "fg-lifetime") == 0)
         rrlive::ControllerCpuTest::FgRecordingLifetime();

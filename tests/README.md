@@ -55,3 +55,10 @@ moving-object rejections of the CPU mirror; it does not run the shader). The pri
 `RR_RELEASE_NEGATIVE_CONTROL` compile definition that deliberately bypasses
 the internal-call guard and is expected to fail. Never use that definition
 for an addon build.
+
+`controller-lifecycle` also counts heap allocations around warmed-up queue
+submissions, including nested calls, a reentrant completion signal, and
+empty/invalid submissions. `dispatch-cpu` exercises the production dispatch
+callback with narrow CPU-only ReShade/native-list doubles, checking unrelated
+shader early exits, identity rejection, and reentrant pipeline binding. These
+checks establish reduced CPU work, not an in-game FPS improvement.

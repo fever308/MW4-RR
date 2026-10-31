@@ -21,14 +21,14 @@ static rrsssmask::State SssMaskState() {
 // app prepared the outputs on another command list. Binding alone is not used
 // as proof: exact pipeline provenance, root/table, views and shapes are required.
 // https://learn.microsoft.com/windows/win32/api/d3d12/ne-d3d12-d3d12_resource_states
-static bool SparsePair(reshade::api::command_list *list, ID3D12GraphicsCommandList *native,
+static bool SparsePair(reshade::api::command_list *list, const rrshader::Binding &binding,
+                       ID3D12GraphicsCommandList *native,
                        uint64_t effective, bool uav, unsigned first, rrsparsecopy::Pair &out,
                        bool nativeSpatialWrites = false) {
     auto *state = rrbindings::State(list->get_device());
     if (!state || !state->tracker.Healthy())
         return false;
     auto root = state->tracker.CurrentLayout(list->get_native());
-    const auto binding = ShaderDispatches().Get(list->get_native());
     const bool contract =
         nativeSpatialWrites && uav && first == 0 && binding.shader == rrbypass::Spatial &&
         rrbypass::SpatialWriteContract(list->get_device(), binding.pipeline, effective);
@@ -134,8 +134,8 @@ static const char *SparseEdgeInputs(reshade::api::command_list *list,
     }
     return nullptr;
 }
-static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
-    const auto binding = ShaderDispatches().Get(list->get_native());
+static bool SparseDispatch(reshade::api::command_list *list, const rrshader::Binding &binding,
+                           uint32_t x, uint32_t y, uint32_t z) {
     if (binding.shader != rrbypass::Temporal && binding.shader != rrbypass::Spatial)
         return false;
     auto *device = list->get_device();
@@ -153,8 +153,8 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
     const auto effective = rrbypass::Effective(device, binding.pipeline);
     rrsparsecopy::Pair input, output;
     if (binding.shader == rrbypass::Temporal) {
-        if (!SparsePair(list, native.Get(), effective, false, 4, input) ||
-            !SparsePair(list, native.Get(), effective, true, 0, output) || z != 1 ||
+        if (!SparsePair(list, binding, native.Get(), effective, false, 4, input) ||
+            !SparsePair(list, binding, native.Get(), effective, true, 0, output) || z != 1 ||
             x != (input.r[0]->GetDesc().Width + 7) / 8 ||
             y != (input.r[0]->GetDesc().Height + 7) / 8) {
             rrbypass::Skip(device, "RR current/native-history bindings or layouts unproven");
@@ -167,14 +167,14 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                                    "temporal continues, RR blocked");
         return false;
     }
-    if (!SparsePair(list, native.Get(), effective, false, 0, input)) {
+    if (!SparsePair(list, binding, native.Get(), effective, false, 0, input)) {
         SparsePool().Abandon(native.Get());
         rrbypass::Skip(device, "RR spatial input proof failed");
         return false;
     }
     if (!SparsePool().Pending(native.Get(), input))
         return false;
-    if (!SparsePair(list, native.Get(), effective, true, 0, output, true)) {
+    if (!SparsePair(list, binding, native.Get(), effective, true, 0, output, true)) {
         SparsePool().Abandon(native.Get());
         rrbypass::Skip(device, "RR first spatial output proof failed");
         return false;

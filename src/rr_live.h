@@ -68,11 +68,20 @@ class Controller {
         std::array<Observed, 4> states{};
         rreval::Options options;
     };
+    struct SubmissionSlot {
+        int pre = -1, producer = -1, consumer = -1, glass_pre = -1, glass_anchor = -1,
+            cover = -1, fg_copy = -1;
+        bool touched{};
+    };
     struct Call {
         bool locked{};
-        std::vector<bool> touched;
+        std::vector<SubmissionSlot> slots;
     };
-    static inline thread_local std::vector<Call> submissions;
+    // Reuse scratch at each nesting depth. A deque keeps outer references valid when a
+    // queue hook submits recursively. Keep the depth occupied through After's Signal too.
+    // This caches only CPU indices, never native resources or command lists.
+    static inline thread_local std::deque<Call> submissions;
+    static inline thread_local size_t submission_depth{};
     rrlock::Recursive mutex;
     // An NGX call into the add-ons beneath RR is running with the lock released (Foreign).
     bool foreign_call{};
@@ -2346,31 +2355,35 @@ class Controller {
         PollLocked();
     }
     void Before(ID3D12CommandQueue *q, UINT n, ID3D12CommandList *const *lists) {
-        Call call;
-        submissions.push_back(std::move(call));
+        if (submission_depth == submissions.size())
+            submissions.emplace_back();
+        auto &call = submissions[submission_depth++];
+        call.locked = false;
         if (n && !lists)
             return;
         mutex.lock();
-        submissions.back().locked = true;
-        submissions.back().touched.resize(slots.size());
-        std::vector<int> pre(slots.size(), -1), producer(pre), consumer(pre), glass_pre(pre),
-            glass_anchor(pre), cover(pre), fg_copy(pre);
+        call.locked = true;
+        call.slots.resize(slots.size());
         bool any = false;
         auto index = [&](ID3D12CommandList *c) { return rrsss::RecordingIndex(n, lists, c); };
         for (unsigned k = 0; k < slots.size(); ++k) {
             const auto &s = slots[k];
-            pre[k] = s.pre_live ? index(s.pre.Get()) : -1;
-            producer[k] = s.sss.live ? index(s.sss.command.Get()) : -1;
-            consumer[k] = s.sr_live ? index(s.sr.Get()) : -1;
-            glass_pre[k] = s.transparency.prep_live ? index(s.transparency.preparation.Get()) : -1;
-            glass_anchor[k] = s.transparency.anchor_live ? index(s.transparency.anchor.Get()) : -1;
-            cover[k] = s.coverage.Live() ? index(s.coverage.capture.Get()) : -1;
-            fg_copy[k] = s.fg_list_live ? index(s.fg_list.Get()) : -1;
-            if (rrsss::Present(pre[k]) || rrsss::Present(producer[k]) ||
-                rrsss::Present(consumer[k]) || rrsss::Present(glass_pre[k]) ||
-                rrsss::Present(glass_anchor[k]) || rrsss::Present(cover[k]) ||
-                rrsss::Present(fg_copy[k])) {
-                submissions.back().touched[k] = true;
+            auto &indices = call.slots[k];
+            indices = {};
+            indices.pre = s.pre_live ? index(s.pre.Get()) : -1;
+            indices.producer = s.sss.live ? index(s.sss.command.Get()) : -1;
+            indices.consumer = s.sr_live ? index(s.sr.Get()) : -1;
+            indices.glass_pre =
+                s.transparency.prep_live ? index(s.transparency.preparation.Get()) : -1;
+            indices.glass_anchor =
+                s.transparency.anchor_live ? index(s.transparency.anchor.Get()) : -1;
+            indices.cover = s.coverage.Live() ? index(s.coverage.capture.Get()) : -1;
+            indices.fg_copy = s.fg_list_live ? index(s.fg_list.Get()) : -1;
+            if (rrsss::Present(indices.pre) || rrsss::Present(indices.producer) ||
+                rrsss::Present(indices.consumer) || rrsss::Present(indices.glass_pre) ||
+                rrsss::Present(indices.glass_anchor) || rrsss::Present(indices.cover) ||
+                rrsss::Present(indices.fg_copy)) {
+                indices.touched = true;
                 any = true;
             }
         }
@@ -2390,15 +2403,16 @@ class Controller {
             queue_ready = q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
         } catch (const std::exception &e) {
             for (unsigned k = 0; k < slots.size(); ++k)
-                if (submissions.back().touched[k])
+                if (call.slots[k].touched)
                     slots[k].poisoned = true;
             Failure(e.what());
         }
         for (unsigned k = 0; k < slots.size(); ++k) {
-            if (!submissions.back().touched[k])
+            const auto &indices = call.slots[k];
+            if (!indices.touched)
                 continue;
             auto &s = slots[k];
-            const int a = pre[k], c = producer[k], b = consumer[k];
+            const int a = indices.pre, c = indices.producer, b = indices.consumer;
             if (s.recorded && !s.sealed && rrsss::Present(b)) {
                 s.sealed = true;
                 const bool baseline = queue_ready && a >= 0 && b >= a && !s.pre_submitted &&
@@ -2416,14 +2430,14 @@ class Controller {
                                                                 : rrtrans::Route::Prepared;
                 s.transparency_accepted =
                     s.transparency_used && s.transparency.written && s.transparency.anchored &&
-                    rrtrans::RouteAdmits(route, a, glass_pre[k], glass_anchor[k], b,
+                    rrtrans::RouteAdmits(route, a, indices.glass_pre, indices.glass_anchor, b,
                                          s.transparency.prep_submitted,
                                          s.transparency.anchor_submitted, baseline);
                 if (s.transparency_used) {
                     const auto misses = s.transparency_accepted
                                             ? 0u
-                                            : rrtrans::Misses(route, a, glass_pre[k],
-                                                              glass_anchor[k], b,
+                                            : rrtrans::Misses(route, a, indices.glass_pre,
+                                                              indices.glass_anchor, b,
                                                               s.transparency.prep_submitted,
                                                               s.transparency.anchor_submitted,
                                                               baseline, s.transparency.written,
@@ -2439,7 +2453,7 @@ class Controller {
                     }
                 }
                 // Never part of acceptance: an unadmitted blend only reads no coverage.
-                SealCoverage(s, a, cover[k], b, baseline);
+                SealCoverage(s, a, indices.cover, b, baseline);
                 const bool accepted = baseline && (!s.sss_used || sss_accept) &&
                                       (!s.transparency_used || s.transparency_accepted);
                 s.gpu.Accept(accepted);
@@ -2455,43 +2469,45 @@ class Controller {
                 s.pre_submitted = true;
             if (rrsss::Present(c))
                 s.sss.submitted = true;
-            if (rrsss::Present(glass_pre[k]))
+            if (rrsss::Present(indices.glass_pre))
                 s.transparency.prep_submitted = true;
-            if (rrsss::Present(glass_anchor[k]))
+            if (rrsss::Present(indices.glass_anchor))
                 s.transparency.anchor_submitted = true;
-            if (rrsss::Present(cover[k]))
+            if (rrsss::Present(indices.cover))
                 s.coverage.submitted = true;
         }
     }
     void After(ID3D12CommandQueue *q) {
-        if (submissions.empty())
+        if (!submission_depth)
             return;
-        auto call = submissions.back();
-        submissions.pop_back();
-        if (!call.locked)
+        auto &call = submissions[submission_depth - 1];
+        if (!call.locked) {
+            --submission_depth;
             return;
+        }
         {
             std::lock_guard lock(mutex);
             bool any = false;
-            for (bool v : call.touched)
-                any |= v;
+            for (const auto &slot : call.slots)
+                any |= slot.touched;
             if (any) {
                 const auto value = ++signaled;
                 const auto signal_result = q->Signal(fence.Get(), value);
                 if (FAILED(signal_result)) {
-                    for (size_t k = 0; k < call.touched.size(); ++k)
-                        if (call.touched[k])
+                    for (size_t k = 0; k < call.slots.size(); ++k)
+                        if (call.slots[k].touched)
                             slots[k].poisoned = true;
                     Failure("RR native completion fence failed; allocations retained");
                 } else
-                    for (size_t k = 0; k < call.touched.size(); ++k)
-                        if (call.touched[k]) {
+                    for (size_t k = 0; k < call.slots.size(); ++k)
+                        if (call.slots[k].touched) {
                             slots[k].fence_value = value;
                             slots[k].reported = false;
                         }
             }
         }
         mutex.unlock();
+        --submission_depth;
     }
     bool BeforeShutdown(HMODULE mod, ID3D12Device *d) {
         std::lock_guard lock(mutex);

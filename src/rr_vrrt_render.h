@@ -17,8 +17,8 @@ static rrbindings::Value SamplingConstant(reshade::api::device *device, UINT64 l
     }
     return value;
 }
-static bool PreserveNativeSampling(reshade::api::command_list *list, UINT x, UINT y, UINT z) {
-    const auto binding = ShaderDispatches().Get(list->get_native());
+static bool PreserveNativeSampling(reshade::api::command_list *list,
+                                   const rrshader::Binding &binding, UINT x, UINT y, UINT z) {
     if (binding.shader != rrbypass::Vrrt)
         return false;
     auto *device = list->get_device();

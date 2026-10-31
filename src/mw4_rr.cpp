@@ -699,8 +699,8 @@ static bool AuditDrawIndexed(reshade::api::command_list *l, uint32_t c, uint32_t
 }
 #include "rr_sparse_render.h"
 #include "rr_vrrt_render.h"
-static bool PreservePrepass(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
-    const auto binding = ShaderDispatches().Get(list->get_native());
+static bool PreservePrepass(reshade::api::command_list *list, const rrshader::Binding &binding,
+                            uint32_t x, uint32_t y, uint32_t z) {
     if (list->get_device()->get_api() != reshade::api::device_api::d3d12 ||
         binding.shader != 0xc8be52d1ee156111ull)
         return false;
@@ -806,12 +806,12 @@ static rrspecular::Diagnostics &DistanceStats() {
 // snapshot would wrongly require unused roots after ExecuteIndirect. Another
 // shader with the same bindings is only logged, once, so a game update that
 // changes the blur's hash can be recognized without copying unknown data.
-static void PreserveSpecularDistance(reshade::api::command_list *list, uint32_t x, uint32_t y,
+static void PreserveSpecularDistance(reshade::api::command_list *list,
+                                     const rrshader::Binding &binding, uint32_t x, uint32_t y,
                                      uint32_t z) {
     if (list->get_device()->get_api() != reshade::api::device_api::d3d12 ||
         !LiveRR().Enabled() || !LiveRR().SpecularHitEnabled())
         return;
-    const auto binding = ShaderDispatches().Get(list->get_native());
     if (!binding.shader)
         return;
     const bool known = rrspecular::DistanceBlur(binding.shader);
@@ -890,8 +890,7 @@ static void PreserveSpecularDistance(reshade::api::command_list *list, uint32_t 
                ? S::Copied
                : S::Slot);
 }
-static void RestoreLightingPipeline(reshade::api::command_list *list) {
-    const auto b = ShaderDispatches().Get(list->get_native());
+static void RestoreLightingPipeline(reshade::api::command_list *list, const rrshader::Binding &b) {
     if (!rrbypass::Target(b.shader) || !b.pipeline)
         return;
     auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
@@ -899,29 +898,38 @@ static void RestoreLightingPipeline(reshade::api::command_list *list) {
     if (native)
         native->SetPipelineState((ID3D12PipelineState *)b.pipeline);
 }
+static void RestoreLightingPipeline(reshade::api::command_list *list) {
+    RestoreLightingPipeline(list, ShaderDispatches().Get(list->get_native()));
+}
 static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
     if (rrinternal::active)
         return false;
     try {
-        RestoreLightingPipeline(list);
+        // Snapshot only this callback's binding. Helpers restore any private PSO before
+        // returning; do not cache across dispatches or command-list resets.
+        const auto b = ShaderDispatches().Get(list->get_native());
+        RestoreLightingPipeline(list, b);
         try {
-            PreserveSpecularDistance(list, x, y, z);
+            PreserveSpecularDistance(list, b, x, y, z);
         } catch (...) {
             static std::atomic<bool> warned{};
             if (!warned.exchange(true))
                 WriteLog("Specular hit distance validation failed; RR continues without it");
         }
-        const bool live_prepass = PreservePrepass(list, x, y, z);
+        const bool live_prepass = PreservePrepass(list, b, x, y, z);
         if (live_prepass)
             return true;
-        const auto b = ShaderDispatches().Get(list->get_native());
+        // Specular candidate discovery and the prepass above still see every dispatch.
+        // Only lighting targets need the remaining raw-slot and sampling checks.
+        if (!rrbypass::Target(b.shader))
+            return false;
         auto *device = list->get_device();
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
             (ID3D12GraphicsCommandList *)list->get_native());
         if (!native || !LiveRR().CanRaw(native.Get()) || rrbypass::Health(device).failed)
             return false;
         if (b.shader == rrbypass::Vrrt) {
-            if (!PreserveNativeSampling(list, x, y, z))
+            if (!PreserveNativeSampling(list, b, x, y, z))
                 return false;
             rrbypass::Used(device, b.pipeline, b.shader);
             return false;
@@ -930,7 +938,7 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
             return false;
         if (rrbypass::Target(b.shader))
             rrbypass::Used(device, b.pipeline, b.shader);
-        const bool corrected = SparseDispatch(list, x, y, z);
+        const bool corrected = SparseDispatch(list, b, x, y, z);
         if (corrected) {
             const auto health = rrbypass::Health(device);
             LiveRR().RawCorrected(native.Get(), UINT64(device), health.revision);
