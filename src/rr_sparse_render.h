@@ -185,13 +185,13 @@ static bool SparseDispatch(reshade::api::command_list *list, const rrshader::Bin
     rrinternal::Scope ignoreCopies;
     rrcompute::Tracker::Internal ignoreState;
     const auto rates = LiveRR().SamplingData(native.Get());
-    // An admitted guide gates coverage. Only matched, drawn surfaces take native history;
-    // without a usable record, prepare raw lighting.
+    // Use the admitted guide directly. Reprojected coverage selection is bypassed
+    // because it caused boiling; edge-aware fill remains available.
     unsigned mask_age{};
     const auto mask = LiveRR().SssMask(native.Get(), &mask_age);
     rrsparsecopy::CoverageInputs coverage;
     auto coverage_reason = rrssscov::FrameReason::NoStorage;
-    // Diagnostic: use the admitted guide directly; no coverage record or reprojection.
+    // Direct guide selection does not require a coverage record or reprojection.
     const bool coverage_ready = false;
     const auto cbvs = ComputeState().RateCBVs(
         native.Get(), (ID3D12PipelineState *)effective,

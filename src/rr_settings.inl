@@ -203,7 +203,7 @@ static void StatusRow(const char *name, rrstatus::State value) {
 static void DrawSettings(reshade::api::effect_runtime *) {
     std::lock_guard lock(settings_mutex);
     LoadSettings();
-    ImGui::TextUnformatted("MW4 Ray Reconstruction — Beta 3");
+    ImGui::TextUnformatted("MW4 Ray Reconstruction - Beta 3 Hotfix 1");
     bool changed = ImGui::Checkbox("Ray reconstruction (F8)", &requested_rr);
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);

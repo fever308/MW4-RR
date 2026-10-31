@@ -1,10 +1,13 @@
-MW4 RAY RECONSTRUCTION - BETA 3
+MW4 RAY RECONSTRUCTION - BETA 3 HOTFIX 1
 By Fever308
 
 ReShade addon for the MW4 campaign executable sp26-cod.exe.
 Ray Reconstruction, the Transparency Guide, and the Subsurface Scattering
 Guide are enabled by default. The initial Ray Reconstruction preset is F.
 Your choices are saved between sessions.
+
+Hotfix 1 fixes boiling in shadows and Subsurface Scattering surfaces by
+restoring guide-based lighting selection. Edge-aware sample filling is retained.
 
 Beta 3 adds broader shader compatibility, a local shader cache, weapon depth
 for Frame Generation, and improved Subsurface Scattering history selection

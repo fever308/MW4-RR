@@ -2,6 +2,8 @@
 
 A Windows x64 ReShade addon integrating NVIDIA DLSS Ray Reconstruction into the MW4 campaign's Direct3D 12 rendering path. Includes Transparency and Subsurface Scattering guides, live RR preset selection, and a ReShade status panel.
 
+**Beta 3 Hotfix 1** fixes a lighting regression that caused shadows and Subsurface Scattering surfaces to boil. It restores the established guide-based lighting selection while retaining edge-aware filling of missing samples.
+
 **Beta 3** improves shader compatibility, Frame Generation depth, and Subsurface Scattering lighting. Results vary by scene, hardware, and settings. See the requirements and limitations below before installing or building.
 
 ### What's new in Beta 3
@@ -9,7 +11,7 @@ A Windows x64 ReShade addon integrating NVIDIA DLSS Ray Reconstruction into the 
 - Broader recognition of Subsurface Scattering and transparency shader variants.
 - A per-user cache reuses successfully prepared guide shaders on later launches.
 - Weapon-inclusive depth for Frame Generation, with the game's depth retained when the replacement cannot be supplied.
-- Subsurface Scattering history selection follows the camera and checks the current surface. Missing lighting samples are filled from nearby rays with matching depth, normal and material.
+- Missing Subsurface Scattering lighting samples are filled from nearby rays with matching depth, normal and material. Hotfix 1 restores guide-based history selection to fix boiling introduced by the coverage tracker.
 
 These Frame Generation and Subsurface Scattering improvements apply automatically, without separate panel toggles or configuration keys.
 
@@ -63,7 +65,7 @@ The panel also has these checkboxes, all on by default and saved in `ReShade.ini
 The following features apply automatically, with no separate panel control or saved configuration key:
 
 - Weapon depth for Frame Generation: when RR is running and the required inputs and command ordering are available, Frame Generation receives weapon-inclusive depth. Otherwise it keeps the game's depth for that frame. Super Resolution and RR keep their own inputs.
-- Subsurface Scattering lighting selection and filling: camera reprojection and surface checks select history for scattering surfaces. Pixels with no ray and no history are filled from nearby rays with matching depth, normal and material. A failed coverage match uses raw lighting. This does not change the Subsurface Scattering guide supplied to RR. Camera reprojection does not itself track independent object motion.
+- Subsurface Scattering lighting selection and filling: the admitted guide selects history for scattering surfaces. Pixels with no ray and no history are filled from nearby rays with matching depth, normal and material. This does not change the Subsurface Scattering guide supplied to RR.
 
 With the Subsurface Scattering Guide on, lighting on skin and other subsurface materials uses the game's native temporal history where it exists, and a spatial estimate elsewhere. The panel reports this as "SSS lighting".
 

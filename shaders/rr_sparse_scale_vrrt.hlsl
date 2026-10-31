@@ -46,7 +46,7 @@ uint PixelCode(uint2 p){
 #define RR_SSS_COVERAGE 0
 #endif
 #if RR_SSS_MASK&&!RR_SSS_COVERAGE
-// Coverage isolation diagnostic: Beta 2 same-pixel guide selection.
+// Direct guide selection retains the established same-pixel mask.
 Texture2D<float> sssGuide:register(t2);
 #endif
 #if RR_SSS_COVERAGE

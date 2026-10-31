@@ -35,7 +35,7 @@ enum class State : unsigned {
 inline constexpr const char *Label(State s) {
     switch (s) {
     case State::CoverageActive:
-        return "DIAGNOSTIC active: Beta 2 guide selection; coverage tracking bypassed; Beta 3 edge fill retained";
+        return "active, selected by the Subsurface Scattering guide";
     case State::CoverageWaiting:
         return "waiting for usable Subsurface Scattering coverage (raw lighting)";
     case State::NoGuide:

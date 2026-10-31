@@ -384,7 +384,7 @@ static void Shapes() {
         array.DepthOrArraySize = 2;
         CHECK(!EdgeShape(array, n, st, light));
     }
-    // Diagnostic legacy-mask variants must retain the edge fill and never run raw scale.
+    // Direct-guide variants must retain the edge fill and never run raw scale.
     for (bool fp : {false, true}) {
         const auto raw = rrsparsecopy::RetirementTest::Code(fp, rrlighting::Raw);
         const auto legacy = rrsparsecopy::RetirementTest::Code(
