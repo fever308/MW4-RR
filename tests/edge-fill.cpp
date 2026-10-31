@@ -4,7 +4,15 @@
 // GPU timing, the game's inputs or the visual result.
 #ifdef _WIN32
 #include <d3d12.h>
+#define RR_SPARSE_RETIREMENT_TEST
 #include "../src/rr_sparse_copy.h"
+namespace rrsparsecopy {
+struct RetirementTest {
+    static auto Code(bool fp, unsigned lobe, unsigned bits = 0) {
+        return Pool::PrivateScaleCode(fp, lobe, bits);
+    }
+};
+}
 #endif
 #include "../src/rr_edge_fill.h"
 #include <cassert>
@@ -376,6 +384,13 @@ static void Shapes() {
         array.DepthOrArraySize = 2;
         CHECK(!EdgeShape(array, n, st, light));
     }
+    // Diagnostic legacy-mask variants must retain the edge fill and never run raw scale.
+    for (bool fp : {false, true}) {
+        const auto raw = rrsparsecopy::RetirementTest::Code(fp, rrlighting::Raw);
+        const auto legacy = rrsparsecopy::RetirementTest::Code(
+            fp, rrlighting::SssHistory2, rrsparsecopy::EdgeBit);
+        CHECK(legacy.pShaderBytecode != raw.pShaderBytecode);
+    }
     // Every (lobe, variant) pipeline has its own slot.
     static_assert(rrsparsecopy::VariantIndex(rrlighting::Raw, 0) == 0 &&
                   rrsparsecopy::VariantIndex(rrlighting::SssHistory2, 0) == 4 &&
@@ -385,7 +400,7 @@ static void Shapes() {
     // Descriptors 0-4 base, 5-9 edge, 10-12 the Subsurface Scattering coverage selection;
     // its root parameters follow the edge table when both bits are set.
     static_assert(rrsparsecopy::EdgeDescriptor == 4 && rrsparsecopy::CoverageDescriptor == 9 &&
-                  rrsparsecopy::PrivateDescriptors == 12 &&
+                  rrsparsecopy::PrivateDescriptors == 13 &&
                   rrsparsecopy::EdgeTableParameter == 4 &&
                   rrsparsecopy::CoverageTableParameter(rrsparsecopy::CoverageBit) == 4 &&
                   rrsparsecopy::CoverageTableParameter(rrsparsecopy::EdgeBit |

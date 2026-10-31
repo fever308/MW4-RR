@@ -306,7 +306,8 @@ inline constexpr unsigned EdgeTableParameter = 4;
 inline constexpr unsigned CoverageTableParameter(unsigned bits) { return 4 + (bits & EdgeBit); }
 inline constexpr unsigned EdgeDescriptor = 4;      // 4-8
 inline constexpr unsigned CoverageDescriptor = 9; // 9-11
-inline constexpr unsigned PrivateDescriptors = 12; // 0-3 base, 4-8 edge, 9-11 coverage
+inline constexpr unsigned LegacyMaskDescriptor = 12;
+inline constexpr unsigned PrivateDescriptors = 13; // 0-3 base, 4-8 edge, 9-11 coverage, 12 legacy guide
 class Pool {
 #ifdef RR_SPARSE_RETIREMENT_TEST
     friend struct RetirementTest;
@@ -412,6 +413,15 @@ class Pool {
                                                sizeof(RRVrrtScaleSssHistory2CoverageFloat)}
                        : D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2Coverage,
                                                sizeof(RRVrrtScaleSssHistory2Coverage)};
+        if (lobe == rrlighting::SssHistory2 && !(bits & CoverageBit)) {
+            if (bits & EdgeBit)
+                return packed_float
+                    ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2EdgeLegacyFloat, sizeof(RRVrrtScaleSssHistory2EdgeLegacyFloat)}
+                    : D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2EdgeLegacy, sizeof(RRVrrtScaleSssHistory2EdgeLegacy)};
+            return packed_float
+                ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2LegacyFloat, sizeof(RRVrrtScaleSssHistory2LegacyFloat)}
+                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2Legacy, sizeof(RRVrrtScaleSssHistory2Legacy)};
+        }
         return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}
                             : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
     }
@@ -421,7 +431,7 @@ class Pool {
                                     unsigned lobe = 0, ID3D12Resource *mask = nullptr,
                                     const EdgeInputs *edge = nullptr,
                                     const CoverageInputs *coverage = nullptr) {
-        if (lobe >= rrlighting::Count || (rrlighting::SssMasked(lobe) && (!mask || !coverage)))
+        if (lobe >= rrlighting::Count || (rrlighting::SssMasked(lobe) && !mask))
             lobe = 0;
         unsigned bits = rrlighting::SssMasked(lobe)
                             ? (edge ? EdgeBit : 0u) | (coverage ? CoverageBit : 0u)
@@ -436,6 +446,7 @@ class Pool {
                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0},
                                                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 3, 0, 0},
                                                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 8, 0, 0}};
+            D3D12_DESCRIPTOR_RANGE legacyRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, 0};
             D3D12_ROOT_PARAMETER p[7]{};
             for (unsigned i = 0; i < 2; ++i) {
                 p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -456,6 +467,11 @@ class Pool {
                 p[c + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
                 p[c + 1].Constants = {4, 0, rrssscov::ConstantWords};
                 count = c + 2;
+            }
+            if (masked && !(variant & CoverageBit)) {
+                p[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                p[count].DescriptorTable = {1, &legacyRange};
+                ++count;
             }
             D3D12_ROOT_SIGNATURE_DESC rd{count, p};
             ComPtr<ID3DBlob> code, error;
@@ -489,9 +505,9 @@ class Pool {
         auto usable = [&](unsigned b) {
             return makeRoot(true, s.privateMaskRoots[b], b) && create(lobe, b);
         };
-        if (bits && !usable(bits)) {
+        if (rrlighting::SssMasked(lobe) && !usable(bits)) {
             const unsigned fewer = bits & ~EdgeBit;
-            if (fewer && usable(fewer))
+            if ((bits & EdgeBit) && usable(fewer))
                 bits = fewer;
             else
                 lobe = bits = 0;
@@ -526,6 +542,14 @@ class Pool {
             u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             s.device->CreateUnorderedAccessView(output.r[i].Get(), nullptr, &u,
                                                 {cpu.ptr + (2 + i) * stride});
+        }
+        if (rrlighting::SssMasked(lobe) && !(bits & CoverageBit)) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+            v.Format = mask->GetDesc().Format;
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            v.Texture2D.MipLevels = 1;
+            v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            s.device->CreateShaderResourceView(mask, &v, {cpu.ptr + LegacyMaskDescriptor * stride});
         }
         if (bits & EdgeBit) {
             // t3/t4 the raw snapshot the output is copied from, t5-t7 the surface inputs.
@@ -780,6 +804,7 @@ class Pool {
         const bool useMask = privateRestore && rrlighting::SssMasked(s.privateLobe);
         const bool useEdge = useMask && (s.privateBits & EdgeBit);
         const bool useCoverage = useMask && (s.privateBits & CoverageBit);
+        const bool useLegacy = useMask && !useCoverage;
         if (coverageRequired && !useCoverage)
             return false;
         // All proofs and references acquired before the first output mutation.
@@ -808,6 +833,13 @@ class Pool {
             if (useEdge) {
                 cl->SetComputeRootDescriptorTable(EdgeTableParameter, {gpu.ptr + EdgeDescriptor * stride});
                 cl->ResourceBarrier(4, EdgeBarriers(s, true).data());
+            }
+            if (useLegacy) {
+                cl->SetComputeRootDescriptorTable(CoverageTableParameter(s.privateBits),
+                    {gpu.ptr + LegacyMaskDescriptor * stride});
+                auto barrier = Transition(s.mask.Get(), D3D12_RESOURCE_STATE_COMMON,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                cl->ResourceBarrier(1, &barrier);
             }
             if (useCoverage) {
                 const unsigned c = CoverageTableParameter(s.privateBits);
@@ -842,6 +874,11 @@ class Pool {
             cl->ResourceBarrier(4, EdgeBarriers(s, false).data());
         if (useCoverage)
             cl->ResourceBarrier(3, CoverageBarriers(s, false).data());
+        if (useLegacy) {
+            auto barrier = Transition(s.mask.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                      D3D12_RESOURCE_STATE_COMMON);
+            cl->ResourceBarrier(1, &barrier);
+        }
         if (masked)
             *masked = useMask;
         if (covered)

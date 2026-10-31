@@ -191,8 +191,8 @@ static bool SparseDispatch(reshade::api::command_list *list, const rrshader::Bin
     const auto mask = LiveRR().SssMask(native.Get(), &mask_age);
     rrsparsecopy::CoverageInputs coverage;
     auto coverage_reason = rrssscov::FrameReason::NoStorage;
-    const bool coverage_ready =
-        mask && LiveRR().SssCoverage(native.Get(), coverage, coverage_reason);
+    // Diagnostic: use the admitted guide directly; no coverage record or reprojection.
+    const bool coverage_ready = false;
     const auto cbvs = ComputeState().RateCBVs(
         native.Get(), (ID3D12PipelineState *)effective,
         (ID3D12RootSignature *)rrbindings::State(device)->tracker.CurrentLayout(
@@ -221,7 +221,7 @@ static bool SparseDispatch(reshade::api::command_list *list, const rrshader::Bin
     const char *edge_why =
         edge_wanted ? SparseEdgeInputs(list, native.Get(), effective, edge, edge_detail) : nullptr;
     bool masked = false, edged = false, covered = false;
-    bool replaced = mask && privateValid && coverage_ready &&
+    bool replaced = mask && privateValid &&
                     SparsePool().Apply(native.Get(), input, output, scale.Get(),
                                        (ID3D12PipelineState *)effective, x, y, z, &rates, nullptr,
                                        &privateRestore, lobe, mask.Get(), &masked,

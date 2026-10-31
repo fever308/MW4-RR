@@ -45,8 +45,9 @@ uint PixelCode(uint2 p){
 #ifndef RR_SSS_COVERAGE
 #define RR_SSS_COVERAGE 0
 #endif
-#if RR_SSS_COVERAGE!=RR_SSS_MASK
-#error SSS-masked selection requires reprojected coverage
+#if RR_SSS_MASK&&!RR_SSS_COVERAGE
+// Coverage isolation diagnostic: Beta 2 same-pixel guide selection.
+Texture2D<float> sssGuide:register(t2);
 #endif
 #if RR_SSS_COVERAGE
 #include "rr_guide_math.hlsli"
@@ -296,7 +297,11 @@ void main(uint3 id:SV_DispatchThreadID){
 #endif
 #endif
 #if RR_SSS_MASK
+#if RR_SSS_COVERAGE
  bool sssNative=CoverageSelect(p);
+#else
+ bool sssNative=sssGuide.Load(int3(p,0))!=0;
+#endif
  if(!sssNative){ca=rawA;cb=rawB;outWeights=rawWeights;}
 #endif
 #ifdef RR_PACKED_FLOAT

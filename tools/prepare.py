@@ -68,7 +68,9 @@ def main():
                                '-D', 'RR_SSS_MASK=1', '-D', 'RR_FILL_HISTORY=1',
                                '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
                                *defines, *extra)), False)
-          for name, tag, defines in (('Coverage', '_coverage', ('-D', 'RR_SSS_COVERAGE=1')),
+          for name, tag, defines in (('Legacy', '_legacy', ()),
+                                     ('EdgeLegacy', '_edge_legacy', ('-D', 'RR_FILL_EDGE=1')),
+                                     ('Coverage', '_coverage', ('-D', 'RR_SSS_COVERAGE=1')),
                                      ('EdgeCoverage', '_edge_coverage',
                                       ('-D', 'RR_FILL_EDGE=1', '-D', 'RR_SSS_COVERAGE=1')))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
